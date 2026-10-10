@@ -1,0 +1,75 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -86,7 +86,26 @@
+                 )
+             )
+       else do
+-        AWS.newEnv AWS.discover
++        -- The pinned amazonka ignores AWS_ENDPOINT_URL, so a non-AWS S3 needs its endpoint set here.
++        s3Endpoint <- lookupEnv "CLOUD_S3_ENDPOINT" >>= traverse (exitErrOnLeft . first ("'CLOUD_S3_ENDPOINT': " <>) . parseS3Endpoint)
++        s3Addressing <- lookupEnv "CLOUD_S3_ADDRESSING" >>= traverse (exitErrOnLeft . first ("'CLOUD_S3_ADDRESSING': " <>) . parseS3AddressingStyle)
++        awsEnv <- AWS.newEnv AWS.discover
++        case (s3Endpoint, s3Addressing) of
++          (Nothing, Nothing) -> pure awsEnv
++          (Just (secure, host, port), Just addressing) ->
++            pure $
++              awsEnv
++                & AWS.configureService
++                  ( AWS.setEndpoint
++                      secure
++                      host
++                      port
++                      ( S3.defaultService
++                          & AWS.service_s3AddressingStyle
++                          .~ addressing
++                      )
++                  )
++          _ -> exitErrOnLeft (Left "CLOUD_S3_ENDPOINT and CLOUD_S3_ADDRESSING must be set together")
+   -- awsCredentialUrl <- fromEnv "CLOUD_AWS_CREDENTIAL_URL" (pure . Right . Text.pack)
+   -- AWS.newEnv (AWSAuth.fromContainer awsCredentialUrl)
+   cloudServicesBucket <- fromEnv "CLOUD_CLOUD_SERVICE_BUCKET" (pure . Right . S3.BucketName . Text.pack)
+@@ -179,11 +198,13 @@
+   --     defaultCookieSettings envCookieDomain Deployment.onLocal
+ 
+   (envEmailClientEnv, envEmailServiceToken) <- case Deployment.deployment of
+-    Deployment.Production -> do
+-      emailServiceURL <- fromEnv "CLOUD_EMAIL_SERVICE_URL" (pure . Right)
+-      clientEnv <- parseBaseUrl emailServiceURL >>= exitErrOnLeft <&> mkClientEnv manager
+-      serviceToken <- fromEnv "CLOUD_EMAIL_SERVICE_TOKEN" (pure . Right . Text.pack)
+-      pure (Just clientEnv, Just serviceToken)
++    Deployment.Production ->
++      (,) <$> lookupEnv "CLOUD_EMAIL_SERVICE_URL" <*> lookupEnv "CLOUD_EMAIL_SERVICE_TOKEN" >>= \case
++        (Nothing, Nothing) -> pure (Nothing, Nothing)
++        (Just emailServiceURL, Just serviceToken) -> do
++          clientEnv <- parseBaseUrl emailServiceURL >>= exitErrOnLeft <&> mkClientEnv manager
++          pure (Just clientEnv, Just (Text.pack serviceToken))
++        _ -> exitErrOnLeft (Left "CLOUD_EMAIL_SERVICE_URL and CLOUD_EMAIL_SERVICE_TOKEN must be set together")
+     Deployment.Staging -> pure (Nothing, Nothing)
+     Deployment.Local -> pure (Nothing, Nothing)
+ 
+@@ -264,3 +285,25 @@
+ exitErrOnLeft :: Either String a -> IO a
+ exitErrOnLeft (Right a) = pure a
+ exitErrOnLeft (Left err) = putStrLn ("Error: " <> err) >> exitWith (ExitFailure 1)
++
++parseS3Endpoint :: String -> Either String (Bool, BS.ByteString, Int)
++parseS3Endpoint str = do
++  uri <- maybeToRight ("not an absolute URI: " <> str) (parseAbsoluteURI str)
++  secure <- case uriScheme uri of
++    "http:" -> Right False
++    "https:" -> Right True
++    scheme -> Left ("scheme must be http or https, got " <> scheme)
++  auth <- maybeToRight ("no host in " <> str) (uriAuthority uri)
++  port <- case uriPort auth of
++    "" -> Right (if secure then 443 else 80)
++    ':' : p -> maybeToRight ("invalid port in " <> str) (readMaybe p)
++    p -> Left ("invalid port " <> p)
++  when (uriPath uri `notElem` ["", "/"] || not (null (uriQuery uri)) || not (null (uriUserInfo auth))) $
++    Left ("must be scheme://host[:port] only, got " <> str)
++  pure (secure, BS.pack (uriRegName auth), port)
++
++parseS3AddressingStyle :: String -> Either String AWS.S3AddressingStyle
++parseS3AddressingStyle = \case
++  "path" -> Right AWS.S3AddressingStylePath
++  "virtual" -> Right AWS.S3AddressingStyleVirtual
++  other -> Left ("must be path or virtual, got " <> other)

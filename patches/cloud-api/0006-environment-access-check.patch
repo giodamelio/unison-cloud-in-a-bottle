@@ -1,0 +1,39 @@
+--- a/src/Cloud/Client.hs
++++ b/src/Cloud/Client.hs
+@@ -43,7 +43,7 @@
+     fromExceptionUnwrap,
+   )
+ import UnliftIO.Concurrent (ThreadId)
+-import Control.Monad (when)
++import Control.Monad (unless, when)
+ import Cloud.Postgres.App (postgresM)
+ import Cloud.User.Env (AuthEnv(..))
+ 
+@@ -102,7 +102,8 @@
+   envId <- case clientForkEnvironment clientFork of
+     Nothing -> pure Nothing
+     Just envId -> do
+-      postgresM $ PG.runTransaction $ Q.verifyEnvironmentAccess defaultClusterId userId envId
++      access <- postgresM $ PG.runTransaction $ Q.verifyEnvironmentAccess defaultClusterId userId envId
++      unless access $ respondErrorM (AuthFailure $ "not authorized for environment " <> tShow envId)
+       pure $ Just envId
+   jobId <- postgresM $ PG.runTransaction $ Q.recordJobRun defaultClusterId userId
+ 
+--- a/src/Cloud/Web/Impl.hs
++++ b/src/Cloud/Web/Impl.hs
+@@ -246,13 +246,13 @@
+ 
+ setEnvironmentValueEndpoint :: UserId -> EnvironmentId -> Text -> Text -> WebApp NoContent
+ setEnvironmentValueEndpoint uid envId name value = do
+-  postgresM $ PG.runTransaction $ Q.verifyEnvironmentAccess defaultClusterId uid envId
++  PGO.checkEnvironmentAccess defaultClusterId uid envId
+   Envs.setEnvironmentVariable envId name value
+   pure NoContent
+ 
+ deleteEnvironmentValueEndpoint :: UserId -> EnvironmentId -> Text -> WebApp NoContent
+ deleteEnvironmentValueEndpoint uid envId name = do
+-  postgresM $ PG.runTransaction $ Q.verifyEnvironmentAccess defaultClusterId uid envId
++  PGO.checkEnvironmentAccess defaultClusterId uid envId
+   Envs.deleteEnvironmentVariable envId name
+   pure NoContent
+ 

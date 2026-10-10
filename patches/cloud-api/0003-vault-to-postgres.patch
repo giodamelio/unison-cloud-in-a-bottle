@@ -1,0 +1,431 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -69,7 +69,6 @@
+   shareOAuthClientID <- fromEnv "CLOUD_SHARE_OAUTH_CLIENT_ID" (pure . Right . Text.pack)
+   shareOAuthClientSecret <- fromEnv "CLOUD_SHARE_OAUTH_CLIENT_SECRET" (pure . Right . Text.pack)
+   hs256Key <- fromEnv "CLOUD_HMAC_KEY" (pure . Right . BS.pack)
+-  envVaultToken <- fromEnv "VAULT_TOKEN" (pure . Right . Text.pack)
+   envEnvironmentsMount <- fromEnv "CLOUD_ENVIRONMENTS_MOUNT" (pure . Right . Text.pack)
+   s3Env <-
+     if Deployment.onLocal
+@@ -112,8 +111,8 @@
+   cloudEddsaKey <- fromEnv "CLOUD_EDDSA_KEY" (pure . Right . BS.pack)
+   shareEddsaKey <- fromEnv "SHARE_EDDSA_KEY" (pure . Right . BS.pack)
+   manager <- newManager tlsManagerSettings
+-  vaultHost <- fromEnv "VAULT_HOST" parseBaseUrl
+-  let envVaultClientEnv = mkClientEnv manager vaultHost
++  envSecretsHost <- fromEnv "CLOUD_SECRETS_HOST" readHostname
++  envSecretsPort <- fromEnv "CLOUD_SECRETS_PORT" (pure . maybeToEither "Invalid CLOUD_SECRETS_PORT" . readMaybe)
+   consulHost <- fromEnv "CONSUL_HOST" parseBaseUrl
+   let consulClientEnv = mkClientEnv manager consulHost
+   zendeskAPIUser <- fromEnv "CLOUD_ZENDESK_API_USER" (pure . Right . BS.pack)
+--- a/cloud.cabal
++++ b/cloud.cabal
+@@ -87,6 +87,8 @@
+       Cloud.Postgres.Queries.User
+       Cloud.Prelude
+       Cloud.Prelude.Orphans
++      Cloud.SelfHost.Secrets.Listener
++      Cloud.SelfHost.Secrets.Queries
+       Cloud.Service.API
+       Cloud.Service.Impl
+       Cloud.Service.Types
+--- a/docker/sql/2099-01-01-00_selfhost_environment_secrets.sql
++++ b/docker/sql/2099-01-01-00_selfhost_environment_secrets.sql
+@@ -0,0 +1,10 @@
++CREATE SCHEMA IF NOT EXISTS selfhost;
++
++-- Replaces the Vault KV v2 mount that held one secret per environment.
++CREATE TABLE selfhost.environment_secrets (
++  environment_id uuid PRIMARY KEY REFERENCES public.cloud_environments (id) ON DELETE CASCADE,
++  -- Always a JSON object of string values: nimbus decodes it as a text map.
++  data jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(data) = 'object'),
++  version integer NOT NULL DEFAULT 1,
++  updated_at timestamptz NOT NULL DEFAULT now()
++);
+--- a/src/Cloud/Env.hs
++++ b/src/Cloud/Env.hs
+@@ -40,8 +40,8 @@
+     authEnv :: AuthEnv,
+     envNimbusConfig :: NimbusConfig,
+     envEnvironmentsMount :: Text,
+-    envVaultToken :: Text,
+-    envVaultClientEnv :: S.ClientEnv,
++    envSecretsHost :: HostName,
++    envSecretsPort :: Int,
+     cloudServicesBucket :: S3.BucketName,
+     s3Env :: S3.Env,
+     envRedisConnection :: R.Connection,
+--- a/src/Cloud/SelfHost/Secrets/Listener.hs
++++ b/src/Cloud/SelfHost/Secrets/Listener.hs
+@@ -0,0 +1,122 @@
++-- | The subset of the Vault KV v2 HTTP API that nimbus uses for environment secrets,
++-- served from Postgres so the stack runs without Vault.
++module Cloud.SelfHost.Secrets.Listener
++  ( runSecretsListener,
++  )
++where
++
++import Cloud.App (runAppM)
++import Cloud.Byoc.Env (ClusterConfig (..), ClusterToken (..))
++import Cloud.Env (Env (..))
++import Cloud.Postgres qualified as PG
++import Cloud.Postgres.App (postgresM)
++import Cloud.Postgres.Queries.BYOC qualified as BYOC
++import Cloud.Prelude
++import Cloud.SelfHost.Secrets.Queries (SecretVersion)
++import Cloud.SelfHost.Secrets.Queries qualified as Q
++import Cloud.Web.Types (EnvironmentId (..))
++import Data.Aeson ((.:), (.:?), (.=))
++import Data.Aeson qualified as JS
++import Data.ByteString.Lazy qualified as BL
++import Data.String (fromString)
++import Data.Text.Encoding qualified as Text
++import Data.UUID qualified as UUID
++import Data.Void (Void)
++import Network.HTTP.Types qualified as HTTP
++import Network.Wai qualified as Wai
++import Network.Wai.Handler.Warp qualified as Warp
++
++runSecretsListener :: Env () -> IO ()
++runSecretsListener env =
++  Warp.runSettings settings (secretsApp env)
++  where
++    settings =
++      Warp.defaultSettings
++        & Warp.setHost (fromString (envSecretsHost env))
++        & Warp.setPort (envSecretsPort env)
++
++data WriteRequest = WriteRequest (Maybe SecretVersion) (Map Text Text)
++
++instance JS.FromJSON WriteRequest where
++  parseJSON = JS.withObject "WriteRequest" \o -> do
++    options <- o .:? "options"
++    cas <- maybe (pure Nothing) (.:? "cas") options
++    secretData <- o .: "data"
++    pure (WriteRequest cas secretData)
++
++newtype PatchRequest = PatchRequest (Map Text (Maybe Text))
++
++instance JS.FromJSON PatchRequest where
++  parseJSON = JS.withObject "PatchRequest" \o -> PatchRequest <$> o .: "data"
++
++secretsApp :: Env () -> Wai.Application
++secretsApp env req respond = do
++  body <- Wai.strictRequestBody req
++  response <- case Wai.pathInfo req of
++    ["v1", mount, kind, rawId]
++      | mount /= envEnvironmentsMount env -> pure $ vaultError HTTP.status404 ("unknown mount: " <> mount)
++      | Just uuid <- UUID.fromText rawId -> route kind (EnvironmentId uuid) body
++      | otherwise -> pure $ vaultError HTTP.status404 ("not an environment id: " <> rawId)
++    _ -> pure $ vaultError HTTP.status404 "unsupported path"
++  respond response
++  where
++    route :: Text -> EnvironmentId -> BL.ByteString -> IO Wai.Response
++    route kind envId body = case (Wai.requestMethod req, kind) of
++      ("GET", "data") -> authorized envId $ Q.fetchSecret envId <&> \case
++        Nothing -> vaultError HTTP.status404 "secret not found"
++        Just (secretData, version) ->
++          jsonResponse HTTP.status200 $
++            JS.object ["data" .= JS.object ["data" .= secretData, "metadata" .= JS.object ["version" .= version]]]
++      -- Real Vault answers this route with KV metadata, but nimbus's
++      -- environment.fetchVersion decodes {data: {data}, version}, so serve that.
++      ("GET", "metadata") -> authorized envId $ Q.fetchSecret envId <&> \case
++        Nothing -> vaultError HTTP.status404 "secret not found"
++        Just (secretData, version) ->
++          jsonResponse HTTP.status200 $
++            JS.object ["data" .= JS.object ["data" .= secretData], "version" .= version]
++      (method, "data") | method `elem` ["POST", "PUT"] -> withBody body \(WriteRequest cas secretData) ->
++        authorized envId $ versionResponse <$> case cas of
++          Nothing -> Just <$> Q.writeSecret envId secretData
++          Just 0 -> Q.createSecret envId secretData
++          Just expected -> Q.checkAndSetSecret envId expected secretData
++      ("PATCH", "data") -> withBody body \(PatchRequest patch) ->
++        authorized envId $ Q.patchSecret envId patch <&> \case
++          Nothing -> vaultError HTTP.status404 "secret not found"
++          Just version -> jsonResponse HTTP.status200 (versionBody version)
++      ("DELETE", "data") ->
++        authorized envId $ Q.deleteSecret envId $> Wai.responseLBS HTTP.status204 [] ""
++      _ -> pure $ vaultError HTTP.status405 "unsupported method"
++
++    versionResponse :: Maybe SecretVersion -> Wai.Response
++    versionResponse = \case
++      Nothing -> vaultError HTTP.status400 "check-and-set parameter did not match the current version"
++      Just version -> jsonResponse HTTP.status200 (versionBody version)
++
++    versionBody :: SecretVersion -> JS.Value
++    versionBody version = JS.object ["data" .= JS.object ["version" .= version]]
++
++    withBody :: (JS.FromJSON a) => BL.ByteString -> (a -> IO Wai.Response) -> IO Wai.Response
++    withBody body k = case JS.eitherDecode body of
++      Left err -> pure $ vaultError HTTP.status400 ("invalid request body: " <> fromString err)
++      Right a -> k a
++
++    -- The token is a cluster token, and it only reaches environments of its own cluster.
++    authorized :: EnvironmentId -> PG.Transaction Void Wai.Response -> IO Wai.Response
++    authorized envId tx =
++      case lookup "X-Vault-Token" (Wai.requestHeaders req) >>= eitherToMaybe . Text.decodeUtf8' of
++        Nothing -> pure permissionDenied
++        Just token -> runAppM env . postgresM . PG.runTransaction $ do
++          tokenCluster <- BYOC.clusterConfigByToken (ClusterToken token)
++          envCluster <- Q.environmentClusterId envId
++          case (tokenCluster, envCluster) of
++            (Just ClusterConfig {clusterId}, Just envClusterId) | clusterId == envClusterId -> tx
++            _ -> pure permissionDenied
++
++    permissionDenied :: Wai.Response
++    permissionDenied = vaultError HTTP.status403 "permission denied"
++
++vaultError :: HTTP.Status -> Text -> Wai.Response
++vaultError status msg = jsonResponse status (JS.object ["errors" .= [msg]])
++
++jsonResponse :: HTTP.Status -> JS.Value -> Wai.Response
++jsonResponse status = Wai.responseLBS status [(HTTP.hContentType, "application/json")] . JS.encode
+--- a/src/Cloud/SelfHost/Secrets/Queries.hs
++++ b/src/Cloud/SelfHost/Secrets/Queries.hs
+@@ -0,0 +1,95 @@
++module Cloud.SelfHost.Secrets.Queries
++  ( SecretVersion,
++    environmentClusterId,
++    fetchSecret,
++    createSecret,
++    writeSecret,
++    checkAndSetSecret,
++    patchSecret,
++    deleteSecret,
++  )
++where
++
++import Cloud.Byoc.Env (ClusterId)
++import Cloud.Postgres qualified as PG
++import Cloud.Prelude
++import Cloud.Web.Types (EnvironmentId)
++import Data.Int (Int32)
++import Hasql.Interpolate (AsJsonb (..))
++
++type SecretVersion = Int32
++
++environmentClusterId :: EnvironmentId -> PG.Transaction e (Maybe ClusterId)
++environmentClusterId envId =
++  PG.query1Col
++    [PG.sql|
++        SELECT cluster_id FROM cloud_environments WHERE id = #{envId}
++      |]
++
++fetchSecret :: EnvironmentId -> PG.Transaction e (Maybe (Map Text Text, SecretVersion))
++fetchSecret envId = do
++  row <-
++    PG.query1Row
++      [PG.sql|
++          SELECT data, version FROM selfhost.environment_secrets
++            WHERE environment_id = #{envId}
++        |]
++  pure $ row <&> \(AsJsonb secretData, version) -> (secretData, version)
++
++-- | Inserts the secret unless one exists. Returns 'Nothing' if it already existed.
++createSecret :: EnvironmentId -> Map Text Text -> PG.Transaction e (Maybe SecretVersion)
++createSecret envId secretData = do
++  let json = AsJsonb secretData
++  PG.query1Col
++    [PG.sql|
++        INSERT INTO selfhost.environment_secrets (environment_id, data)
++          VALUES (#{envId}, #{json})
++          ON CONFLICT (environment_id) DO NOTHING
++          RETURNING version
++      |]
++
++writeSecret :: EnvironmentId -> Map Text Text -> PG.Transaction e SecretVersion
++writeSecret envId secretData = do
++  let json = AsJsonb secretData
++  PG.queryExpect1Col
++    [PG.sql|
++        INSERT INTO selfhost.environment_secrets (environment_id, data)
++          VALUES (#{envId}, #{json})
++          ON CONFLICT (environment_id) DO UPDATE
++            SET data = EXCLUDED.data,
++                version = selfhost.environment_secrets.version + 1,
++                updated_at = now()
++          RETURNING version
++      |]
++
++-- | Replaces the secret only if its current version matches. Returns 'Nothing' otherwise.
++checkAndSetSecret :: EnvironmentId -> SecretVersion -> Map Text Text -> PG.Transaction e (Maybe SecretVersion)
++checkAndSetSecret envId expectedVersion secretData = do
++  let json = AsJsonb secretData
++  PG.query1Col
++    [PG.sql|
++        UPDATE selfhost.environment_secrets
++          SET data = #{json}, version = version + 1, updated_at = now()
++          WHERE environment_id = #{envId} AND version = #{expectedVersion}
++          RETURNING version
++      |]
++
++-- | JSON merge-patch: a 'Nothing' value removes the key. Returns 'Nothing' if there's no secret.
++patchSecret :: EnvironmentId -> Map Text (Maybe Text) -> PG.Transaction e (Maybe SecretVersion)
++patchSecret envId patch = do
++  let json = AsJsonb patch
++  -- Stored values are always strings, so stripping nulls only removes the patched-out keys.
++  PG.query1Col
++    [PG.sql|
++        UPDATE selfhost.environment_secrets
++          SET data = jsonb_strip_nulls(data || #{json}), version = version + 1, updated_at = now()
++          WHERE environment_id = #{envId}
++          RETURNING version
++      |]
++
++deleteSecret :: EnvironmentId -> PG.Transaction e ()
++deleteSecret envId =
++  PG.execute_
++    [PG.sql|
++        DELETE FROM selfhost.environment_secrets WHERE environment_id = #{envId}
++      |]
+--- a/src/Cloud/Web/Environment.hs
++++ b/src/Cloud/Web/Environment.hs
+@@ -17,110 +17,47 @@
+ import Cloud.Byoc.Env (ClusterConfig(..), defaultClusterId)
+ import Cloud.Env
+ import Cloud.Errors (respondError)
++import Cloud.Postgres qualified as PG
++import Cloud.Postgres.App (postgresM)
+ import Cloud.Prelude
+-import Cloud.Utils.Logging
++import Cloud.SelfHost.Secrets.Queries qualified as Secrets
+ import Cloud.Web.App (WebApp)
+ import Cloud.Web.Errors
+-import Cloud.Web.Types (EnvironmentId (..), JsonMergePatch)
++import Cloud.Web.Types (EnvironmentId (..))
+ import Control.Monad.Reader (ask)
+-import Data.Aeson qualified as JS
+ import Data.Map qualified as Map
+-import Data.Text (pack, unpack)
+-import Network.HTTP.Types (Status (statusCode))
+-import Servant
+-import Servant.Client (ClientError (FailureResponse))
+-import Servant.Client qualified as S
+ import Cloud.Events (fireEnvironmentInvalidationEvent)
+ 
+--- API definition
+--- API definition
+-type VaultAPI =
+-  Capture "mount" Text :> "data" :> Header "X-Vault-Token" Text :> Capture "path" Text :> DeleteNoContent
+-    :<|> Capture "mount" Text :> "data" :> Header "X-Vault-Token" Text :> Capture "path" Text :> ReqBody '[JsonMergePatch] SecretPatch :> PatchNoContent
+-    :<|> Capture "mount" Text :> "data" :> Header "X-Vault-Token" Text :> Capture "path" Text :> ReqBody '[JSON] SecretRequest :> PostNoContent
+-
+-vaultApi :: Proxy VaultAPI
+-vaultApi = Proxy
+-
+-deleteSecret' :: Text -> Maybe Text -> Text -> S.ClientM NoContent
+-patchSecret' :: Text -> Maybe Text -> Text -> SecretPatch -> S.ClientM NoContent
+-storeSecret' :: Text -> Maybe Text -> Text -> SecretRequest -> S.ClientM NoContent
+-deleteSecret' :<|> patchSecret' :<|> storeSecret' = S.client vaultApi
+-
+--- Data types
+-
+-data SecretRequest = SecretRequest
+-  { options :: Maybe Options,
+-    data_ :: Map String String
+-  }
+-  deriving (Generic)
+-
+-instance JS.ToJSON SecretRequest where
+-  toJSON (SecretRequest options data_) = JS.object ["options" JS..= options, "data" JS..= data_]
+-
+-newtype Options = Options
+-  { cas :: Int
+-  }
+-  deriving (Generic)
+-
+-instance JS.ToJSON Options
+-
+-newtype SecretData = SecretData (Map String String)
+-
+-data SecretPatch = SecretPatch !(Maybe Options) !(Map String (Maybe String))
+-
+-instance MimeRender JsonMergePatch SecretPatch where
+-  mimeRender _ (SecretPatch options data_) = JS.encode $ JS.object ["options" JS..= options, "data" JS..= data_]
+-
+-instance JS.ToJSON SecretData where
+-  toJSON (SecretData data_) = JS.object ["data" JS..= data_]
+-
+-
+ -- Functions
+ createEnvironment :: EnvironmentId -> Text -> WebApp ()
+-createEnvironment envId name = do
+-  Env {envEnvironmentsMount, envVaultToken, envVaultClientEnv} <- ask
+-  -- we don't want to overwrite the environment if it already exists, so we supply a cas value of 0
+-  let req = SecretRequest (Just (Options {cas = 0})) (Map.singleton "environment" (unpack name))
+-  res <- liftIO $ S.runClientM (storeSecret' envEnvironmentsMount (Just envVaultToken) (pack $ show envId) req) envVaultClientEnv
+-  case res of
+-    Right _ -> return ()
+-    -- the environment already exists
+-    Left (FailureResponse _ err) | statusCode (S.responseStatusCode err) == 400 -> return ()
+-    Left err -> do
+-      respondError $ InternalError $ pack $ "Error creating environment: " ++ show err
++createEnvironment envId name =
++  -- we don't want to overwrite the environment if it already exists
++  void . postgresM . PG.runTransaction $ Secrets.createSecret envId (Map.singleton "environment" name)
+ 
+ 
+ -- deprecated this is just to support old clients
+ setEnvironmentVariable :: EnvironmentId -> Text -> Text -> WebApp ()
+ setEnvironmentVariable envId key value = do
+-  Env {envEnvironmentsMount, envNimbusConfig, envVaultToken, envVaultClientEnv } <- ask
+-
+-  let newData = Map.singleton (unpack key) (Just $ unpack value)
+-  res <- liftIO $ S.runClientM (patchSecret' envEnvironmentsMount (Just envVaultToken) (pack $ show envId) (SecretPatch Nothing newData)) envVaultClientEnv
++  Env {envNimbusConfig} <- ask
++  res <- postgresM . PG.runTransaction $ Secrets.patchSecret envId (Map.singleton key (Just value))
+   case res of
+-    Left err -> logErrorText $ pack $ "Error storing environment: " ++ show err
+-    Right _ -> fireEnvironmentInvalidationEvent envNimbusConfig defaultClusterId envId
++    Nothing -> respondError $ InternalError $ "Error storing environment: no secrets for environment " <> tshow envId
++    Just _ -> fireEnvironmentInvalidationEvent envNimbusConfig defaultClusterId envId
+ 
+ -- deprecated this is just to support old clients
+ deleteEnvironmentVariable :: EnvironmentId -> Text -> WebApp ()
+ deleteEnvironmentVariable envId key = do
+-  Env {envEnvironmentsMount, envNimbusConfig, envVaultToken, envVaultClientEnv } <- ask
+-  let newData = Map.singleton (unpack key) Nothing
+-  res <- liftIO $ S.runClientM (patchSecret' envEnvironmentsMount (Just envVaultToken) (pack $ show envId) (SecretPatch Nothing newData)) envVaultClientEnv
++  Env {envNimbusConfig} <- ask
++  res <- postgresM . PG.runTransaction $ Secrets.patchSecret envId (Map.singleton key Nothing)
+   case res of
+-    Left err -> do
+-      respondError $ InternalError $ pack $ "Error deleting environment variable: " ++ show err
+-    Right _ -> fireEnvironmentInvalidationEvent envNimbusConfig defaultClusterId envId
++    Nothing -> respondError $ InternalError $ "Error deleting environment variable: no secrets for environment " <> tshow envId
++    Just _ -> fireEnvironmentInvalidationEvent envNimbusConfig defaultClusterId envId
+ -- deprecated this is just to support old clients
+ deleteEnvironment :: EnvironmentId -> WebApp ()
+ deleteEnvironment envId = do
+-  Env {envEnvironmentsMount, envNimbusConfig, envVaultToken, envVaultClientEnv } <- ask
+-  res <- liftIO $ S.runClientM (deleteSecret' envEnvironmentsMount (Just envVaultToken) (pack $ show envId)) envVaultClientEnv
+-  case res of
+-    Left err -> do
+-      respondError $ InternalError $ pack $ "Error deleting environment: " ++ show err
+-    Right _ -> fireEnvironmentInvalidationEvent envNimbusConfig defaultClusterId envId
++  Env {envNimbusConfig} <- ask
++  postgresM . PG.runTransaction $ Secrets.deleteSecret envId
++  fireEnvironmentInvalidationEvent envNimbusConfig defaultClusterId envId
+ 
+ storagePoolAssignEnv :: ClusterConfig -> EnvironmentId -> WebApp ()
+ storagePoolAssignEnv cluster envId = do
+--- a/src/Cloud.hs
++++ b/src/Cloud.hs
+@@ -17,6 +17,7 @@
+ import Cloud.Errors (respondError)
+ import Cloud.Metrics
+ import Cloud.Prelude
++import Cloud.SelfHost.Secrets.Listener (runSecretsListener)
+ import Cloud.User.Env (AuthEnv (..))
+ import Cloud.Utils.Logging (LogMsg (..), Loggable, Severity (Error), logErrorText, withSeverity)
+ import Cloud.Utils.Logging qualified as Logging
+@@ -79,6 +80,8 @@
+   -- Loop tcp handler forever, logging any exceptions.
+   forkIO . void . forever . runAppM env $ UnliftIO.catchAny listenThread (Logging.logErrorText . tShow)
+   forkIO . void . runAppM env $ UnliftIO.catchAny consulRegistrationSelfCheck (Logging.logErrorText . tShow)
++  -- Linked so a listener failure (e.g. the port is taken) takes the whole process down.
++  UnliftIO.link =<< UnliftIO.async (runSecretsListener env)
+   app <- mkApp env
+   run (envServerPort env) app
+ 

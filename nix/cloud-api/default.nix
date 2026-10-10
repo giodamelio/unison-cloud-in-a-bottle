@@ -1,9 +1,20 @@
 {
+  applyPatches,
   haskell,
   libpq,
+  runCommand,
   stacklock2nix,
   src,
 }: let
+  patches = [
+    ../../patches/cloud-api/0001-remove-unused-api-types.patch
+    ../../patches/cloud-api/0002-production-mode-fixes.patch
+    ../../patches/cloud-api/0003-vault-to-postgres.patch
+    ../../patches/cloud-api/0004-header-trust-login.patch
+    ../../patches/cloud-api/0005-session-error-redirect.patch
+    ../../patches/cloud-api/0006-environment-access-check.patch
+  ];
+
   stacklock = stacklock2nix {
     stackYaml = src + "/stack.yaml";
     # postgresql-libpq links the C libpq, but inside the Haskell package set the name
@@ -14,9 +25,7 @@
         "postgresql-libpq" = _version: {inherit libpq;};
       };
     additionalHaskellPkgSetOverrides = hfinal: hprev: {
-      cloud = haskell.lib.appendPatches hprev.cloud [
-        ../../patches/cloud-api/0001-remove-unused-api-types.patch
-      ];
+      cloud = haskell.lib.appendPatches hprev.cloud patches;
 
       # Its tests need tmp-postgres, which isn't in the snapshot and is marked broken in nixpkgs.
       hasql-interpolate = haskell.lib.dontCheck hprev.hasql-interpolate;
@@ -43,5 +52,16 @@
     # lts-22.26 targets GHC 9.6.5; nixpkgs only carries the latest 9.6 point release.
     baseHaskellPkgSet = haskell.packages.ghc96;
   };
+
+  # The migrations aren't part of the Haskell build output, but the module's migrate unit
+  # needs them, including the ones the patches add.
+  sql = runCommand "cloud-api-sql" {} ''
+    cp -r ${applyPatches {
+      name = "cloud-api-patched-src";
+      inherit src patches;
+    }}/docker/sql $out
+  '';
 in
-  haskell.lib.justStaticExecutables stacklock.pkgSet.cloud
+  (haskell.lib.justStaticExecutables stacklock.pkgSet.cloud).overrideAttrs (old: {
+    passthru = old.passthru // {inherit sql;};
+  })
