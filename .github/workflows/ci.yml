@@ -10,8 +10,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # On ARM because lint-eval-demo-aarch64 builds stacklock2nix's small import-from-derivation
+  # steps for aarch64 while evaluating, which an x86 runner can't do.
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -24,9 +26,9 @@ jobs:
 
       - name: Run the lint-* checks
         run: |
-          nix eval --json .#checks.x86_64-linux \
+          nix eval --json .#checks.aarch64-linux \
             --apply 'cs: builtins.filter (n: builtins.substring 0 5 n == "lint-") (builtins.attrNames cs)' \
-            | jq -r '.[] | ".#checks.x86_64-linux.\(.)"' \
+            | jq -r '.[] | ".#checks.aarch64-linux.\(.)"' \
             | xargs nix build --print-build-logs --keep-going --no-link
 
   # Building and the VM tests only run on main: they're slow, and pushing needs the Cachix token.
