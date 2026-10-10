@@ -49,7 +49,9 @@
   # loki_task_name>} | userId=<user id>`, the labels upstream's Nomad log collection set.
   # nimbus writes one JSON object per line, prefixed with a zero-width space; the lines
   # about a user's job carry `userId` as the user's UUID in hex without dashes, which is
-  # also how cloud-api renders it in the query.
+  # also how cloud-api renders it in the query. The zero-width space is upstream's line
+  # separator for ingestion, not part of the line: the web UI JSON.parses each stored line
+  # and silently drops any it cannot parse, so it is stripped before shipping.
   shipperConfigJson = pkgs.writeText "unison-cloud-log-shipper.json" (builtins.toJSON {
     data_dir = shipperDir;
     sources.nimbus = {
@@ -62,11 +64,12 @@
       inputs = ["nimbus"];
       drop_on_abort = true;
       source = ''
-        parsed, err = parse_json(replace(string!(.message), r'^\x{200B}', ""))
+        line = replace(string!(.message), r'^\x{200B}', "")
+        parsed, err = parse_json(line)
         if err != null || !is_object(parsed) { abort }
         user_id = parsed.userId
         if !is_string(user_id) { abort }
-        . = {"message": .message, "timestamp": .timestamp, "userId": user_id}
+        . = {"message": line, "timestamp": .timestamp, "userId": user_id}
       '';
     };
     sinks.loki = {

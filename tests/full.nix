@@ -114,6 +114,28 @@
             f" --variable token={token} --variable 'line=deploy-program hello served' ${./hurl/logs.hurl}"
         )
 
+    with subtest("the UI's deployment page gets the service's log line in a shape it can parse"):
+        jar = "/tmp/ui-cookies"
+        hurl("${./hurl/login-ui.hurl}", "--test", f"--cookie-jar {jar}", "--variable ui=https://ui.test",
+             "--variable user=admin@cloud.test", "--variable handle=admin", f"--secret password={password}")
+        end = machine.succeed("date -u +%Y-%m-%dT%H:%M:%S.%3NZ").strip()
+        start = machine.succeed("date -u -d '48 hours ago' +%Y-%m-%dT%H:%M:%S.%3NZ").strip()
+        response = json.loads(hurl(
+            "${./hurl/logs-ui.hurl}", f"--cookie {jar}", "--variable ui=https://ui.test", f"--variable hash={hello['hash']}",
+            f"--variable start={start}", f"--variable end={end}", "--variable 'line=deploy-program hello served'",
+        ))
+        # The UI drops, without a word, every entry JSON.parse rejects or that lacks id, time
+        # and an object userMsg; nimbus's other user lines, such as UserServiceCall, lack them.
+        messages = []
+        for raw in response["logs"]:
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise AssertionError(f"the UI cannot parse log entry {raw!r}: {e}")
+            if isinstance(entry.get("id"), str) and isinstance(entry.get("time"), str) and isinstance(entry.get("userMsg"), dict):
+                messages.append(entry["userMsg"].get("message"))
+        assert "deploy-program hello served" in messages, response
+
     with subtest("the UI is served and built for this API"):
         index = machine.succeed(f"curl -sf --cacert {ca} https://ui.test/")
         assert "<html" in index.lower()
