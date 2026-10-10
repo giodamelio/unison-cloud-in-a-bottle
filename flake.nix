@@ -25,8 +25,16 @@
   in {
     nixosModules.default = import ./nixos inputs.self;
 
-    checks = forAllSystems (pkgs: {
+    checks = forAllSystems (defaultPkgs: let
+      # The module always runs the bundled Consul, which nixpkgs marks unfree (BSL 1.1).
+      pkgs = import inputs.nixpkgs {
+        inherit (defaultPkgs.stdenv.hostPlatform) system;
+        config.allowUnfreePredicate = pkg: inputs.nixpkgs.lib.getName pkg == "consul";
+      };
+    in {
       extenddb = pkgs.testers.runNixOSTest (import ./tests/extenddb.nix inputs.self);
+
+      cloud-api-boot = pkgs.testers.runNixOSTest (import ./tests/cloud-api-boot.nix inputs.self);
 
       nimbus-dynamo = pkgs.testers.runNixOSTest (import ./tests/nimbus-dynamo {
         inherit (inputs) self;

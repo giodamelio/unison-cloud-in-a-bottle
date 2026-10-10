@@ -33,6 +33,15 @@
       generate extenddb-admin-password openssl rand -hex 24
       generate extenddb-access-key-id access_key_id
       generate extenddb-secret-access-key openssl rand -hex 20
+      generate s3-access-key-id access_key_id
+      generate s3-secret-access-key openssl rand -hex 20
+      generate redis-password openssl rand -hex 24
+      # cloud-api reads its Ed25519 keys as the raw bytes of an environment variable and
+      # needs exactly 32 of them, so they must be printable: 24 random bytes in base64.
+      generate cloud-eddsa-key openssl rand -base64 24
+      generate share-eddsa-key openssl rand -base64 24
+      generate cloud-hmac-key openssl rand -hex 32
+      generate cluster-token openssl rand -hex 32
 
       if [ ! -e ca.crt ]; then
         openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \

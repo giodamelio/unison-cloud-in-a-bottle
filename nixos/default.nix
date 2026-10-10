@@ -12,6 +12,9 @@ in {
     ./secrets.nix
     ./postgresql.nix
     ./extenddb.nix
+    ./s3.nix
+    ./redis.nix
+    ./consul.nix
   ];
 
   options.services.unison-cloud = {
