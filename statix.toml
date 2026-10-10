@@ -1,0 +1,2 @@
+# Repeated keys like `systemd.services.a = ...; systemd.services.b = ...;` are idiomatic in NixOS modules.
+disabled = ["repeated_keys"]
