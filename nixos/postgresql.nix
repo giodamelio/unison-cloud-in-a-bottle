@@ -6,6 +6,8 @@
 }: let
   cfg = config.services.unison-cloud;
   bundled = cfg.database.mode == "bundled";
+  external = cfg.database.mode == "external";
+  ext = cfg.database.external;
   pg =
     if bundled
     then cfg.database.package
@@ -32,18 +34,92 @@
     + lib.concatStrings (lib.mapAttrsToList databaseSql cfg.internal.postgresDatabases)
   );
 in {
-  options.services.unison-cloud.database.mode = lib.mkOption {
-    type = lib.types.enum ["bundled" "host"];
-    default = "bundled";
-    description = ''
-      Where the databases live. `bundled` runs the module's own Postgres inside the
-      namespace, socket-only. `host` uses the host's `services.postgresql`: the module
-      creates its roles, databases and extensions there, and every service connects over
-      `/run/postgresql` with peer authentication, which the network namespace doesn't affect.
-    '';
+  options.services.unison-cloud.database = {
+    mode = lib.mkOption {
+      type = lib.types.enum ["bundled" "host" "external"];
+      default = "bundled";
+      description = ''
+        Where the databases live. `bundled` runs the module's own Postgres inside the
+        namespace, socket-only. `host` uses the host's `services.postgresql`: the module
+        creates its roles, databases and extensions there, and every service connects over
+        `/run/postgresql` with peer authentication, which the network namespace doesn't
+        affect. `external` connects over TCP with passwords to a server you prepare
+        yourself (see `database.external`); add its address to `egress.allowedDestinations`.
+      '';
+    };
+
+    external = {
+      host = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Address of the external Postgres server.";
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 5432;
+      };
+
+      cloudApi = {
+        user = lib.mkOption {
+          type = lib.types.str;
+          default = "unison_cloud";
+          description = ''
+            Role cloud-api connects as. It must own `cloudApi.database`, and the
+            `uuid-ossp`, `citext` and `moddatetime` extensions must already exist in that
+            database, because creating `moddatetime` needs a superuser.
+          '';
+        };
+
+        database = lib.mkOption {
+          type = lib.types.str;
+          default = "unison_cloud";
+        };
+
+        passwordFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+        };
+      };
+
+      extenddb = {
+        user = lib.mkOption {
+          type = lib.types.str;
+          default = "extenddb";
+          description = ''
+            Role ExtendDB connects as. It needs `CREATEDB`: on first start ExtendDB creates
+            and owns the `extenddb` and `extenddb_catalog` databases, which must not exist yet.
+          '';
+        };
+
+        passwordFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+        };
+      };
+    };
   };
 
   options.services.unison-cloud.internal = {
+    postgres = lib.mkOption {
+      type = lib.types.attrs;
+      internal = true;
+      readOnly = true;
+      default = {
+        inherit external;
+        host =
+          if external
+          then ext.host
+          else cfg.internal.postgresSocketDir;
+        port = toString (
+          if external
+          then ext.port
+          else 5432
+        );
+      };
+      description = "Where every service connects: a socket directory, or the external server.";
+    };
+
     postgresSocketDir = lib.mkOption {
       type = lib.types.str;
       internal = true;
@@ -99,8 +175,12 @@ in {
     {
       assertions = [
         {
-          assertion = bundled || config.services.postgresql.enable;
+          assertion = cfg.database.mode != "host" || config.services.postgresql.enable;
           message = "services.unison-cloud: database.mode = \"host\" needs services.postgresql.enable = true.";
+        }
+        {
+          assertion = !external || (ext.host != null && ext.cloudApi.passwordFile != null && ext.extenddb.passwordFile != null);
+          message = "services.unison-cloud: database.mode = \"external\" needs database.external.host and both passwordFile options.";
         }
       ];
 
@@ -112,7 +192,19 @@ in {
 
       systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [
         cfg.internal.inNamespace
-        {
+        (lib.mkIf external {
+          description = "Wait for the external Postgres server";
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            DynamicUser = true;
+            ExecStart = pkgs.writeShellScript "unison-cloud-postgresql-wait" ''
+              until ${cfg.database.package}/bin/pg_isready -h ${ext.host} -p ${toString ext.port}; do sleep 1; done
+            '';
+            TimeoutStartSec = 300;
+          };
+        })
+        (lib.mkIf (!external) {
           description = "Create Unison Cloud database roles, databases and extensions";
           requires = [cfg.internal.postgresUnit];
           after = [cfg.internal.postgresUnit];
@@ -123,7 +215,7 @@ in {
             Group = superuser;
             ExecStart = "${pg}/bin/psql -h ${cfg.internal.postgresSocketDir} -d postgres -X -v ON_ERROR_STOP=1 -f ${setupSql}";
           };
-        }
+        })
       ];
     }
 

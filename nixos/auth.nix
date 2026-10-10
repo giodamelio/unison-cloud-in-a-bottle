@@ -8,6 +8,7 @@
   oidc = cfg.auth.oidc;
   dex = cfg.auth.dex;
   secrets = "${cfg.stateDir}/secrets";
+  user = "unison-cloud-oauth2-proxy";
   apiOrigin = cfg.internal.publicUrl.api;
   dexLoopback = "http://127.0.0.1:${toString cfg.internal.dexPort}/dex";
 
@@ -122,7 +123,17 @@ in {
       }
     ];
 
-    services.unison-cloud.internal.ingressSockets.oauth2-proxy = cfg.internal.oauth2ProxyPort;
+    users.users.${user} = {
+      isSystemUser = true;
+      group = user;
+    };
+    users.groups.${user} = {};
+
+    services.unison-cloud.internal = {
+      ingressSockets.oauth2-proxy = cfg.internal.oauth2ProxyPort;
+      # An external provider is on the internet, which only egress users may reach.
+      egressUsers = lib.mkIf (!dex.enable) [user];
+    };
 
     systemd.services.unison-cloud-oauth2-proxy = lib.mkMerge [
       cfg.internal.inNamespace
@@ -132,7 +143,8 @@ in {
         requires = ["unison-cloud-secrets.service"] ++ lib.optional dex.enable "unison-cloud-dex.service";
         after = ["unison-cloud-secrets.service"] ++ lib.optional dex.enable "unison-cloud-dex.service";
         serviceConfig = {
-          DynamicUser = true;
+          User = user;
+          Group = user;
           LoadCredential = [
             "client-secret:${
               if dex.enable

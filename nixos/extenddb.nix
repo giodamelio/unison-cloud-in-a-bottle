@@ -10,6 +10,13 @@
   secrets = "${cfg.stateDir}/secrets";
   endpoint = "https://127.0.0.1:${toString cfg.extenddb.port}";
   extenddb = lib.getExe cfg.extenddb.package;
+  pg = cfg.internal.postgres;
+  ext = cfg.database.external.extenddb;
+  # Locally, peer authentication maps the service's own user to its role and ignores passwords.
+  pgUser =
+    if pg.external
+    then ext.user
+    else user;
 
   # Fixed so the setup can find what it created on an earlier start.
   accountId = "100000000001";
@@ -144,24 +151,37 @@ in {
           User = user;
           Group = user;
           WorkingDirectory = home;
-          LoadCredential = [
-            "admin-password:${secrets}/extenddb-admin-password"
-            "tls-cert:${secrets}/extenddb.crt"
-            "tls-key:${secrets}/extenddb.key"
-          ];
-          # `init` refuses to run once its databases exist, so it only runs while there's no config yet.
-          # It connects as the service's own role through peer authentication, so the password is never checked.
+          LoadCredential =
+            [
+              "admin-password:${secrets}/extenddb-admin-password"
+              "tls-cert:${secrets}/extenddb.crt"
+              "tls-key:${secrets}/extenddb.key"
+            ]
+            ++ lib.optional pg.external "db-password:${ext.passwordFile}";
+          # `init` refuses to run once its databases exist, so it only runs while there's no
+          # config yet. It connects as ExtendDB's own role, which needs CREATEDB, both as the
+          # admin and as the application user.
           ExecStartPre = pkgs.writeShellScript "unison-cloud-extenddb-init" ''
+            ${
+              if pg.external
+              then ''
+                EXTENDDB_PG_PASSWORD=$(< "$CREDENTIALS_DIRECTORY/db-password")
+                EXTENDDB_APP_PASSWORD=$EXTENDDB_PG_PASSWORD
+              ''
+              else ''
+                EXTENDDB_APP_PASSWORD=unused-with-peer-auth
+              ''
+            }
+            export EXTENDDB_PG_PASSWORD EXTENDDB_APP_PASSWORD
             if [ ! -e extenddb.toml ]; then
               EXTENDDB_ADMIN_USER=admin \
               EXTENDDB_ADMIN_PASSWORD=$(< "$CREDENTIALS_DIRECTORY/admin-password") \
-              EXTENDDB_APP_PASSWORD=unused-with-peer-auth \
                 ${extenddb} init --config extenddb.toml \
-                  --pg-host ${cfg.internal.postgresSocketDir} \
-                  --pg-user ${user} --extenddb-user ${user} \
+                  --pg-host ${pg.host} --pg-port ${pg.port} \
+                  --pg-user ${pgUser} --extenddb-user ${pgUser} \
                   --data-db extenddb --bind-addr 127.0.0.1
             else
-              ${extenddb} migrate --config extenddb.toml --yes --pg-user ${user}
+              ${extenddb} migrate --config extenddb.toml --yes --pg-user ${pgUser}
             fi
           '';
           ExecStart = "${extenddb} serve --foreground --config extenddb.toml";

@@ -6,10 +6,31 @@
 }: let
   cfg = config.services.unison-cloud;
   user = "unison-cloud-api";
-  database = "unison_cloud";
   secrets = "${cfg.stateDir}/secrets";
-  socketDir = cfg.internal.postgresSocketDir;
   psql = "${cfg.database.package}/bin/psql";
+  pg = cfg.internal.postgres;
+  ext = cfg.database.external.cloudApi;
+  database =
+    if pg.external
+    then ext.database
+    else "unison_cloud";
+
+  # libpq's environment variables configure every client here: psql in the migrate and
+  # seed units, and cloud-api's connection string, assembled at start.
+  pgEnvironment = {
+    PGHOST = pg.host;
+    PGPORT = pg.port;
+    PGDATABASE = database;
+    PGUSER =
+      if pg.external
+      then ext.user
+      else user;
+  };
+  pgCredentials = lib.optional pg.external "db-password:${ext.passwordFile}";
+  exportPassword = lib.optionalString pg.external ''
+    PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/db-password")
+    export PGPASSWORD
+  '';
 
   # In production mode cloud-api files new environments under this cluster ID
   # (`defaultClusterId`), so the seeded cluster and nimbus's token must use it.
@@ -21,9 +42,10 @@
     name = "unison-cloud-migrate";
     runtimeInputs = [cfg.database.package pkgs.coreutils pkgs.gnugrep];
     text = ''
+      ${exportPassword}
       sql_dir=${cfg.cloudApi.package.sql}
       run_psql() {
-        psql -h ${socketDir} -d ${database} -X -q -v ON_ERROR_STOP=1 "$@"
+        psql -X -q -v ON_ERROR_STOP=1 "$@"
       }
 
       run_psql -c "CREATE SCHEMA IF NOT EXISTS selfhost" \
@@ -93,6 +115,15 @@
     export SHARE_EDDSA_KEY=$(< "$creds/share-eddsa-key")
     export CLOUD_HMAC_KEY=$(< "$creds/cloud-hmac-key")
     export CLOUD_INTERNAL_AUTH_TOKEN=$(< "$creds/internal-auth-token")
+    CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
+    ${lib.optionalString pg.external ''
+      # libpq keyword values are single-quoted, with backslash and quote escaped.
+      password=$(< "$creds/db-password")
+      password=''${password//\\/\\\\}
+      password=''${password//\'/\\\'}
+      CLOUD_POSTGRES="$CLOUD_POSTGRES password='$password'"
+    ''}
+    export CLOUD_POSTGRES
     exec ${lib.getExe' cfg.cloudApi.package "cloud-exe"}
   '';
 in {
@@ -137,11 +168,13 @@ in {
         description = "Apply Unison Cloud database migrations";
         requires = ["unison-cloud-postgresql-setup.service"];
         after = ["unison-cloud-postgresql-setup.service"];
+        environment = pgEnvironment;
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
           User = user;
           Group = user;
+          LoadCredential = pgCredentials;
           ExecStart = lib.getExe migrate;
         };
       }
@@ -153,14 +186,16 @@ in {
         description = "Register the Unison Cloud cluster and its nimbus token";
         requires = ["unison-cloud-migrate.service" "unison-cloud-secrets.service"];
         after = ["unison-cloud-migrate.service" "unison-cloud-secrets.service"];
+        environment = pgEnvironment;
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
           User = user;
           Group = user;
-          LoadCredential = ["cluster-token:${secrets}/cluster-token"];
+          LoadCredential = ["cluster-token:${secrets}/cluster-token"] ++ pgCredentials;
           ExecStart = pkgs.writeShellScript "unison-cloud-seed" ''
-            ${psql} -h ${socketDir} -d ${database} -X -q -v ON_ERROR_STOP=1 -1 \
+            ${exportPassword}
+            ${psql} -X -q -v ON_ERROR_STOP=1 -1 \
               -v token="$(< "$CREDENTIALS_DIRECTORY/cluster-token")" -f ${seedSql}
           '';
         };
@@ -184,7 +219,7 @@ in {
           "unison-cloud-consul.service"
           "unison-cloud-s3.service"
         ];
-        environment = {
+        environment = pgEnvironment // {
           CLOUD_DEPLOYMENT = "production";
           CLOUD_COMMIT = cfg.cloudApi.package.version;
           CLOUD_LOG_LEVEL = "INFO";
@@ -200,7 +235,6 @@ in {
           NOMAD_HOST_IP_cloud_tcp = "127.0.0.1";
           NOMAD_ALLOC_PORT_cloud_tcp = "5425";
 
-          CLOUD_POSTGRES = "host=${socketDir} dbname=${database}";
           CLOUD_POSTGRES_CONN_MAX = "10";
           CONSUL_HOST = "http://127.0.0.1:${toString cfg.internal.consulPort}";
 
@@ -235,7 +269,8 @@ in {
             "share-eddsa-key"
             "cloud-hmac-key"
             "internal-auth-token"
-          ];
+          ]
+          ++ pgCredentials;
           ExecStart = start;
           Restart = "on-failure";
         };
