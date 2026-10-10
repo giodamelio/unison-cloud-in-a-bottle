@@ -43,6 +43,8 @@
 
       auth = pkgs.testers.runNixOSTest (import ./tests/auth.nix inputs.self);
 
+      variants = pkgs.testers.runNixOSTest (import ./tests/variants.nix inputs.self);
+
       nimbus-dynamo = pkgs.testers.runNixOSTest (import ./tests/nimbus-dynamo {
         inherit (inputs) self;
         dynamoProbe = pkgs.callPackage ./tests/nimbus-dynamo/probe.nix {

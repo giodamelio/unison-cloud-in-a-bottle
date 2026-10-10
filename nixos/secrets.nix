@@ -15,6 +15,12 @@
       mkdir -p ${dir}
       cd ${dir}
 
+      ${lib.concatStrings (lib.mapAttrsToList (name: source: ''
+          # Supplied secrets replace generated ones on every start, so rotating the file takes effect.
+          tr -d '\n' < ${lib.escapeShellArg source} > ${name}.tmp
+          mv ${name}.tmp ${name}
+        '')
+        cfg.secrets.files)}
       generate() {
         local file=$1
         shift
@@ -78,6 +84,25 @@
     '';
   };
 in {
+  options.services.unison-cloud.secrets.files = lib.mkOption {
+    type = lib.types.attrsOf lib.types.str;
+    default = {};
+    example = {
+      cloud-eddsa-key = "/run/agenix/unison-cloud-signing-key";
+      dex-client-secret = "/run/secrets/dex-client-secret";
+    };
+    description = ''
+      Secrets to supply instead of generating, by name in `<stateDir>/secrets/`. Every
+      start copies each file over the generated one; the rest are generated once and kept.
+      Names: `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each), `cloud-hmac-key`,
+      `cluster-token`, `internal-auth-token`, `redis-password`, `s3-access-key-id`,
+      `s3-secret-access-key`, `extenddb-access-key-id`, `extenddb-secret-access-key`,
+      `extenddb-admin-password`, `dex-client-secret`, `oauth2-proxy-cookie-secret`
+      (16, 24 or 32 bytes), `dex-admin-password`.
+      Paths are strings so the secrets never enter the Nix store.
+    '';
+  };
+
   config = lib.mkIf cfg.enable {
     systemd.services.unison-cloud-secrets = {
       description = "Generate Unison Cloud secrets";

@@ -5,8 +5,17 @@
   ...
 }: let
   cfg = config.services.unison-cloud;
-  pg = cfg.database.package;
+  bundled = cfg.database.mode == "bundled";
+  pg =
+    if bundled
+    then cfg.database.package
+    else config.services.postgresql.package;
   user = "unison-cloud-postgres";
+  # The role that owns the server: our own user for the bundled one, `postgres` on the host.
+  superuser =
+    if bundled
+    then user
+    else "postgres";
   dataDir = "${cfg.stateDir}/postgresql/${lib.versions.major pg.version}";
 
   roleSql = name: role: ''
@@ -23,13 +32,38 @@
     + lib.concatStrings (lib.mapAttrsToList databaseSql cfg.internal.postgresDatabases)
   );
 in {
+  options.services.unison-cloud.database.mode = lib.mkOption {
+    type = lib.types.enum ["bundled" "host"];
+    default = "bundled";
+    description = ''
+      Where the databases live. `bundled` runs the module's own Postgres inside the
+      namespace, socket-only. `host` uses the host's `services.postgresql`: the module
+      creates its roles, databases and extensions there, and every service connects over
+      `/run/postgresql` with peer authentication, which the network namespace doesn't affect.
+    '';
+  };
+
   options.services.unison-cloud.internal = {
     postgresSocketDir = lib.mkOption {
       type = lib.types.str;
       internal = true;
       readOnly = true;
-      default = "/run/unison-cloud-postgresql";
-      description = "Directory holding the bundled Postgres's Unix socket.";
+      default =
+        if bundled
+        then "/run/unison-cloud-postgresql"
+        else "/run/postgresql";
+      description = "Directory holding the Postgres Unix socket every service connects through.";
+    };
+
+    postgresUnit = lib.mkOption {
+      type = lib.types.str;
+      internal = true;
+      readOnly = true;
+      default =
+        if bundled
+        then "unison-cloud-postgresql.service"
+        else "postgresql.service";
+      description = "The unit running the Postgres server.";
     };
 
     postgresRoles = lib.mkOption {
@@ -61,61 +95,77 @@ in {
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    users.users.${user} = {
-      isSystemUser = true;
-      group = user;
-    };
-    users.groups.${user} = {};
+  config = lib.mkIf cfg.enable (lib.mkMerge [
+    {
+      assertions = [
+        {
+          assertion = bundled || config.services.postgresql.enable;
+          message = "services.unison-cloud: database.mode = \"host\" needs services.postgresql.enable = true.";
+        }
+      ];
 
-    systemd.tmpfiles.settings.unison-cloud-postgresql = {
-      ${cfg.stateDir}.d = {
+      systemd.tmpfiles.settings.unison-cloud-state.${cfg.stateDir}.d = {
         user = "root";
         group = "root";
         mode = "0755";
       };
-      "${cfg.stateDir}/postgresql".d = {
+
+      systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [
+        cfg.internal.inNamespace
+        {
+          description = "Create Unison Cloud database roles, databases and extensions";
+          requires = [cfg.internal.postgresUnit];
+          after = [cfg.internal.postgresUnit];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            User = superuser;
+            Group = superuser;
+            ExecStart = "${pg}/bin/psql -h ${cfg.internal.postgresSocketDir} -d postgres -X -v ON_ERROR_STOP=1 -f ${setupSql}";
+          };
+        }
+      ];
+    }
+
+    (lib.mkIf bundled {
+      users.users.${user} = {
+        isSystemUser = true;
+        group = user;
+      };
+      users.groups.${user} = {};
+
+      systemd.tmpfiles.settings.unison-cloud-postgresql."${cfg.stateDir}/postgresql".d = {
         inherit user;
         group = user;
         mode = "0700";
       };
-    };
 
-    systemd.services.unison-cloud-postgresql = lib.mkMerge [cfg.internal.inNamespace {
-      description = "Unison Cloud bundled PostgreSQL";
-      serviceConfig = {
-        Type = "notify";
-        User = user;
-        Group = user;
-        RuntimeDirectory = baseNameOf cfg.internal.postgresSocketDir;
-        RuntimeDirectoryMode = "0755";
-        ExecStartPre = pkgs.writeShellScript "unison-cloud-postgresql-init" ''
-          if [ ! -e ${dataDir}/PG_VERSION ]; then
-            mkdir -p ${dataDir}
-            ${pg}/bin/initdb -D ${dataDir} --auth-local=peer --auth-host=reject \
-              --encoding=UTF8 --locale=C --no-instructions
-          fi
-        '';
-        # No TCP listener at all; peer authentication over the socket is the only way in.
-        ExecStart = "${pg}/bin/postgres -D ${dataDir} -c listen_addresses= -c unix_socket_directories=${cfg.internal.postgresSocketDir}";
-        ExecReload = "${lib.getExe' pkgs.coreutils "kill"} -HUP $MAINPID";
-        KillMode = "mixed";
-        KillSignal = "SIGINT";
-        TimeoutSec = 120;
-      };
-    }];
-
-    systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [cfg.internal.inNamespace {
-      description = "Create Unison Cloud database roles";
-      requires = ["unison-cloud-postgresql.service"];
-      after = ["unison-cloud-postgresql.service"];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        User = user;
-        Group = user;
-        ExecStart = "${pg}/bin/psql -h ${cfg.internal.postgresSocketDir} -d postgres -v ON_ERROR_STOP=1 -f ${setupSql}";
-      };
-    }];
-  };
+      systemd.services.unison-cloud-postgresql = lib.mkMerge [
+        cfg.internal.inNamespace
+        {
+          description = "Unison Cloud bundled PostgreSQL";
+          serviceConfig = {
+            Type = "notify";
+            User = user;
+            Group = user;
+            RuntimeDirectory = baseNameOf cfg.internal.postgresSocketDir;
+            RuntimeDirectoryMode = "0755";
+            ExecStartPre = pkgs.writeShellScript "unison-cloud-postgresql-init" ''
+              if [ ! -e ${dataDir}/PG_VERSION ]; then
+                mkdir -p ${dataDir}
+                ${pg}/bin/initdb -D ${dataDir} --auth-local=peer --auth-host=reject \
+                  --encoding=UTF8 --locale=C --no-instructions
+              fi
+            '';
+            # No TCP listener at all; peer authentication over the socket is the only way in.
+            ExecStart = "${pg}/bin/postgres -D ${dataDir} -c listen_addresses= -c unix_socket_directories=${cfg.internal.postgresSocketDir}";
+            ExecReload = "${lib.getExe' pkgs.coreutils "kill"} -HUP $MAINPID";
+            KillMode = "mixed";
+            KillSignal = "SIGINT";
+            TimeoutSec = 120;
+          };
+        }
+      ];
+    })
+  ]);
 }
