@@ -32,6 +32,10 @@
           s = builtins.substring;
         in "${s 0 4 d}-${s 4 2 d}-${s 6 2 d}T${s 8 2 d}:${s 10 2 d}:${s 12 2 d}Z";
       };
+
+      nimbus = pkgs.callPackage ./nix/nimbus {
+        inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+      };
     });
 
     devShells = forAllSystems (pkgs: let
