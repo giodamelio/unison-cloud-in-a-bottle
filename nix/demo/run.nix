@@ -127,14 +127,14 @@ in
 
         UI:     ${url.ui}
         API:    ${url.api}
-        Login:  demo / demo
+        Login:  demo@unison.localhost / demo
         Admin:  admin@${cfg.domains.api} / $(cat "$state/xchg/dex-admin-password")
                 (inside the VM: ${cfg.stateDir}/secrets/dex-admin-password)
 
       Deploy from ucm:
         1. In another terminal, enter this flake's demo shell (nix develop <flake>#demo).
            It provides ucm and points the cloud client at this VM.
-        2. Log in once, as demo / demo in the browser window ucm opens:
+        2. Log in once, as demo@unison.localhost / demo in the browser window ucm opens:
              UNISON_SHARE_HOST=${url.api} ucm
              auth.login
            Then quit that ucm. The login is stored for ${cfg.domains.api}:${toString cfg.ingress.port} only,

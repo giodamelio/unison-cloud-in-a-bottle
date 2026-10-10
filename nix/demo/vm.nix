@@ -41,7 +41,7 @@ in {
 
       UI:    ${url.ui}
       API:   ${url.api}
-      Login: demo / demo
+      Login: demo@unison.localhost / demo
       Admin: admin@${cfg.domains.api}, password in ${cfg.stateDir}/secrets/dex-admin-password
 
   '';
