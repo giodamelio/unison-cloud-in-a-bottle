@@ -7,6 +7,7 @@
   version,
   apiUrl,
   websiteUrl,
+  servicesUrl,
 }: let
   elmJson = lib.importJSON (src + "/elm.json");
   elmGitJson = lib.importJSON (src + "/elm-git.json");
@@ -26,6 +27,7 @@ in
       ../../patches/cloud-ui/0001-remove-intercom.patch
       ../../patches/cloud-ui/0002-remove-billing.patch
       ../../patches/cloud-ui/0003-remove-status-link.patch
+      ../../patches/cloud-ui/0004-path-based-service-urls.patch
     ];
 
     npmDeps = importNpmLock {npmRoot = src;};
@@ -38,6 +40,7 @@ in
       # webpack.prod.js falls back to the hosted unison.cloud endpoints when these are unset.
       API_URL = apiUrl;
       WEBSITE_URL = websiteUrl;
+      SERVICES_URL = servicesUrl;
     };
 
     preConfigure = ''

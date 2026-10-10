@@ -26,6 +26,7 @@ in {
       default = cfg.internal.uiPackage.override {
         apiUrl = "${cfg.internal.publicUrl.api}/v2";
         websiteUrl = cfg.internal.publicUrl.ui;
+        servicesUrl = "${cfg.internal.publicUrl.apps}/services";
       };
       defaultText = lib.literalMD "the cloud UI built for `domains.api`";
       description = "The cloud UI, built for this deployment's API origin. Serve it as a single-page app.";
