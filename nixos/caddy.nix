@@ -5,6 +5,7 @@
 }: let
   cfg = config.services.unison-cloud;
   sock = name: "unix//run/unison-cloud/${name}.sock";
+  appsSockets = lib.filter (lib.hasPrefix "nimbus-interactive-") (lib.attrNames cfg.internal.ingressSockets);
 in {
   options.services.unison-cloud = {
     caddy.enable = lib.mkOption {
@@ -67,6 +68,16 @@ in {
 
         handle {
           reverse_proxy ${sock "cloud-api"}
+        }
+      '';
+
+      # Any interactive node can take any deploy and serve any service. The public port has
+      # no health route, so failed nodes are skipped passively.
+      virtualHosts.${cfg.internal.publicUrl.apps}.extraConfig = lib.mkIf (appsSockets != []) ''
+        reverse_proxy ${lib.concatMapStringsSep " " sock appsSockets} {
+          lb_policy round_robin
+          lb_retries 2
+          fail_duration 30s
         }
       '';
 

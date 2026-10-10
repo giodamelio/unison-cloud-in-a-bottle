@@ -61,6 +61,13 @@
           inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
         };
       });
+
+      full = pkgs.testers.runNixOSTest (import ./tests/full.nix {
+        inherit (inputs) self;
+        deployProgram = pkgs.callPackage ./tests/deploy-program {
+          inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+        };
+      });
     });
 
     packages = forAllSystems (pkgs: {
