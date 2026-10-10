@@ -27,8 +27,33 @@
   outputs = inputs: let
     systems = ["x86_64-linux" "aarch64-linux"];
     forAllSystems = f: inputs.nixpkgs.lib.genAttrs systems (system: f inputs.nixpkgs.legacyPackages.${system});
+
+    demoName = system:
+      if system == "x86_64-linux"
+      then "demo"
+      else "demo-${system}";
+    demoFor = pkgs: inputs.self.nixosConfigurations.${demoName pkgs.stdenv.hostPlatform.system};
+    demoRun = pkgs: pkgs.callPackage ./nix/demo/run.nix {nixos = demoFor pkgs;};
   in {
     nixosModules.default = import ./nixos inputs.self;
+
+    nixosConfigurations = inputs.nixpkgs.lib.listToAttrs (map (system:
+      inputs.nixpkgs.lib.nameValuePair (demoName system) (inputs.nixpkgs.lib.nixosSystem {
+        modules = [
+          (import ./nix/demo/configuration.nix inputs.self)
+          ./nix/demo/vm.nix
+          {nixpkgs.hostPlatform = system;}
+        ];
+      }))
+    systems);
+
+    apps = forAllSystems (pkgs: {
+      demo = {
+        type = "app";
+        program = pkgs.lib.getExe (demoRun pkgs);
+        meta.description = "Boot the self-hosted Unison Cloud demo VM and print its URLs and login";
+      };
+    });
 
     checks = forAllSystems (defaultPkgs: let
       # The module always runs the bundled Consul, which nixpkgs marks unfree (BSL 1.1).
@@ -73,6 +98,13 @@
           inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
         };
       });
+
+      demo = pkgs.testers.runNixOSTest (import ./tests/demo.nix {
+        inherit (inputs) self;
+        deployProgram = pkgs.callPackage ./tests/deploy-program {
+          inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+        };
+      });
     });
 
     packages = forAllSystems (pkgs: {
@@ -103,7 +135,13 @@
       };
 
       push-cache = pkgs.callPackage ./nix/push-cache {
-        packages = removeAttrs inputs.self.packages.${pkgs.stdenv.hostPlatform.system} ["push-cache"];
+        packages =
+          removeAttrs inputs.self.packages.${pkgs.stdenv.hostPlatform.system} ["push-cache"]
+          // {
+            demo-vm = (demoFor pkgs).config.system.build.vm;
+            demo-run = demoRun pkgs;
+            demo-shell = inputs.self.devShells.${pkgs.stdenv.hostPlatform.system}.demo.inputDerivation;
+          };
       };
     });
 
@@ -116,6 +154,18 @@
           unison.ucm-desktop
         ];
       };
+
+      demo = let
+        cfg = (demoFor pkgs).config.services.unison-cloud;
+      in
+        pkgs.mkShell {
+          packages = [unison.ucm-bin];
+          UNISON_CLOUD_HOST = cfg.domains.api;
+          UNISON_CLOUD_HTTP_PORT = toString cfg.ingress.port;
+          UNISON_CLOUD_USE_TLS = "false";
+          # ucm stores `auth.login` credentials under the codeserver's host and port.
+          UNISON_CLOUD_CREDENTIALS_HOST = "${cfg.domains.api}:${toString cfg.ingress.port}";
+        };
     });
   };
 }
