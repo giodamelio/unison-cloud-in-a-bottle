@@ -42,6 +42,7 @@
       generate share-eddsa-key openssl rand -base64 24
       generate cloud-hmac-key openssl rand -hex 32
       generate cluster-token openssl rand -hex 32
+      generate internal-auth-token openssl rand -hex 32
 
       if [ ! -e ca.crt ]; then
         openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \

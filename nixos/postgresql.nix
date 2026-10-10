@@ -13,7 +13,15 @@
     SELECT format('CREATE ROLE %I', '${name}') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${name}') \gexec
     ALTER ROLE "${name}" LOGIN ${lib.optionalString (!role.createdb) "NO"}CREATEDB;
   '';
-  setupSql = pkgs.writeText "unison-cloud-postgresql-setup.sql" (lib.concatStrings (lib.mapAttrsToList roleSql cfg.internal.postgresRoles));
+  databaseSql = name: db: ''
+    SELECT format('CREATE DATABASE %I OWNER %I', '${name}', '${db.owner}') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${name}') \gexec
+    \c "${name}"
+    ${lib.concatMapStrings (ext: "CREATE EXTENSION IF NOT EXISTS \"${ext}\";\n") db.extensions}
+  '';
+  setupSql = pkgs.writeText "unison-cloud-postgresql-setup.sql" (
+    lib.concatStrings (lib.mapAttrsToList roleSql cfg.internal.postgresRoles)
+    + lib.concatStrings (lib.mapAttrsToList databaseSql cfg.internal.postgresDatabases)
+  );
 in {
   options.services.unison-cloud.internal = {
     postgresSocketDir = lib.mkOption {
@@ -34,6 +42,22 @@ in {
       internal = true;
       default = {};
       description = "Login roles to create, named after the system user that connects with peer authentication.";
+    };
+
+    postgresDatabases = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          owner = lib.mkOption {type = lib.types.str;};
+          extensions = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            description = "Extensions to create as superuser, for migrations that can't create untrusted ones as the owner.";
+          };
+        };
+      });
+      internal = true;
+      default = {};
+      description = "Databases to create, each owned by one of the roles above.";
     };
   };
 

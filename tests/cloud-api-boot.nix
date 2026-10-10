@@ -1,12 +1,19 @@
 self: {
   name = "unison-cloud-api-boot";
 
-  nodes.machine = {pkgs, ...}: {
+  nodes.machine = {config, pkgs, ...}: {
     imports = [self.nixosModules.default];
 
-    services.unison-cloud.enable = true;
+    services.unison-cloud = {
+      enable = true;
+      domains = {
+        api = "cloud.test";
+        apps = "apps.test";
+        ui = "ui.test";
+      };
+    };
 
-    environment.systemPackages = [pkgs.awscli2 pkgs.redis];
+    environment.systemPackages = [pkgs.awscli2 pkgs.redis pkgs.hurl config.services.unison-cloud.database.package];
 
     # nimbus only speaks virtual-host bucket addressing, so the S3 checks use it too.
     environment.etc."aws-config".text = ''
@@ -19,7 +26,12 @@ self: {
     virtualisation.memorySize = 2048;
   };
 
-  testScript = ''
+  testScript = {nodes, ...}: let
+    sql = nodes.machine.services.unison-cloud.cloudApi.package.sql;
+  in ''
+    import json
+    import shlex
+
     secrets = "/var/lib/unison-cloud/secrets"
 
     def ns(cmd):
@@ -67,7 +79,80 @@ self: {
     with subtest("Consul has elected itself leader"):
         machine.wait_until_succeeds(ns("curl -sf http://127.0.0.1:8500/v1/status/leader | grep -q 127.0.0.1"))
 
+    def psql(query):
+        return machine.succeed(ns(
+            f"sudo -u unison-cloud-api psql -h /run/unison-cloud-postgresql -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
+        )).strip()
+
+    def api(args):
+        return ns(f"curl -s -H 'Host: cloud.test' {args}")
+
+    machine.wait_for_unit("unison-cloud-api.service")
+    machine.wait_until_succeeds(api("-o /dev/null -w '%{http_code}' http://127.0.0.1:5424/v2/account | grep -q 401"), timeout=120)
+
+    with subtest("every migration except the test seed data is applied and recorded"):
+        applied = int(psql("SELECT count(*) FROM selfhost.applied_migrations"))
+        files = int(machine.succeed("ls ${sql} | grep -v '^inserts.sql$' | grep -c '\\.sql$'"))
+        assert applied == files, (applied, files)
+        assert psql("SELECT count(*) FROM selfhost.applied_migrations WHERE filename = 'inserts.sql'") == "0"
+
+    with subtest("a second run applies nothing"):
+        machine.systemctl("restart unison-cloud-migrate.service")
+        machine.wait_for_unit("unison-cloud-migrate.service")
+        invocation = machine.succeed("systemctl show -P InvocationID unison-cloud-migrate.service").strip()
+        machine.fail(f"journalctl _SYSTEMD_INVOCATION_ID={invocation} | grep -q applying")
+
+    with subtest("an edited migration stops the migrate unit"):
+        psql("UPDATE selfhost.applied_migrations SET sha256 = 'tampered' WHERE filename = '0000_initial.sql'")
+        machine.fail(ns("systemctl restart unison-cloud-migrate.service"))
+        assert "was edited after it was applied" in machine.succeed("journalctl -u unison-cloud-migrate.service")
+        psql(f"UPDATE selfhost.applied_migrations SET sha256 = '{machine.succeed('sha256sum ${sql}/0000_initial.sql').split()[0]}' WHERE filename = '0000_initial.sql'")
+        machine.systemctl("restart unison-cloud-migrate.service")
+        machine.wait_for_unit("unison-cloud-migrate.service")
+        # The failed migration took the seed and cloud-api down with it, through Requires=.
+        machine.systemctl("start unison-cloud-api.service")
+        machine.wait_until_succeeds(api("-o /dev/null -w '%{http_code}' http://127.0.0.1:5424/v2/account | grep -q 401"), timeout=120)
+
+    with subtest("the seed registers the cluster and the hash of nimbus's token"):
+        assert psql("SELECT hostname || ' ' || service_uri || ' ' || loki_uri FROM cloud_clusters WHERE id = 'd3ee426c-c252-4910-a861-08fccf85fb66'") == "cloud.test https://apps.test http://127.0.0.1:3100"
+        token = machine.succeed(f"cat {secrets}/cluster-token").strip()
+        expected = machine.succeed(f"printf %s {token} | sha512sum").split()[0]
+        assert psql("SELECT token_hash FROM cloud_cluster_tokens") == expected
+
+    with subtest("the secrets listener serves nimbus's requests, scoped to the token's cluster"):
+        env = "11111111-1111-4111-8111-111111111111"
+        other_env = "22222222-2222-4222-8222-222222222222"
+        psql(
+            "INSERT INTO cloud_clusters (id, name, hostname, service_uri_type, service_uri, cluster_uri, loki_uri, loki_task_name, user_id, created_by)"
+            " SELECT '33333333-3333-4333-8333-333333333333', 'other', 'other.test', service_uri_type, service_uri, cluster_uri, loki_uri, loki_task_name, user_id, created_by"
+            " FROM cloud_clusters WHERE id = 'd3ee426c-c252-4910-a861-08fccf85fb66'"
+        )
+        psql(
+            "INSERT INTO cloud_environments (id, user_id, name, cluster_id) VALUES"
+            f" ('{env}', '7f3c2a1e-0d4b-4c6a-9e2f-5b8d1c3a7e90', 'test', 'd3ee426c-c252-4910-a861-08fccf85fb66'),"
+            f" ('{other_env}', '7f3c2a1e-0d4b-4c6a-9e2f-5b8d1c3a7e90', 'test', '33333333-3333-4333-8333-333333333333')"
+        )
+        machine.succeed(ns(
+            f"hurl --test --variable base=http://127.0.0.1:5426 --variable env={env} --variable other_env={other_env}"
+            f" --secret token=$(cat {secrets}/cluster-token) ${./hurl/secrets.hurl}"
+        ))
+        assert psql(f"SELECT count(*) FROM selfhost.environment_secrets WHERE environment_id = '{env}'") == "0"
+
+    with subtest("header login provisions a user and issues a working token"):
+        headers = "-H 'X-Auth-Request-User: sub-alice' -H 'X-Auth-Request-Preferred-Username: Alice' -H 'X-Auth-Request-Email: alice@example.com'"
+        token = machine.succeed(api(f"-f {headers} http://127.0.0.1:5424/selfhost/access-token")).strip()
+        account = json.loads(machine.succeed(api(f"-f -H 'Authorization: Bearer {token}' http://127.0.0.1:5424/v2/account")))
+        assert account["handle"] == "alice", account
+        assert psql("SELECT count(*) FROM selfhost.oidc_identities WHERE subject = 'sub-alice' AND issuer = 'https://cloud.test/dex'") == "1"
+        assert psql("SELECT count(*) FROM cloud_users cu JOIN users u ON u.id = cu.user_id WHERE u.handle = 'alice'") == "1"
+        again = machine.succeed(api(f"-f {headers} http://127.0.0.1:5424/selfhost/access-token")).strip()
+        second = json.loads(machine.succeed(api(f"-f -H 'Authorization: Bearer {again}' http://127.0.0.1:5424/v2/account")))
+        assert second["handle"] == "alice"
+
+    with subtest("login without the identity header is refused"):
+        assert machine.succeed(api("-o /dev/null -w '%{http_code}' http://127.0.0.1:5424/selfhost/access-token")) == "401"
+
     with subtest("nothing listens outside the namespace"):
-        machine.fail("ss -Hltn | grep -E ':(7070|6379|8500|18443) '")
+        machine.fail("ss -Hltn | grep -E ':(7070|6379|8500|18443|5424|5426) '")
   '';
 }

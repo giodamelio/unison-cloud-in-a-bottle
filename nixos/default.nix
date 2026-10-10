@@ -15,10 +15,22 @@ in {
     ./s3.nix
     ./redis.nix
     ./consul.nix
+    ./cloud-api.nix
   ];
 
   options.services.unison-cloud = {
     enable = lib.mkEnableOption "the self-hosted Unison Cloud stack";
+
+    domains = lib.genAttrs ["api" "apps" "ui"] (name:
+      lib.mkOption {
+        type = lib.types.str;
+        example = "${name}.example.com";
+        description = {
+          api = "Public hostname of cloud-api, which also serves login and the bundled Dex.";
+          apps = "Public hostname of nimbus: the deploy API and every deployed service.";
+          ui = "Public hostname of the cloud web UI.";
+        }.${name};
+      });
 
     stateDir = lib.mkOption {
       type = lib.types.path;
@@ -41,6 +53,13 @@ in {
         an empty data directory, and moving data across needs a manual `pg_upgrade` or
         dump and restore.
       '';
+    };
+
+    cloudApi.package = lib.mkOption {
+      type = lib.types.package;
+      default = packages.cloud-api;
+      defaultText = lib.literalExpression "self.packages.\${system}.cloud-api";
+      description = "Patched cloud-api package. Its `sql` passthru holds the migrations.";
     };
 
     extenddb = {

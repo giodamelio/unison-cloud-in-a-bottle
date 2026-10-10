@@ -4,7 +4,14 @@ self: {
   nodes.machine = {config, ...}: {
     imports = [self.nixosModules.default];
 
-    services.unison-cloud.enable = true;
+    services.unison-cloud = {
+      enable = true;
+      domains = {
+        api = "cloud.test";
+        apps = "apps.test";
+        ui = "ui.test";
+      };
+    };
 
     environment.systemPackages = [config.services.unison-cloud.internal.dynamoCall];
 
