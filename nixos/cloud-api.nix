@@ -68,7 +68,7 @@
     INSERT INTO cloud_clusters (id, name, hostname, service_uri_type, service_uri, cluster_uri, loki_uri, loki_task_name, user_id, created_by)
     VALUES (
       '${clusterId}', 'default', '${cfg.domains.api}', 'local',
-      'https://${cfg.domains.apps}', 'https://${cfg.domains.apps}',
+      '${cfg.internal.publicUrl.apps}', '${cfg.internal.publicUrl.apps}',
       'http://127.0.0.1:3100', 'nimbus', '${systemUserId}', '${systemUserId}'
     )
     ON CONFLICT (id) DO UPDATE SET
@@ -122,6 +122,7 @@ in {
     users.groups.${user} = {};
 
     services.unison-cloud.internal = {
+      ingressSockets.cloud-api = cfg.internal.cloudApiPort;
       postgresRoles.${user} = {};
       # Untrusted extensions a database owner can't create; the migrations skip them once they exist.
       postgresDatabases.${database} = {
@@ -188,11 +189,11 @@ in {
           CLOUD_COMMIT = cfg.cloudApi.package.version;
           CLOUD_LOG_LEVEL = "INFO";
 
-          CLOUD_API_ORIGIN = "https://${cfg.domains.api}";
+          CLOUD_API_ORIGIN = cfg.internal.publicUrl.api;
           # Share is never contacted, but the variable must parse as an origin.
-          SHARE_API_ORIGIN = "https://${cfg.domains.api}";
-          CLOUD_CLOUD_UI_ORIGIN = "https://${cfg.domains.ui}";
-          CLOUD_CLOUD_HOMEPAGE_ORIGIN = "https://${cfg.domains.ui}";
+          SHARE_API_ORIGIN = cfg.internal.publicUrl.api;
+          CLOUD_CLOUD_UI_ORIGIN = cfg.internal.publicUrl.ui;
+          CLOUD_CLOUD_HOMEPAGE_ORIGIN = cfg.internal.publicUrl.ui;
           CLOUD_API_SUFFIX = cfg.domains.api;
 
           NOMAD_ALLOC_PORT_cloud_http = toString cfg.internal.cloudApiPort;
@@ -212,8 +213,8 @@ in {
           CLOUD_S3_ADDRESSING = "path";
           CLOUD_CLOUD_SERVICE_BUCKET = "unison-cloud-services";
 
-          CLOUD_SELFHOST_OIDC_ISSUER = "https://${cfg.domains.api}/dex";
-          CLOUD_SELFHOST_DEFAULT_TIER = "free";
+          CLOUD_SELFHOST_OIDC_ISSUER = cfg.internal.oidcIssuer;
+          CLOUD_SELFHOST_DEFAULT_TIER = cfg.auth.defaultTier;
 
           # Hosted-business integrations a self-hosted user never reaches.
           CLOUD_SHARE_OAUTH_CLIENT_ID = "unused";

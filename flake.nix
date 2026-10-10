@@ -41,6 +41,8 @@
 
       cloud-api-boot = pkgs.testers.runNixOSTest (import ./tests/cloud-api-boot.nix inputs.self);
 
+      auth = pkgs.testers.runNixOSTest (import ./tests/auth.nix inputs.self);
+
       nimbus-dynamo = pkgs.testers.runNixOSTest (import ./tests/nimbus-dynamo {
         inherit (inputs) self;
         dynamoProbe = pkgs.callPackage ./tests/nimbus-dynamo/probe.nix {

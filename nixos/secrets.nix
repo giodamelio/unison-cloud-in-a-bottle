@@ -9,7 +9,7 @@
 
   generate = pkgs.writeShellApplication {
     name = "unison-cloud-secrets";
-    runtimeInputs = [pkgs.coreutils pkgs.openssl];
+    runtimeInputs = [pkgs.coreutils pkgs.openssl pkgs.mkpasswd];
     text = ''
       umask 077
       mkdir -p ${dir}
@@ -19,7 +19,8 @@
         local file=$1
         shift
         if [ ! -e "$file" ]; then
-          "$@" > "$file.tmp"
+          # No trailing newline: some consumers (oauth2-proxy's secret files) read the file verbatim.
+          "$@" | tr -d '\n' > "$file.tmp"
           mv "$file.tmp" "$file"
         fi
       }
@@ -43,6 +44,14 @@
       generate cloud-hmac-key openssl rand -hex 32
       generate cluster-token openssl rand -hex 32
       generate internal-auth-token openssl rand -hex 32
+      generate dex-client-secret openssl rand -hex 32
+      # oauth2-proxy only accepts a cookie secret of 16, 24 or 32 bytes; 32 hex characters are 32 bytes.
+      generate oauth2-proxy-cookie-secret openssl rand -hex 16
+      generate dex-admin-password openssl rand -hex 16
+      if [ ! -e dex-admin-password.bcrypt ] || [ dex-admin-password -nt dex-admin-password.bcrypt ]; then
+        mkpasswd -m bcrypt -R 10 -s < dex-admin-password | tr -d '\n' > dex-admin-password.bcrypt.tmp
+        mv dex-admin-password.bcrypt.tmp dex-admin-password.bcrypt
+      fi
 
       if [ ! -e ca.crt ]; then
         openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \

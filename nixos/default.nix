@@ -10,6 +10,10 @@ in {
   imports = [
     ./netns.nix
     ./secrets.nix
+    ./ingress.nix
+    ./dex.nix
+    ./auth.nix
+    ./caddy.nix
     ./postgresql.nix
     ./extenddb.nix
     ./s3.nix
@@ -53,6 +57,13 @@ in {
         an empty data directory, and moving data across needs a manual `pg_upgrade` or
         dump and restore.
       '';
+    };
+
+    internal.uiPackage = lib.mkOption {
+      type = lib.types.package;
+      internal = true;
+      default = packages.unison-cloud-ui;
+      description = "The cloud UI package before it's built for this deployment's domains.";
     };
 
     cloudApi.package = lib.mkOption {
