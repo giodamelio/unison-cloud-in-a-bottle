@@ -13,6 +13,7 @@
     ../../patches/cloud-api/0004-header-trust-login.patch
     ../../patches/cloud-api/0005-session-error-redirect.patch
     ../../patches/cloud-api/0006-environment-access-check.patch
+    ../../patches/cloud-api/0007-cookie-secure-from-origin.patch
   ];
 
   stacklock = stacklock2nix {

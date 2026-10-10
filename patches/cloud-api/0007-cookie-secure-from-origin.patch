@@ -1,0 +1,14 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -167,7 +167,10 @@
+   let acceptedIssuers = Set.fromList [envApiOrigin, shareIssuer]
+   let cookieDefaultTTL = Just $ Time.secondsToDiffTime (60 * 60 * 24 * 30) -- 1 month
+   let envSessionCookieName = "cloud-session"
+-  let envCookieSettings = Cookies.defaultCookieSettings Deployment.onLocal cookieDefaultTTL
++  -- Clients refuse Secure cookies set over plain HTTP, so a self-hosted origin without TLS
++  -- could never log in if Secure followed the deployment mode.
++  let cookieIsSecure = if uriScheme envApiOrigin == "https:" then Cookies.Secure else Cookies.NotSecure
++  let envCookieSettings = (Cookies.defaultCookieSettings Deployment.onLocal cookieDefaultTTL) {Cookies.cookieIsSecure}
+   let legacyKey = JWT.KeyDescription {JWT.key = hs256Key, JWT.alg = JWT.HS256}
+   let cloudEddsaKeyDesc = JWT.KeyDescription {JWT.key = cloudEddsaKey, JWT.alg = JWT.Ed25519}
+   let shareEddsaKeyDesc = JWT.KeyDescription {JWT.key = shareEddsaKey, JWT.alg = JWT.Ed25519}
