@@ -1,12 +1,11 @@
 {
-  lib,
   runCommand,
   buildFromTranscript,
   nimbus,
 }:
 buildFromTranscript {
   pname = "dynamo-probe";
-  version = nimbus.version;
+  inherit (nimbus) version;
 
   src = runCommand "dynamo-probe-src" {} ''
     mkdir $out

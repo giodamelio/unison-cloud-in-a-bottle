@@ -26,7 +26,7 @@
       // {
         "postgresql-libpq" = _version: {inherit libpq;};
       };
-    additionalHaskellPkgSetOverrides = hfinal: hprev: {
+    additionalHaskellPkgSetOverrides = _: hprev: {
       cloud = haskell.lib.appendPatches hprev.cloud patches;
 
       # Its tests need tmp-postgres, which isn't in the snapshot and is marked broken in nixpkgs.

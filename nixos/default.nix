@@ -1,10 +1,8 @@
 self: {
-  config,
   lib,
   pkgs,
   ...
 }: let
-  cfg = config.services.unison-cloud;
   packages = self.packages.${pkgs.stdenv.hostPlatform.system};
 in {
   imports = [
@@ -33,11 +31,14 @@ in {
       lib.mkOption {
         type = lib.types.str;
         example = "${name}.example.com";
-        description = {
-          api = "Public hostname of cloud-api, which also serves login and the bundled Dex.";
-          apps = "Public hostname of nimbus: the deploy API and every deployed service.";
-          ui = "Public hostname of the cloud web UI.";
-        }.${name};
+        description =
+          {
+            api = "Public hostname of cloud-api, which also serves login and the bundled Dex.";
+            apps = "Public hostname of nimbus: the deploy API and every deployed service.";
+            ui = "Public hostname of the cloud web UI.";
+          }.${
+            name
+          };
       });
 
     stateDir = lib.mkOption {

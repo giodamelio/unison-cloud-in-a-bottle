@@ -61,7 +61,7 @@ self: {
     virtualisation.memorySize = 3072;
   };
 
-  testScript = {nodes, ...}: let
+  testScript = _: let
     hurl = file: "${./hurl}/${file}";
   in ''
     import base64

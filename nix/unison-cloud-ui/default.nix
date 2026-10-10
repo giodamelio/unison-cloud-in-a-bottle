@@ -31,7 +31,7 @@ in
     ];
 
     npmDeps = importNpmLock {npmRoot = src;};
-    npmConfigHook = importNpmLock.npmConfigHook;
+    inherit (importNpmLock) npmConfigHook;
 
     nativeBuildInputs = [elmPackages.elm];
 

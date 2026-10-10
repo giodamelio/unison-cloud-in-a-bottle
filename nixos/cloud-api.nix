@@ -237,66 +237,69 @@ in {
             "unison-cloud-consul.service"
           ]
           ++ lib.optional (s3.unit != null) s3.unit;
-        environment = pgEnvironment // {
-          CLOUD_DEPLOYMENT = "production";
-          CLOUD_COMMIT = cfg.cloudApi.package.version;
-          CLOUD_LOG_LEVEL = "INFO";
+        environment =
+          pgEnvironment
+          // {
+            CLOUD_DEPLOYMENT = "production";
+            CLOUD_COMMIT = cfg.cloudApi.package.version;
+            CLOUD_LOG_LEVEL = "INFO";
 
-          CLOUD_API_ORIGIN = cfg.internal.publicUrl.api;
-          # Share is never contacted, but the variable must parse as an origin.
-          SHARE_API_ORIGIN = cfg.internal.publicUrl.api;
-          CLOUD_CLOUD_UI_ORIGIN = cfg.internal.publicUrl.ui;
-          CLOUD_CLOUD_HOMEPAGE_ORIGIN = cfg.internal.publicUrl.ui;
-          CLOUD_API_SUFFIX = cfg.domains.api;
+            CLOUD_API_ORIGIN = cfg.internal.publicUrl.api;
+            # Share is never contacted, but the variable must parse as an origin.
+            SHARE_API_ORIGIN = cfg.internal.publicUrl.api;
+            CLOUD_CLOUD_UI_ORIGIN = cfg.internal.publicUrl.ui;
+            CLOUD_CLOUD_HOMEPAGE_ORIGIN = cfg.internal.publicUrl.ui;
+            CLOUD_API_SUFFIX = cfg.domains.api;
 
-          NOMAD_ALLOC_PORT_cloud_http = toString cfg.internal.cloudApiPort;
-          NOMAD_HOST_IP_cloud_tcp = "127.0.0.1";
-          NOMAD_ALLOC_PORT_cloud_tcp = "5425";
+            NOMAD_ALLOC_PORT_cloud_http = toString cfg.internal.cloudApiPort;
+            NOMAD_HOST_IP_cloud_tcp = "127.0.0.1";
+            NOMAD_ALLOC_PORT_cloud_tcp = "5425";
 
-          CLOUD_POSTGRES_CONN_MAX = "10";
-          CONSUL_HOST = "http://127.0.0.1:${toString cfg.internal.consulPort}";
+            CLOUD_POSTGRES_CONN_MAX = "10";
+            CONSUL_HOST = "http://127.0.0.1:${toString cfg.internal.consulPort}";
 
-          CLOUD_ENVIRONMENTS_MOUNT = "environments";
-          CLOUD_SECRETS_HOST = "127.0.0.1";
-          CLOUD_SECRETS_PORT = toString cfg.internal.secretsPort;
+            CLOUD_ENVIRONMENTS_MOUNT = "environments";
+            CLOUD_SECRETS_HOST = "127.0.0.1";
+            CLOUD_SECRETS_PORT = toString cfg.internal.secretsPort;
 
-          AWS_REGION = s3.region;
-          CLOUD_S3_ENDPOINT =
-            if cfg.s3.bundled
-            then "http://127.0.0.1:${toString cfg.internal.s3Port}"
-            else "${
-              if s3.https
-              then "https"
-              else "http"
-            }://${s3.host}:${toString s3.port}";
-          CLOUD_S3_ADDRESSING = "path";
-          CLOUD_CLOUD_SERVICE_BUCKET = "unison-cloud-services";
+            AWS_REGION = s3.region;
+            CLOUD_S3_ENDPOINT =
+              if cfg.s3.bundled
+              then "http://127.0.0.1:${toString cfg.internal.s3Port}"
+              else "${
+                if s3.https
+                then "https"
+                else "http"
+              }://${s3.host}:${toString s3.port}";
+            CLOUD_S3_ADDRESSING = "path";
+            CLOUD_CLOUD_SERVICE_BUCKET = "unison-cloud-services";
 
-          CLOUD_SELFHOST_OIDC_ISSUER = cfg.internal.oidcIssuer;
-          CLOUD_SELFHOST_DEFAULT_TIER = cfg.auth.defaultTier;
+            CLOUD_SELFHOST_OIDC_ISSUER = cfg.internal.oidcIssuer;
+            CLOUD_SELFHOST_DEFAULT_TIER = cfg.auth.defaultTier;
 
-          # Hosted-business integrations a self-hosted user never reaches.
-          CLOUD_SHARE_OAUTH_CLIENT_ID = "unused";
-          CLOUD_SHARE_OAUTH_CLIENT_SECRET = "unused";
-          CLOUD_STRIPE_API_SECRET_KEY = "rk_test_unused";
-          CLOUD_STRIPE_WEBHOOK_SECRET_KEY = "whsec_unused";
-          CLOUD_ZENDESK_API_USER = "unused";
-          CLOUD_ZENDESK_API_TOKEN = "unused";
-        };
+            # Hosted-business integrations a self-hosted user never reaches.
+            CLOUD_SHARE_OAUTH_CLIENT_ID = "unused";
+            CLOUD_SHARE_OAUTH_CLIENT_SECRET = "unused";
+            CLOUD_STRIPE_API_SECRET_KEY = "rk_test_unused";
+            CLOUD_STRIPE_WEBHOOK_SECRET_KEY = "whsec_unused";
+            CLOUD_ZENDESK_API_USER = "unused";
+            CLOUD_ZENDESK_API_TOKEN = "unused";
+          };
         serviceConfig = {
           User = user;
           Group = user;
-          LoadCredential = map (name: "${name}:${secrets}/${name}") [
-            "redis-password"
-            "s3-access-key-id"
-            "s3-secret-access-key"
-            "cloud-eddsa-key"
-            "share-eddsa-key"
-            "cloud-hmac-key"
-            "internal-auth-token"
-          ]
-          ++ pgCredentials
-          ++ lib.optional (cfg.sentry.dsnFile != null) "sentry-dsn:${cfg.sentry.dsnFile}";
+          LoadCredential =
+            map (name: "${name}:${secrets}/${name}") [
+              "redis-password"
+              "s3-access-key-id"
+              "s3-secret-access-key"
+              "cloud-eddsa-key"
+              "share-eddsa-key"
+              "cloud-hmac-key"
+              "internal-auth-token"
+            ]
+            ++ pgCredentials
+            ++ lib.optional (cfg.sentry.dsnFile != null) "sentry-dsn:${cfg.sentry.dsnFile}";
           ExecStart = start;
           Restart = "on-failure";
         };

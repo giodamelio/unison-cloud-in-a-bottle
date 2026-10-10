@@ -6,11 +6,7 @@
 
   # One combination of levers: the host's Postgres, secrets supplied as files, and no
   # bundled Caddy, so the ingress sockets are the whole interface.
-  nodes.machine = {
-    config,
-    pkgs,
-    ...
-  }: {
+  nodes.machine = {pkgs, ...}: {
     imports = [self.nixosModules.default];
 
     networking.nftables.enable = true;

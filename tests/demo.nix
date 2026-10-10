@@ -40,7 +40,7 @@
   testScript = {nodes, ...}: let
     cfg = nodes.machine.services.unison-cloud;
     url = cfg.internal.publicUrl;
-    domains = cfg.domains;
+    inherit (cfg) domains;
     hurl = file: "${./hurl}/${file}";
   in ''
     import base64

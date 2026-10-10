@@ -5,11 +5,7 @@
   name = "unison-cloud-full";
 
   # The module as a user would write it: only the three domains, every default kept.
-  nodes.machine = {
-    config,
-    pkgs,
-    ...
-  }: {
+  nodes.machine = {pkgs, ...}: {
     imports = [self.nixosModules.default];
 
     networking.nftables.enable = true;
