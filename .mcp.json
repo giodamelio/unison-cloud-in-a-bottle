@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "unison": {
+      "type": "http",
+      "url": "http://localhost:5858/codebase/mcp"
+    }
+  }
+}
