@@ -1,7 +1,7 @@
-# A Dex user outside the allowlist authenticates but is refused, and gets no token.
+# A provider user outside the allowlist authenticates but is refused, and gets no session.
 # Variables: api, user; secret: password.
 
-GET {{api}}/selfhost/access-token
+GET {{api}}/login
 [Options]
 location: true
 HTTP 200
@@ -15,3 +15,5 @@ location: true
 login: {{user}}
 password: {{password}}
 HTTP 403
+[Asserts]
+cookie "cloud-session" not exists

@@ -25,7 +25,7 @@
         local file=$1
         shift
         if [ ! -e "$file" ]; then
-          # No trailing newline: some consumers (oauth2-proxy's secret files) read the file verbatim.
+          # No trailing newline: some consumers read the file verbatim.
           "$@" | tr -d '\n' > "$file.tmp"
           mv "$file.tmp" "$file"
         fi
@@ -51,8 +51,6 @@
       generate cluster-token openssl rand -hex 32
       generate internal-auth-token openssl rand -hex 32
       generate dex-client-secret openssl rand -hex 32
-      # oauth2-proxy only accepts a cookie secret of 16, 24 or 32 bytes; 32 hex characters are 32 bytes.
-      generate oauth2-proxy-cookie-secret openssl rand -hex 16
       generate dex-admin-password openssl rand -hex 16
       if [ ! -e dex-admin-password.bcrypt ] || [ dex-admin-password -nt dex-admin-password.bcrypt ]; then
         mkpasswd -m bcrypt -R 10 -s < dex-admin-password | tr -d '\n' > dex-admin-password.bcrypt.tmp
@@ -97,8 +95,7 @@ in {
       Names: `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each), `cloud-hmac-key`,
       `cluster-token`, `internal-auth-token`, `redis-password`, `s3-access-key-id`,
       `s3-secret-access-key`, `extenddb-access-key-id`, `extenddb-secret-access-key`,
-      `extenddb-admin-password`, `dex-client-secret`, `oauth2-proxy-cookie-secret`
-      (16, 24 or 32 bytes), `dex-admin-password`.
+      `extenddb-admin-password`, `dex-client-secret`, `dex-admin-password`.
       Paths are strings so the secrets never enter the Nix store.
     '';
   };

@@ -49,12 +49,24 @@ self: {
 
     environment.systemPackages = [pkgs.hurl config.services.unison-cloud.database.package];
 
+    # Stands in for the listener ucm opens on a loopback port during `auth.login`.
+    systemd.services.redirect-catcher = {
+      wantedBy = ["multi-user.target"];
+      serviceConfig = {
+        DynamicUser = true;
+        ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8099 --bind 127.0.0.1 --directory /var/empty";
+      };
+    };
+
     virtualisation.memorySize = 3072;
   };
 
   testScript = {nodes, ...}: let
     hurl = file: "${./hurl}/${file}";
   in ''
+    import base64
+    import hashlib
+    import json
     import shlex
 
     secrets = "/var/lib/unison-cloud/secrets"
@@ -67,6 +79,17 @@ self: {
             f"hurl --cacert {ca}{jar} --variable api={api} " + " ".join(args) + f" {file}"
         )
 
+    verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    def login_ucm(user, password, handle):
+        response = hurl(
+            "${hurl "login-ucm.hurl"}", f"--variable user={user}", f"--variable handle={handle}",
+            "--variable redirect=http://127.0.0.1:8099/redirect", f"--variable verifier={verifier}",
+            f"--variable challenge={challenge}", f"--secret password={password}",
+        )
+        return json.loads(response)["access_token"]
+
     def psql(query):
         return machine.succeed(
             "ip netns exec unison-cloud sudo -u unison-cloud-api psql -h /run/unison-cloud-postgresql"
@@ -75,14 +98,14 @@ self: {
 
     machine.wait_for_unit("caddy.service")
     machine.wait_for_unit("unison-cloud-api.service")
-    machine.wait_for_unit("unison-cloud-oauth2-proxy.service")
+    machine.wait_for_unit("redirect-catcher.service")
     machine.wait_for_unit("unison-cloud-dex.service")
     machine.wait_until_succeeds(f"test -f {ca}", timeout=60)
     machine.wait_until_succeeds(f"curl -sf --cacert {ca} -o /dev/null {api}/dex/.well-known/openid-configuration", timeout=120)
     machine.wait_until_succeeds(f"curl -s --cacert {ca} -o /dev/null -w '%{{http_code}}' {api}/v2/account | grep -q 401", timeout=120)
 
-    with subtest("alice logs in through Dex and gets a token"):
-        token = hurl("${hurl "login-token.hurl"}", "--variable user=alice@example.com", "--secret password=alice-password").strip()
+    with subtest("alice logs in the way ucm's auth.login does, through cloud-api and Dex"):
+        token = login_ucm("alice@example.com", "alice-password", "alice")
         assert psql("SELECT u.handle FROM selfhost.oidc_identities i JOIN users u ON u.id = i.user_id WHERE i.issuer = 'https://cloud.test:8443/dex'") == "alice"
         assert psql("SELECT count(*) FROM cloud_users cu JOIN users u ON u.id = cu.user_id WHERE u.handle = 'alice'") == "1"
 
@@ -103,16 +126,17 @@ self: {
 
     with subtest("the generated admin user can log in"):
         password = machine.succeed(f"cat {secrets}/dex-admin-password").strip()
-        hurl("${hurl "login-token.hurl"}", "--test", "--variable user=admin@cloud.test", f"--secret password={password}")
+        login_ucm("admin@cloud.test", password, "admin")
         assert psql("SELECT count(*) FROM users WHERE handle = 'admin'") == "1"
 
     with subtest("only the ingress group can open the sockets"):
-        for sock in ["cloud-api", "dex", "oauth2-proxy"]:
+        machine.fail("test -e /run/unison-cloud/oauth2-proxy.sock")
+        for sock in ["cloud-api", "dex"]:
             machine.succeed(f"test -S /run/unison-cloud/{sock}.sock")
             machine.fail(f"sudo -u nobody curl -s --unix-socket /run/unison-cloud/{sock}.sock http://x/")
             machine.succeed(f"sudo -u caddy curl -s -o /dev/null --unix-socket /run/unison-cloud/{sock}.sock http://x/")
 
-    with subtest("the public URL is unreachable inside the namespace, so the code exchange used Dex's loopback"):
+    with subtest("the public URL is unreachable inside the namespace, so cloud-api's code exchange used Dex's loopback"):
         machine.fail("ip netns exec unison-cloud curl -s -o /dev/null --max-time 5 https://cloud.test:8443/")
   '';
 }

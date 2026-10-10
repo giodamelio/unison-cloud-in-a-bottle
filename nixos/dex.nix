@@ -53,10 +53,10 @@
         --argjson passwords "$passwords" \
         --arg secret "$(< ${secrets}/dex-client-secret)" \
         '. + {staticPasswords: $passwords, staticClients: [{
-          id: "oauth2-proxy",
+          id: "cloud-api",
           name: "Unison Cloud",
           secret: $secret,
-          redirectURIs: ["${cfg.internal.publicUrl.api}/oauth2/callback"]
+          redirectURIs: ["${cfg.internal.publicUrl.api}/selfhost/oidc/callback"]
         }]}' \
         ${baseConfig} > ${runtimeDir}/config.json
       chown ${user}:${user} ${runtimeDir}/config.json

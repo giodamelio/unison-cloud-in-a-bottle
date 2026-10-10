@@ -116,6 +116,7 @@
     export SHARE_EDDSA_KEY=$(< "$creds/share-eddsa-key")
     export CLOUD_HMAC_KEY=$(< "$creds/cloud-hmac-key")
     export CLOUD_INTERNAL_AUTH_TOKEN=$(< "$creds/internal-auth-token")
+    export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/oidc-client-secret")
     CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
     ${lib.optionalString pg.external ''
       # libpq keyword values are single-quoted, with backslash and quote escaped.

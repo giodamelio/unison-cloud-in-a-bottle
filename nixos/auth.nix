@@ -1,44 +1,17 @@
 {
   config,
   lib,
-  pkgs,
   ...
 }: let
   cfg = config.services.unison-cloud;
   oidc = cfg.auth.oidc;
   dex = cfg.auth.dex;
   secrets = "${cfg.stateDir}/secrets";
-  user = "unison-cloud-oauth2-proxy";
   apiOrigin = cfg.internal.publicUrl.api;
   dexLoopback = "http://127.0.0.1:${toString cfg.internal.dexPort}/dex";
 
   allowlisted = oidc.allowedEmails != [] || oidc.allowedEmailDomains != [] || oidc.allowedGroups != [];
-  emailsFile = pkgs.writeText "unison-cloud-allowed-emails" (lib.concatLines oidc.allowedEmails);
-
-  # The issuer is a public URL that may not resolve, or may be firewalled, inside the
-  # namespace. With the bundled Dex, oauth2-proxy validates tokens against that issuer
-  # but makes its server-to-server calls to Dex's loopback listener.
-  providerFlags =
-    if dex.enable
-    then [
-      "--skip-oidc-discovery"
-      "--login-url=${cfg.internal.oidcIssuer}/auth"
-      "--redeem-url=${dexLoopback}/token"
-      "--oidc-jwks-url=${dexLoopback}/keys"
-      "--client-id=oauth2-proxy"
-      "--client-secret-file=%d/client-secret"
-    ]
-    else [
-      "--client-id=${oidc.clientId}"
-      "--client-secret-file=%d/client-secret"
-    ];
-
-  allowFlags =
-    lib.optional (oidc.allowedEmails != []) "--authenticated-emails-file=${emailsFile}"
-    ++ map (d: "--email-domain=${d}") oidc.allowedEmailDomains
-    ++ map (g: "--allowed-group=${g}") oidc.allowedGroups
-    # Only declared users exist in the bundled Dex, so with no allowlist every one of them may log in.
-    ++ lib.optional (dex.enable && !allowlisted) "--email-domain=*";
+  commaList = lib.concatStringsSep ",";
 in {
   options.services.unison-cloud = {
     auth = {
@@ -53,7 +26,7 @@ in {
         clientId = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
           default = null;
-          description = "Client ID at the external provider, whose redirect URI is `https://<domains.api>/oauth2/callback`.";
+          description = "Confidential client at the external provider, whose redirect URI is `<public API URL>/selfhost/oidc/callback`.";
         };
 
         clientSecretFile = lib.mkOption {
@@ -65,13 +38,13 @@ in {
         allowedEmails = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [];
-          description = "Email addresses that may log in.";
+          description = "Verified email addresses that may log in.";
         };
 
         allowedEmailDomains = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [];
-          description = "Email domains whose addresses may log in.";
+          description = "Email domains whose verified addresses may log in.";
         };
 
         allowedGroups = lib.mkOption {
@@ -88,26 +61,16 @@ in {
       };
     };
 
-    internal = {
-      oidcIssuer = lib.mkOption {
-        type = lib.types.str;
-        internal = true;
-        readOnly = true;
-        default =
-          if dex.enable
-          then "${apiOrigin}/dex"
-          else oidc.issuer;
-        defaultText = lib.literalMD "the bundled Dex's issuer, or `auth.oidc.issuer`";
-        description = "Issuer users log in through; cloud-api records identities against it.";
-      };
-
-      oauth2ProxyPort = lib.mkOption {
-        type = lib.types.port;
-        internal = true;
-        readOnly = true;
-        default = 4180;
-        description = "oauth2-proxy's port on the namespace loopback.";
-      };
+    internal.oidcIssuer = lib.mkOption {
+      type = lib.types.str;
+      internal = true;
+      readOnly = true;
+      default =
+        if dex.enable
+        then "${apiOrigin}/dex"
+        else oidc.issuer;
+      defaultText = lib.literalMD "the bundled Dex's issuer, or `auth.oidc.issuer`";
+      description = "Issuer users log in through; cloud-api records identities against it.";
     };
   };
 
@@ -123,61 +86,41 @@ in {
       }
     ];
 
-    users.users.${user} = {
-      isSystemUser = true;
-      group = user;
-    };
-    users.groups.${user} = {};
+    # cloud-api is the OIDC client (cloud-api patch 0008): it runs the login against the
+    # provider, provisions the user, and serves ucm's authorization endpoints itself.
+    # An external provider is on the internet, which only egress users may reach.
+    services.unison-cloud.internal.egressUsers = lib.mkIf (!dex.enable) ["unison-cloud-api"];
 
-    services.unison-cloud.internal = {
-      ingressSockets.oauth2-proxy = cfg.internal.oauth2ProxyPort;
-      # An external provider is on the internet, which only egress users may reach.
-      egressUsers = lib.mkIf (!dex.enable) [user];
-    };
-
-    systemd.services.unison-cloud-oauth2-proxy = lib.mkMerge [
-      cfg.internal.inNamespace
-      {
-        description = "Unison Cloud login front (oauth2-proxy)";
-        wantedBy = ["multi-user.target"];
-        requires = ["unison-cloud-secrets.service"] ++ lib.optional dex.enable "unison-cloud-dex.service";
-        after = ["unison-cloud-secrets.service"] ++ lib.optional dex.enable "unison-cloud-dex.service";
-        serviceConfig = {
-          User = user;
-          Group = user;
-          LoadCredential = [
-            "client-secret:${
-              if dex.enable
-              then "${secrets}/dex-client-secret"
-              else oidc.clientSecretFile
-            }"
-            "cookie-secret:${secrets}/oauth2-proxy-cookie-secret"
-          ];
-          ExecStart = lib.escapeShellArgs ([
-              (lib.getExe pkgs.oauth2-proxy)
-              "--http-address=127.0.0.1:${toString cfg.internal.oauth2ProxyPort}"
-              "--provider=oidc"
-              "--oidc-issuer-url=${cfg.internal.oidcIssuer}"
-              "--redirect-url=${apiOrigin}/oauth2/callback"
-              "--scope=openid email profile"
-              "--code-challenge-method=S256"
-              "--cookie-secret-file=%d/cookie-secret"
-              "--cookie-secure=${lib.boolToString (cfg.ingress.scheme == "https")}"
-              "--set-xauthrequest"
-              "--skip-provider-button"
-              # The default, "force", makes Dex show its consent screen on every login.
-              "--approval-prompt=auto"
-              "--reverse-proxy"
-              # The ingress socket proxy connects from the namespace loopback.
-              "--trusted-proxy-ip=127.0.0.1/32"
-              "--whitelist-domain=${cfg.domains.api}:*"
-              # Requests only reach oauth2-proxy for forward_auth and its own /oauth2 routes.
-              "--upstream=static://202"
-            ]
-            ++ providerFlags
-            ++ allowFlags);
+    systemd.services.unison-cloud-api = {
+      requires = lib.optional dex.enable "unison-cloud-dex.service";
+      after = lib.optional dex.enable "unison-cloud-dex.service";
+      environment =
+        {
+          CLOUD_OIDC_ISSUER = cfg.internal.oidcIssuer;
+          CLOUD_OIDC_CLIENT_ID =
+            if dex.enable
+            then "cloud-api"
+            else oidc.clientId;
+        }
+        # An unset list doesn't restrict; only declared users exist in the bundled Dex.
+        // lib.optionalAttrs (oidc.allowedEmails != []) {CLOUD_OIDC_ALLOWED_EMAILS = commaList oidc.allowedEmails;}
+        // lib.optionalAttrs (oidc.allowedEmailDomains != []) {CLOUD_OIDC_ALLOWED_EMAIL_DOMAINS = commaList oidc.allowedEmailDomains;}
+        // lib.optionalAttrs (oidc.allowedGroups != []) {CLOUD_OIDC_ALLOWED_GROUPS = commaList oidc.allowedGroups;}
+        # The issuer is a public URL that may not resolve, or may be firewalled, inside the
+        # namespace. With the bundled Dex, cloud-api validates tokens against that issuer
+        # but makes its server-to-server calls to Dex's loopback listener.
+        // lib.optionalAttrs dex.enable {
+          CLOUD_OIDC_AUTHORIZATION_URL = "${cfg.internal.oidcIssuer}/auth";
+          CLOUD_OIDC_TOKEN_URL = "${dexLoopback}/token";
+          CLOUD_OIDC_JWKS_URL = "${dexLoopback}/keys";
         };
-      }
-    ];
+      serviceConfig.LoadCredential = [
+        "oidc-client-secret:${
+          if dex.enable
+          then "${secrets}/dex-client-secret"
+          else oidc.clientSecretFile
+        }"
+      ];
+    };
   };
 }

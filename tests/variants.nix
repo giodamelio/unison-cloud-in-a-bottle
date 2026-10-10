@@ -201,7 +201,7 @@
     with subtest("without the bundled Caddy, nothing listens publicly and the sockets are the interface"):
         machine.fail("systemctl is-active caddy.service")
         machine.fail("ss -Hltn | grep -E ':(80|443) '")
-        for s in ["cloud-api", "dex", "oauth2-proxy"]:
+        for s in ["cloud-api", "dex"]:
             machine.succeed(f"test -S /run/unison-cloud/{s}.sock")
         headers = "-H 'X-Auth-Request-User: sub-bob' -H 'X-Auth-Request-Preferred-Username: bob' -H 'X-Auth-Request-Email: bob@example.com'"
         machine.succeed(f"curl -sf {sock} {headers} http://x/selfhost/access-token")

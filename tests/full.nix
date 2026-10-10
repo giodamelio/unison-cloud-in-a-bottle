@@ -29,6 +29,15 @@
 
     environment.systemPackages = [deployProgram pkgs.hurl];
 
+    # Stands in for the listener ucm opens on a loopback port during `auth.login`.
+    systemd.services.redirect-catcher = {
+      wantedBy = ["multi-user.target"];
+      serviceConfig = {
+        DynamicUser = true;
+        ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8099 --bind 127.0.0.1 --directory /var/empty";
+      };
+    };
+
     virtualisation.memorySize = 7168;
     virtualisation.cores = 4;
   };
@@ -36,6 +45,8 @@
   testScript = {nodes, ...}: let
     cfg = nodes.machine.services.unison-cloud;
   in ''
+    import base64
+    import hashlib
     import json
     import re
 
@@ -58,7 +69,14 @@
 
     with subtest("the generated admin logs in through the bundled Dex"):
         password = machine.succeed(f"cat {secrets}/dex-admin-password").strip()
-        token = hurl("${./hurl/login-token.hurl}", "--variable user=admin@cloud.test", f"--secret password={password}").strip()
+        verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        machine.wait_for_unit("redirect-catcher.service")
+        token = json.loads(hurl(
+            "${./hurl/login-ucm.hurl}", "--variable user=admin@cloud.test", "--variable handle=admin",
+            "--variable redirect=http://127.0.0.1:8099/redirect", f"--variable verifier={verifier}",
+            f"--variable challenge={challenge}", f"--secret password={password}",
+        ))["access_token"]
 
     # The cloud client trusts the system bundle, so the deploy program runs with Caddy's CA added to it.
     machine.succeed(f"cat /etc/ssl/certs/ca-certificates.crt {ca} > {bundle}")
