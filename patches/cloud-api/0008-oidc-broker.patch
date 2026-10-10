@@ -1,0 +1,1096 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -18,6 +18,7 @@
+ import Cloud.Env
+ import Cloud.Postgres.Env (PostgresEnv (..))
+ import Cloud.Prelude
++import Cloud.SelfHost.Oidc.Config (loadOidcConfig)
+ import Cloud.Stripe.API (StripeConfig (..))
+ import Cloud.User.Env (AuthEnv (..))
+ import Cloud.User.Types (CloudTier (..))
+@@ -264,6 +265,7 @@
+     "free" -> pure (Right Free)
+     "starter" -> pure (Right Starter)
+     other -> pure (Left ("must be free or starter, got " <> other))
++  envSelfHostOidc <- loadOidcConfig manager >>= exitErrOnLeft
+ 
+   let postgresEnv = PostgresEnv {..}
+   let clusterEnv = ClusterEnv {..}
+--- a/cloud.cabal
++++ b/cloud.cabal
+@@ -89,9 +89,15 @@
+       Cloud.Prelude.Orphans
+       Cloud.SelfHost.HeaderAuth
+       Cloud.SelfHost.HeaderAuth.API
++      Cloud.SelfHost.Oidc
++      Cloud.SelfHost.Oidc.API
++      Cloud.SelfHost.Oidc.Config
++      Cloud.SelfHost.Oidc.RefreshToken
++      Cloud.SelfHost.Oidc.Upstream
+       Cloud.SelfHost.Provision
+       Cloud.SelfHost.Secrets.Listener
+       Cloud.SelfHost.Secrets.Queries
++      Cloud.SelfHost.Tokens
+       Cloud.Service.API
+       Cloud.Service.Impl
+       Cloud.Service.Types
+--- a/src/Cloud/Env.hs
++++ b/src/Cloud/Env.hs
+@@ -9,6 +9,7 @@
+ import Cloud.Client.Types (Client, ClientId, NimbusConfig)
+ import Cloud.Postgres.Env (PostgresEnv)
+ import Cloud.Prelude
++import Cloud.SelfHost.Oidc.Config (OidcConfig)
+ import Cloud.Stripe.API (StripeConfig)
+ import Cloud.User.Env (AuthEnv)
+ import Cloud.User.Types (CloudTier)
+@@ -51,6 +52,7 @@
+     envServerPort :: Int,
+     envSelfHostOidcIssuer :: Text,
+     envSelfHostDefaultTier :: CloudTier,
++    envSelfHostOidc :: Maybe OidcConfig,
+     envZendeskAuth :: S.BasicAuthData,
+     envStripeConfig :: StripeConfig
+   }
+--- a/src/Cloud/SelfHost/HeaderAuth.hs
++++ b/src/Cloud/SelfHost/HeaderAuth.hs
+@@ -14,24 +14,16 @@
+ import Cloud.Prelude
+ import Cloud.SelfHost.HeaderAuth.API (API)
+ import Cloud.SelfHost.Provision (Identity (..), ProvisionError (..), provisionUser)
+-import Cloud.User.App (authM)
+-import Cloud.User.Env (AuthEnv (..))
+-import Cloud.User.Impl (enlilAud, enlilIssuer)
++import Cloud.SelfHost.Tokens (accessToken, cloudUIReturnTarget, sessionCookie)
+ import Cloud.Utils.Logging qualified as Logging
+-import Cloud.Web.App (WebApp, isCloudUILink)
+-import Cloud.Web.Local.Impl (AccessTokenClaims (..), newStandardClaims, signJWT)
++import Cloud.Web.App (WebApp)
+ import Control.Monad.Random (randomIO)
+-import Control.Monad.Reader (ask, asks)
+-import Data.ByteString.Lazy (fromStrict)
++import Control.Monad.Reader (asks)
+ import Data.Set qualified as Set
+-import Data.Text.Encoding (encodeUtf8)
+-import Data.Time (NominalDiffTime, addUTCTime, nominalDay)
+ import Servant
+ import Share.JWT qualified as ShareJWT
+ import Share.OAuth.Scopes (Scopes (..))
+ import Share.OAuth.Scopes qualified as Scopes
+-import Share.OAuth.Session (Session (..))
+-import Share.OAuth.Session qualified as Session
+ import Share.OAuth.Types (UserId)
+ import Share.Utils.Servant.Cookies qualified as Cookies
+ import Share.Utils.URI (URIParam (..))
+@@ -39,34 +31,17 @@
+ data HeaderAuthError
+   = MissingUserHeader
+   | ProvisionFailed ProvisionError
+-  | SigningFailed Text
+ 
+ instance Logging.Loggable HeaderAuthError where
+   toLog = \case
+     MissingUserHeader -> Logging.withSeverity Logging.UserFault $ Logging.textLog "selfhost login without X-Auth-Request-User"
+     ProvisionFailed err -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "selfhost login failed: " <> tshow err
+-    SigningFailed err -> Logging.withSeverity Logging.Error . Logging.textLog $ "selfhost login failed to sign a token: " <> err
+ 
+ instance ToServerError HeaderAuthError where
+   toServerError = \case
+     MissingUserHeader ->
+       (ErrorID "selfhost:unauthenticated", err401 {errBody = "Missing X-Auth-Request-User: this endpoint must sit behind the login proxy."})
+-    ProvisionFailed err -> case err of
+-      MissingClaim claim ->
+-        (ErrorID "selfhost:missing-claim", err403 {errBody = "The identity provider didn't supply your " <> encode claim <> ", which a new account needs."})
+-      InvalidHandle handle ->
+-        (ErrorID "selfhost:invalid-handle", err403 {errBody = "Your username " <> encode handle <> " isn't a valid handle: it must start with a letter and contain only letters, digits and hyphens, at most 63 characters."})
+-      HandleTaken handle ->
+-        (ErrorID "selfhost:handle-taken", err409 {errBody = "The handle " <> encode handle <> " already belongs to another account."})
+-      UnsupportedTier tier ->
+-        (ErrorID "selfhost:unsupported-tier", err500 {errBody = "Unsupported default tier " <> encode (tshow tier) <> "."})
+-    SigningFailed _ -> (ErrorID "selfhost:signing-failed", err500)
+-    where
+-      encode = fromStrict . encodeUtf8
+-
+--- | Shorter than the 300 days of the local-only tokens, since tokens can't be revoked.
+-accessTokenTTL :: NominalDiffTime
+-accessTokenTTL = 30 * nominalDay
++    ProvisionFailed err -> toServerError err
+ 
+ server :: ServerT API WebApp
+ server userHeader usernameHeader emailHeader =
+@@ -83,27 +58,13 @@
+     loginEndpoint :: Maybe URIParam -> WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
+     loginEndpoint returnTo = do
+       userId <- provision
+-      iss <- enlilIssuer
+-      aud <- enlilAud
+-      session <- Session.createSession iss (Set.singleton aud) userId
+-      -- share-auth's sessions last a year; bound the cookie's JWT like the access tokens.
+-      let session' = session {sessionExpiry = addUTCTime accessTokenTTL (sessionCreated session)}
+-      cookie <- authM do
+-        AuthEnv {envSessionCookieName, envCookieSettings, envJwtSettings} <- ask
+-        ShareJWT.createSignedCookie envJwtSettings envCookieSettings envSessionCookieName session'
+-      setCookie <- either (respondError . SigningFailed . tshow) pure cookie
+-      uiOrigin <- asks envCloudUiOrigin
+-      -- Like the Share login callback, only return to the cloud UI, never an arbitrary site.
+-      target <- case returnTo of
+-        Just (URIParam uri) -> isCloudUILink uri <&> \valid -> if valid then uri else uiOrigin
+-        Nothing -> pure uiOrigin
++      setCookie <- sessionCookie userId
++      target <- cloudUIReturnTarget (unpackURI <$> returnTo)
+       pure $ addHeader setCookie (addHeader (show target) NoContent)
+ 
+     accessTokenEndpoint :: WebApp Text
+     accessTokenEndpoint = do
+       userId <- provision
+       sessionId <- randomIO
+-      aud <- enlilAud
+-      standardClaims <- newStandardClaims aud userId accessTokenTTL sessionId
+-      signed <- signJWT AccessTokenClaims {standardClaims, scope = Scopes (Set.fromList [Scopes.OpenId, Scopes.Cloud])}
++      signed <- accessToken userId sessionId (Scopes (Set.fromList [Scopes.OpenId, Scopes.Cloud]))
+       pure (ShareJWT.signedJWTToText signed)
+--- a/src/Cloud/SelfHost/Oidc/API.hs
++++ b/src/Cloud/SelfHost/Oidc/API.hs
+@@ -0,0 +1,113 @@
++{-# LANGUAGE DataKinds #-}
++{-# LANGUAGE TypeOperators #-}
++
++module Cloud.SelfHost.Oidc.API
++  ( API,
++    PendingCookieName,
++    TokenRequest (..),
++    TokenResponse (..),
++    UserInfo (..),
++  )
++where
++
++import Cloud.Prelude
++import Data.Aeson (ToJSON (..), (.=))
++import Data.Aeson qualified as Aeson
++import Data.Time (NominalDiffTime)
++import Servant
++import Share.OAuth.API (AuthorizationEndpoint)
++import Share.OAuth.Scopes (Scopes)
++import Share.OAuth.Session (AuthenticatedUserId)
++import Share.OAuth.Types (Code, OAuthClientId, PendingSessionId, PKCEVerifier, UserId)
++import Share.Utils.Servant.Cookies qualified as Cookies
++import Share.Utils.URI (URIParam)
++import Web.FormUrlEncoded (FromForm (..))
++import Web.FormUrlEncoded qualified as Form
++
++type PendingCookieName = "selfhost-oidc-pending"
++
++-- | The paths are free: ucm finds the authorization server's endpoints through the
++-- discovery document, and the web UI's /login is rewritten to the login endpoint.
++type API =
++  ( "selfhost"
++      :> "oidc"
++      :> ( ("login" :> LoginEndpoint)
++             :<|> ("callback" :> CallbackEndpoint)
++             :<|> ("authorize" :> AuthorizationEndpoint)
++             :<|> ("token" :> TokenEndpoint)
++             :<|> ("userinfo" :> UserInfoEndpoint)
++         )
++  )
++    :<|> (".well-known" :> "openid-configuration" :> Get '[JSON] Aeson.Value)
++
++-- | GET /selfhost/oidc/login
++-- Logs in through the upstream provider, then sets the session cookie and redirects to the cloud UI.
++type LoginEndpoint =
++  QueryParam "return_to" URIParam
++    :> Verb 'GET 302 '[PlainText] (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
++
++-- | GET /selfhost/oidc/callback
++-- The upstream provider's redirect URI.
++type CallbackEndpoint =
++  QueryParam "code" Text
++    :> QueryParam "state" PendingSessionId
++    :> QueryParam "error" Text
++    :> QueryParam "error_description" Text
++    :> Cookies.Cookie PendingCookieName PendingSessionId
++    :> Verb 'GET 302 '[PlainText] (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
++
++-- | POST /selfhost/oidc/token
++type TokenEndpoint =
++  ReqBody '[FormUrlEncoded] TokenRequest
++    :> Post '[JSON] (Headers '[Header "Cache-Control" String] TokenResponse)
++
++-- | GET /selfhost/oidc/userinfo
++type UserInfoEndpoint =
++  AuthenticatedUserId :> Get '[JSON] UserInfo
++
++-- | https://datatracker.ietf.org/doc/html/rfc6749#section-4.1.3 and #section-6.
++-- ucm sends no client_id when refreshing.
++data TokenRequest
++  = AuthorizationCodeGrant Code URIParam OAuthClientId PKCEVerifier
++  | RefreshTokenGrant Text
++
++instance FromForm TokenRequest where
++  fromForm form =
++    Form.parseUnique @Text "grant_type" form >>= \case
++      "authorization_code" ->
++        AuthorizationCodeGrant
++          <$> Form.parseUnique "code" form
++          <*> Form.parseUnique "redirect_uri" form
++          <*> Form.parseUnique "client_id" form
++          <*> Form.parseUnique "code_verifier" form
++      "refresh_token" -> RefreshTokenGrant <$> Form.parseUnique "refresh_token" form
++      other -> Left ("unsupported grant_type " <> other)
++
++-- | ucm requires refresh_token and scope, and reads expires_in to decide when to log in again.
++data TokenResponse = TokenResponse
++  { accessToken :: Text,
++    refreshToken :: Text,
++    expiresIn :: NominalDiffTime,
++    scope :: Scopes
++  }
++
++instance ToJSON TokenResponse where
++  toJSON TokenResponse {accessToken, refreshToken, expiresIn, scope} =
++    Aeson.object
++      [ "access_token" .= accessToken,
++        "token_type" .= ("bearer" :: Text),
++        "expires_in" .= (floor expiresIn :: Integer),
++        "refresh_token" .= refreshToken,
++        "scope" .= scope
++      ]
++
++-- | ucm requires sub and handle; name is optional.
++data UserInfo = UserInfo
++  { sub :: UserId,
++    name :: Maybe Text,
++    handle :: Text
++  }
++
++instance ToJSON UserInfo where
++  toJSON UserInfo {sub, name, handle} =
++    Aeson.object ["sub" .= sub, "name" .= name, "handle" .= handle]
+--- a/src/Cloud/SelfHost/Oidc/Config.hs
++++ b/src/Cloud/SelfHost/Oidc/Config.hs
+@@ -0,0 +1,103 @@
++-- | Configuration of the upstream OIDC provider cloud-api brokers logins through.
++module Cloud.SelfHost.Oidc.Config
++  ( OidcConfig (..),
++    Endpoints (..),
++    EndpointSource (..),
++    Allowlist (..),
++    loadOidcConfig,
++  )
++where
++
++import Cloud.Prelude
++import Data.Set (Set)
++import Data.Set qualified as Set
++import Data.Text qualified as Text
++import Network.HTTP.Client (Manager)
++import Network.URI (URI, parseAbsoluteURI, uriScheme)
++import System.Environment (lookupEnv)
++
++data OidcConfig = OidcConfig
++  { -- | Compared verbatim with the ID token's @iss@, and recorded with each identity.
++    issuer :: Text,
++    endpoints :: EndpointSource,
++    clientId :: Text,
++    clientSecret :: Text,
++    handleClaim :: Text,
++    emailClaim :: Text,
++    groupsClaim :: Text,
++    allowlist :: Allowlist,
++    httpManager :: Manager
++  }
++
++data Endpoints = Endpoints
++  { authorizationEndpoint :: URI,
++    tokenEndpoint :: URI,
++    jwksURI :: URI
++  }
++
++data EndpointSource
++  = Discover
++  | -- | The issuer's public URL isn't always reachable from cloud-api's network, so the
++    -- server-to-server endpoints can point somewhere else.
++    Fixed Endpoints
++
++-- | Like oauth2-proxy: the email has to match one of the email lists if either is set, and
++-- the groups one of the groups if that is set.
++data Allowlist = Allowlist
++  { emails :: Set Text,
++    emailDomains :: Set Text,
++    groups :: Set Text
++  }
++
++-- | Nothing unless @CLOUD_OIDC_ISSUER@ is set, which leaves the broker disabled.
++loadOidcConfig :: Manager -> IO (Either String (Maybe OidcConfig))
++loadOidcConfig httpManager =
++  lookupEnv "CLOUD_OIDC_ISSUER" >>= \case
++    Nothing -> pure (Right Nothing)
++    Just issuerStr -> do
++      clientId <- lookupEnv "CLOUD_OIDC_CLIENT_ID"
++      clientSecret <- lookupEnv "CLOUD_OIDC_CLIENT_SECRET"
++      authorizationURL <- lookupEnv "CLOUD_OIDC_AUTHORIZATION_URL"
++      tokenURL <- lookupEnv "CLOUD_OIDC_TOKEN_URL"
++      jwksURL <- lookupEnv "CLOUD_OIDC_JWKS_URL"
++      handleClaim <- lookupEnv "CLOUD_OIDC_HANDLE_CLAIM"
++      emailClaim <- lookupEnv "CLOUD_OIDC_EMAIL_CLAIM"
++      groupsClaim <- lookupEnv "CLOUD_OIDC_GROUPS_CLAIM"
++      allowedEmails <- lookupEnv "CLOUD_OIDC_ALLOWED_EMAILS"
++      allowedEmailDomains <- lookupEnv "CLOUD_OIDC_ALLOWED_EMAIL_DOMAINS"
++      allowedGroups <- lookupEnv "CLOUD_OIDC_ALLOWED_GROUPS"
++      pure $ fmap Just do
++        _ <- parseURL "CLOUD_OIDC_ISSUER" issuerStr
++        endpoints <- case (authorizationURL, tokenURL, jwksURL) of
++          (Nothing, Nothing, Nothing) -> Right Discover
++          (Just a, Just t, Just j) ->
++            Fixed <$> (Endpoints <$> parseURL "CLOUD_OIDC_AUTHORIZATION_URL" a <*> parseURL "CLOUD_OIDC_TOKEN_URL" t <*> parseURL "CLOUD_OIDC_JWKS_URL" j)
++          _ -> Left "CLOUD_OIDC_AUTHORIZATION_URL, CLOUD_OIDC_TOKEN_URL and CLOUD_OIDC_JWKS_URL must be set together"
++        clientId' <- required "CLOUD_OIDC_CLIENT_ID" clientId
++        clientSecret' <- required "CLOUD_OIDC_CLIENT_SECRET" clientSecret
++        pure
++          OidcConfig
++            { issuer = Text.pack issuerStr,
++              endpoints,
++              clientId = clientId',
++              clientSecret = clientSecret',
++              handleClaim = maybe "preferred_username" Text.pack handleClaim,
++              emailClaim = maybe "email" Text.pack emailClaim,
++              groupsClaim = maybe "groups" Text.pack groupsClaim,
++              allowlist =
++                Allowlist
++                  { emails = Set.map Text.toLower (commaSeparated allowedEmails),
++                    emailDomains = Set.map Text.toLower (commaSeparated allowedEmailDomains),
++                    groups = commaSeparated allowedGroups
++                  },
++              httpManager
++            }
++  where
++    required var = maybe (Left (var <> " must be set when CLOUD_OIDC_ISSUER is")) (Right . Text.pack)
++
++    parseURL var str = case parseAbsoluteURI str of
++      Just uri | uriScheme uri `elem` ["http:", "https:"] -> Right uri
++      _ -> Left (var <> " must be an absolute http or https URL, got " <> str)
++
++    commaSeparated =
++      maybe Set.empty (Set.fromList . filter (not . Text.null) . map Text.strip . Text.splitOn "," . Text.pack)
+--- a/src/Cloud/SelfHost/Oidc/RefreshToken.hs
++++ b/src/Cloud/SelfHost/Oidc/RefreshToken.hs
+@@ -0,0 +1,65 @@
++-- | Opaque, single-use refresh tokens for ucm, kept in Redis.
++--
++-- Unlike the access tokens these can be revoked: deleting the keys under
++-- @selfhost:oidc:refresh:@ stops every refresh.
++module Cloud.SelfHost.Oidc.RefreshToken
++  ( issueRefreshToken,
++    redeemRefreshToken,
++  )
++where
++
++import Cloud.App (AppM)
++import Cloud.Prelude
++import Cloud.SelfHost.Tokens (accessTokenTTL)
++import Crypto.Hash (SHA256 (..), hashWith)
++import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.=))
++import Data.Aeson qualified as Aeson
++import Data.ByteString.Char8 qualified as BSC
++import Data.ByteString.Lazy qualified as BL
++import Data.Text.Encoding qualified as Text
++import Database.Redis qualified as R
++import Share.OAuth.Scopes (Scopes)
++import Share.OAuth.Types (UserId)
++import Share.Utils.SecureTokens (newSecureToken)
++
++data Grant = Grant
++  { userId :: UserId,
++    scope :: Scopes
++  }
++
++instance ToJSON Grant where
++  toJSON Grant {userId, scope} = Aeson.object ["user_id" .= userId, "scope" .= scope]
++
++instance FromJSON Grant where
++  parseJSON = Aeson.withObject "Grant" \o -> Grant <$> o .: "user_id" <*> o .: "scope"
++
++newtype RedisFailure = RedisFailure R.Reply
++  deriving stock (Show)
++
++instance Exception RedisFailure
++
++-- | Only a hash is stored, so reading Redis doesn't hand out working tokens.
++redisKey :: Text -> ByteString
++redisKey token = "selfhost:oidc:refresh:" <> BSC.pack (show (hashWith SHA256 (Text.encodeUtf8 token)))
++
++-- | Lives as long as an access token; each refresh replaces it with a new one.
++issueRefreshToken :: UserId -> Scopes -> AppM ctx Text
++issueRefreshToken userId scope = do
++  token <- newSecureToken
++  _ <- orThrow =<< R.setex (redisKey token) (floor accessTokenTTL) (BL.toStrict (Aeson.encode Grant {userId, scope}))
++  pure token
++
++-- | Consumes the token, so a stolen copy stops working once its owner refreshes.
++redeemRefreshToken :: Text -> AppM ctx (Maybe (UserId, Scopes))
++redeemRefreshToken token = do
++  let key = redisKey token
++  stored <- orThrow =<< R.get key
++  deleted <- orThrow =<< R.del [key]
++  pure do
++    -- Of two concurrent redemptions, only the one that deleted the key wins.
++    guard (deleted == 1)
++    Grant {userId, scope} <- stored >>= Aeson.decodeStrict
++    pure (userId, scope)
++
++orThrow :: Either R.Reply a -> AppM ctx a
++orThrow = either (throwIO . RedisFailure) pure
+--- a/src/Cloud/SelfHost/Oidc/Upstream.hs
++++ b/src/Cloud/SelfHost/Oidc/Upstream.hs
+@@ -0,0 +1,169 @@
++-- | The client side of the OIDC login: cloud-api against the upstream provider.
++module Cloud.SelfHost.Oidc.Upstream
++  ( UpstreamError (..),
++    VerifiedClaims (..),
++    resolveEndpoints,
++    authorizationURI,
++    exchangeCode,
++    verifyIdToken,
++  )
++where
++
++import Cloud.Prelude
++import Cloud.SelfHost.Oidc.Config (Allowlist (..), EndpointSource (..), Endpoints (..), OidcConfig (..))
++import Control.Lens (lens, review, view, (.~))
++import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
++import Crypto.JOSE.JWA.JWS qualified as JWS
++import Crypto.JWT qualified as JWT
++import Data.Aeson (FromJSON (..), (.:))
++import Data.Aeson qualified as Aeson
++import Data.Aeson.KeyMap qualified as KeyMap
++import Data.ByteString.Lazy qualified as BL
++import Data.Maybe (isNothing)
++import Data.Set qualified as Set
++import Data.Text qualified as Text
++import Data.Text.Encoding qualified as Text
++import Network.HTTP.Client qualified as HTTP
++import Network.HTTP.Types (hAccept, statusCode, urlEncode)
++import Network.URI (URI, parseAbsoluteURI)
++import Share.OAuth.Types (PKCEChallenge, PKCEVerifier (..))
++import Share.Utils.URI (addQueryParam)
++
++data UpstreamError
++  = DiscoveryFailed Text
++  | TokenExchangeFailed Text
++  | JWKSFailed Text
++  | InvalidIdToken Text
++  deriving stock (Show)
++
++-- | The claims of an ID token whose signature, issuer, audience, expiry and nonce checked out.
++data VerifiedClaims = VerifiedClaims
++  { subject :: Text,
++    claims :: Aeson.Object
++  }
++
++resolveEndpoints :: OidcConfig -> IO (Either UpstreamError Endpoints)
++resolveEndpoints config@OidcConfig {endpoints} = case endpoints of
++  Fixed fixed -> pure (Right fixed)
++  Discover -> runExceptT do
++    let discoveryURL = Text.dropWhileEnd (== '/') config.issuer <> "/.well-known/openid-configuration"
++    url <- maybe (throwError $ DiscoveryFailed ("invalid discovery URL " <> discoveryURL)) pure (parseAbsoluteURI (Text.unpack discoveryURL))
++    Discovery {discoveredIssuer, discovered} <- ExceptT (first DiscoveryFailed <$> getJSON config.httpManager url)
++    -- OIDC Discovery 1.0 §4.3: the document must name the issuer it was fetched for.
++    when (discoveredIssuer /= config.issuer) $
++      throwError $ DiscoveryFailed ("discovery document names issuer " <> discoveredIssuer <> ", expected " <> config.issuer)
++    pure discovered
++
++authorizationURI :: OidcConfig -> Endpoints -> URI -> Text -> Text -> PKCEChallenge -> URI
++authorizationURI config Endpoints {authorizationEndpoint} redirectURI state nonce challenge =
++  authorizationEndpoint
++    & addQueryParam "response_type" ("code" :: Text)
++    & addQueryParam "client_id" config.clientId
++    & addQueryParam "redirect_uri" (tshow redirectURI)
++    & addQueryParam "scope" scopes
++    & addQueryParam "state" state
++    & addQueryParam "nonce" nonce
++    & addQueryParam "code_challenge" challenge
++    & addQueryParam "code_challenge_method" ("S256" :: Text)
++  where
++    scopes :: Text
++    scopes = Text.unwords $ ["openid", "email", "profile"] <> ["groups" | not (Set.null config.allowlist.groups)]
++
++-- | Redeems an authorization code and returns the raw ID token.
++exchangeCode :: OidcConfig -> Endpoints -> URI -> Text -> PKCEVerifier -> IO (Either UpstreamError Text)
++exchangeCode config Endpoints {tokenEndpoint} redirectURI code (PKCEVerifier verifier) = runExceptT do
++  req <- ExceptT (first TokenExchangeFailed <$> tryHttp (HTTP.requestFromURI tokenEndpoint))
++  let req' =
++        req
++          & HTTP.urlEncodedBody
++            [ ("grant_type", "authorization_code"),
++              ("code", Text.encodeUtf8 code),
++              ("redirect_uri", Text.encodeUtf8 (tshow redirectURI)),
++              ("code_verifier", Text.encodeUtf8 verifier)
++            ]
++          -- RFC 6749 §2.3.1: client_secret_basic form-encodes both halves before base64.
++          & HTTP.applyBasicAuth (urlEncode True (Text.encodeUtf8 config.clientId)) (urlEncode True (Text.encodeUtf8 config.clientSecret))
++          & \r -> r {HTTP.requestHeaders = (hAccept, "application/json") : HTTP.requestHeaders r}
++  resp <- ExceptT (first TokenExchangeFailed <$> tryHttp (HTTP.httpLbs req' config.httpManager))
++  let status = statusCode (HTTP.responseStatus resp)
++  when (status /= 200) $
++    throwError $ TokenExchangeFailed ("token endpoint answered " <> tshow status <> ": " <> Text.decodeUtf8Lenient (BL.toStrict (HTTP.responseBody resp)))
++  TokenResponse idToken <- either (throwError . TokenExchangeFailed . Text.pack) pure (Aeson.eitherDecode (HTTP.responseBody resp))
++  pure idToken
++
++verifyIdToken :: OidcConfig -> Endpoints -> Text -> Text -> IO (Either UpstreamError VerifiedClaims)
++verifyIdToken config Endpoints {jwksURI} expectedNonce idToken = runExceptT do
++  jwks :: JWT.JWKSet <- ExceptT (first JWKSFailed <$> getJSON config.httpManager jwksURI)
++  IdTokenClaims {registered, claims} <-
++    ExceptT . fmap (first (InvalidIdToken . tshow)) . runExceptT @JWT.JWTError $ do
++      jwt <- JWT.decodeCompact (BL.fromStrict (Text.encodeUtf8 idToken))
++      JWT.verifyJWT validation jwks jwt
++  -- jose only validates the registered claims that are present; OIDC Core §2 requires these.
++  subject <- maybe (throwError $ InvalidIdToken "no sub claim") (pure . review JWT.stringOrUri) (view JWT.claimSub registered)
++  when (isNothing (view JWT.claimExp registered)) $ throwError (InvalidIdToken "no exp claim")
++  when (isNothing (view JWT.claimIss registered)) $ throwError (InvalidIdToken "no iss claim")
++  when (isNothing (view JWT.claimAud registered)) $ throwError (InvalidIdToken "no aud claim")
++  when (KeyMap.lookup "nonce" claims /= Just (Aeson.String expectedNonce)) $
++    throwError (InvalidIdToken "nonce mismatch")
++  -- OIDC Core §3.1.3.7: azp, when present, must be this client.
++  case KeyMap.lookup "azp" claims of
++    Nothing -> pure ()
++    Just (Aeson.String azp) | azp == config.clientId -> pure ()
++    Just other -> throwError (InvalidIdToken ("azp is " <> tshow other))
++  pure VerifiedClaims {subject, claims}
++  where
++    validation =
++      JWT.defaultJWTValidationSettings (matches config.clientId)
++        & JWT.issuerPredicate .~ matches config.issuer
++        & JWT.allowedSkew .~ 60
++        & JWT.validationSettings
++          .~ ( JWT.defaultValidationSettings
++                 -- Only asymmetric algorithms, so a token can't be forged by HMAC-signing it with a public key.
++                 & JWT.validationSettingsAlgorithms
++                   .~ Set.fromList [JWS.RS256, JWS.RS384, JWS.RS512, JWS.PS256, JWS.PS384, JWS.PS512, JWS.ES256, JWS.ES384, JWS.ES512, JWS.EdDSA]
++             )
++    matches :: Text -> JWT.StringOrURI -> Bool
++    matches expected actual = review JWT.stringOrUri actual == expected
++
++data Discovery = Discovery
++  { discoveredIssuer :: Text,
++    discovered :: Endpoints
++  }
++
++instance FromJSON Discovery where
++  parseJSON = Aeson.withObject "openid-configuration" \o -> do
++    discoveredIssuer <- o .: "issuer"
++    authorizationEndpoint <- o .: "authorization_endpoint" >>= parseURL
++    tokenEndpoint <- o .: "token_endpoint" >>= parseURL
++    jwksURI <- o .: "jwks_uri" >>= parseURL
++    pure Discovery {discoveredIssuer, discovered = Endpoints {..}}
++    where
++      parseURL txt = maybe (fail ("not an absolute URL: " <> Text.unpack txt)) pure (parseAbsoluteURI (Text.unpack txt))
++
++newtype TokenResponse = TokenResponse Text
++
++instance FromJSON TokenResponse where
++  parseJSON = Aeson.withObject "token response" \o -> TokenResponse <$> o .: "id_token"
++
++-- | An ID token's registered claims, plus the whole object for the rest.
++data IdTokenClaims = IdTokenClaims
++  { registered :: JWT.ClaimsSet,
++    claims :: Aeson.Object
++  }
++
++instance JWT.HasClaimsSet IdTokenClaims where
++  claimsSet = lens (.registered) \c registered -> c {registered}
++
++instance FromJSON IdTokenClaims where
++  parseJSON = Aeson.withObject "ID token claims" \o -> IdTokenClaims <$> parseJSON (Aeson.Object o) <*> pure o
++
++getJSON :: (FromJSON a) => HTTP.Manager -> URI -> IO (Either Text a)
++getJSON manager url = runExceptT do
++  req <- ExceptT (tryHttp (HTTP.requestFromURI url))
++  resp <- ExceptT (tryHttp (HTTP.httpLbs req {HTTP.requestHeaders = [(hAccept, "application/json")]} manager))
++  let status = statusCode (HTTP.responseStatus resp)
++  when (status /= 200) $ throwError (tshow url <> " answered " <> tshow status)
++  either (throwError . (\err -> tshow url <> ": " <> Text.pack err)) pure (Aeson.eitherDecode (HTTP.responseBody resp))
++
++tryHttp :: IO a -> IO (Either Text a)
++tryHttp action = first (tshow @HTTP.HttpException) <$> try action
+--- a/src/Cloud/SelfHost/Oidc.hs
++++ b/src/Cloud/SelfHost/Oidc.hs
+@@ -0,0 +1,329 @@
++{-# LANGUAGE DataKinds #-}
++
++-- | Option A login: cloud-api is an OIDC client of the upstream provider, and a minimal
++-- authorization server for ucm's @auth.login@, modeled on Share's broker for GitHub.
++--
++-- Everything here 404s unless @CLOUD_OIDC_ISSUER@ is set.
++module Cloud.SelfHost.Oidc
++  ( server,
++  )
++where
++
++import Cloud.Env (Env (..))
++import Cloud.Errors (ErrorID (..), ToServerError (..), respondError)
++import Cloud.Postgres qualified as PG
++import Cloud.Postgres.App (postgresM)
++import Cloud.Postgres.Ops qualified as PGO
++import Cloud.Prelude
++import Cloud.SelfHost.Oidc.API
++import Cloud.SelfHost.Oidc.Config (Allowlist (..), OidcConfig (..))
++import Cloud.SelfHost.Oidc.RefreshToken (issueRefreshToken, redeemRefreshToken)
++import Cloud.SelfHost.Oidc.Upstream (UpstreamError (..), VerifiedClaims (..))
++import Cloud.SelfHost.Oidc.Upstream qualified as Upstream
++import Cloud.SelfHost.Provision (Identity (..), ProvisionError, provisionUser)
++import Cloud.SelfHost.Tokens (accessTokenTTL, cloudUIReturnTarget, sessionCookie)
++import Cloud.SelfHost.Tokens qualified as Tokens
++import Cloud.User.Env (AuthEnv (..))
++import Cloud.User.Impl (enlilAud, enlilIssuer)
++import Cloud.User.Types (User (..))
++import Cloud.Utils.Logging qualified as Logging
++import Cloud.Web.App (WebApp)
++import Control.Monad (unless)
++import Control.Monad.Random (randomIO)
++import Control.Monad.Reader (asks)
++import Data.Aeson ((.=))
++import Data.Aeson qualified as Aeson
++import Data.Aeson.KeyMap qualified as KeyMap
++import Data.Aeson.Key qualified as Key
++import Data.ByteString.Lazy qualified as BL
++import Data.List qualified as List
++import Data.Set qualified as Set
++import Data.Text qualified as Text
++import Data.Text.Encoding qualified as Text
++import GHC.TypeLits (symbolVal)
++import Network.URI (URIAuth (..))
++import Servant
++import Share.JWT qualified as ShareJWT
++import Share.OAuth.Errors (OAuth2Error)
++import Share.OAuth.PKCE qualified as PKCE
++import Share.OAuth.Redis qualified as Redis
++import Share.OAuth.Scopes (Scopes, UnisonScope (OpenId), containsScope)
++import Share.OAuth.Session (LoginRequest (..), PendingSession (..), Session (..))
++import Share.OAuth.Types (AuthenticationRequest (..), OAuthClientId (..), PKCEChallenge, PKCEChallengeMethod (..), PendingSessionId, ResponseType (..), UserId)
++import Share.Utils.IDs qualified as IDs
++import Share.Utils.SecureTokens (newSecureToken)
++import Share.Utils.Servant.Cookies (cookieVal)
++import Share.Utils.Servant.Cookies qualified as Cookies
++import Share.Utils.URI (URIParam (..), addQueryParam)
++import Web.Cookie (SetCookie (..))
++
++data BrokerError
++  = BrokerDisabled
++  | ProviderRefused Text (Maybe Text)
++  | MissingPendingSession
++  | MismatchedState
++  | MissingCallbackParam Text
++  | UpstreamFailed UpstreamError
++  | NotAllowed Text
++  | ProvisionFailed ProvisionError
++  | UnknownClient OAuthClientId
++  | InvalidRedirectURI URIParam
++  | UnsupportedChallengeMethod
++  | OpenIdScopeRequired
++
++instance Logging.Loggable BrokerError where
++  toLog = \case
++    UpstreamFailed err -> Logging.withSeverity Logging.Error . Logging.textLog $ "oidc login failed upstream: " <> tshow err
++    ProvisionFailed err -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc login failed: " <> tshow err
++    NotAllowed who -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc login refused by the allowlist: " <> who
++    ProviderRefused err desc -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc provider refused the login: " <> err <> maybe "" (": " <>) desc
++    UnknownClient clientId -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oauth authorize from unknown client " <> tshow clientId
++    InvalidRedirectURI uri -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oauth authorize with non-loopback redirect_uri " <> tshow uri
++    other ->
++      let (ErrorID errId, _) = toServerError other
++       in Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc login failed: " <> errId
++
++instance ToServerError BrokerError where
++  toServerError = \case
++    BrokerDisabled -> (ErrorID "selfhost:oidc-disabled", err404)
++    ProviderRefused err desc ->
++      (ErrorID "selfhost:oidc-provider-refused", err403 {errBody = "The identity provider refused the login: " <> encode err <> maybe "" ((" (" <>) . (<> ")") . encode) desc})
++    MissingPendingSession ->
++      (ErrorID "selfhost:oidc-no-pending-session", err400 {errBody = "The login took too long or was started in another browser. Please try again."})
++    MismatchedState -> (ErrorID "selfhost:oidc-mismatched-state", err400 {errBody = "Mismatched state parameter."})
++    MissingCallbackParam param -> (ErrorID "selfhost:oidc-missing-param", err400 {errBody = "Missing " <> encode param <> " parameter."})
++    UpstreamFailed _ -> (ErrorID "selfhost:oidc-upstream-failed", err502 {errBody = "Logging in through the identity provider failed; the server log has details."})
++    NotAllowed _ -> (ErrorID "selfhost:oidc-not-allowed", err403 {errBody = "Your account isn't allowed to log in here."})
++    ProvisionFailed err -> toServerError err
++    UnknownClient _ -> (ErrorID "selfhost:oauth-unknown-client", err400 {errBody = "Unknown client_id; only ucm may use this server."})
++    InvalidRedirectURI _ -> (ErrorID "selfhost:oauth-invalid-redirect-uri", err400 {errBody = "redirect_uri must be an http URL on a loopback address."})
++    UnsupportedChallengeMethod -> (ErrorID "selfhost:oauth-pkce-method", err400 {errBody = "code_challenge_method must be S256."})
++    OpenIdScopeRequired -> (ErrorID "selfhost:oauth-openid-scope", err400 {errBody = "scope must include openid."})
++    where
++      encode = BL.fromStrict . Text.encodeUtf8
++
++-- | https://datatracker.ietf.org/doc/html/rfc6749#section-5.2
++data TokenError
++  = InvalidGrant
++  | InvalidClient
++
++instance Logging.Loggable TokenError where
++  toLog = \case
++    InvalidGrant -> Logging.withSeverity Logging.UserFault $ Logging.textLog "oauth token request with an invalid, expired or used grant"
++    InvalidClient -> Logging.withSeverity Logging.UserFault $ Logging.textLog "oauth token request from an unknown client"
++
++instance ToServerError TokenError where
++  toServerError = \case
++    InvalidGrant -> (ErrorID "selfhost:oauth-invalid-grant", oauthError err400 "invalid_grant")
++    InvalidClient -> (ErrorID "selfhost:oauth-invalid-client", oauthError err401 "invalid_client")
++    where
++      oauthError base code = base {errBody = Aeson.encode (Aeson.object ["error" .= (code :: Text)]), errHeaders = [("Content-Type", "application/json")]}
++
++ucmClientId :: OAuthClientId
++ucmClientId = OAuthClientId "ucm"
++
++server :: ServerT API WebApp
++server =
++  ( loginEndpoint
++      :<|> callbackEndpoint
++      :<|> authorizeEndpoint
++      :<|> tokenEndpoint
++      :<|> userInfoEndpoint
++  )
++    :<|> discoveryEndpoint
++
++brokerConfig :: WebApp OidcConfig
++brokerConfig = asks envSelfHostOidc >>= maybe (respondError BrokerDisabled) pure
++
++apiURL :: [Text] -> WebApp URI
++apiURL segments =
++  asks envApiOrigin <&> \origin ->
++    origin
++      { uriPath = List.dropWhileEnd (== '/') (uriPath origin) <> concatMap (('/' :) . Text.unpack) segments,
++        uriQuery = "",
++        uriFragment = ""
++      }
++
++discoveryEndpoint :: WebApp Aeson.Value
++discoveryEndpoint = do
++  void brokerConfig
++  issuer <- enlilIssuer
++  authorize <- apiURL ["selfhost", "oidc", "authorize"]
++  token <- apiURL ["selfhost", "oidc", "token"]
++  userinfo <- apiURL ["selfhost", "oidc", "userinfo"]
++  jwks <- apiURL [".well-known", "jwks.json"]
++  pure $
++    Aeson.object
++      [ "issuer" .= tshow issuer,
++        "authorization_endpoint" .= tshow authorize,
++        "token_endpoint" .= tshow token,
++        "userinfo_endpoint" .= tshow userinfo,
++        "jwks_uri" .= tshow jwks,
++        "response_types_supported" .= ["code" :: Text],
++        "grant_types_supported" .= ["authorization_code", "refresh_token" :: Text],
++        "code_challenge_methods_supported" .= ["S256" :: Text],
++        "token_endpoint_auth_methods_supported" .= ["none" :: Text],
++        "scopes_supported" .= ["openid", "cloud", "sync" :: Text],
++        "subject_types_supported" .= ["public" :: Text]
++      ]
++
++loginEndpoint :: Maybe URIParam -> WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
++loginEndpoint returnTo = beginUpstreamLogin LoginPage (unpackURI <$> returnTo)
++
++-- | Sends the browser to the upstream provider, remembering the login in Redis for the callback.
++beginUpstreamLogin :: LoginRequest -> Maybe URI -> WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
++beginUpstreamLogin loginRequest returnTo = do
++  config <- brokerConfig
++  endpoints <- liftIO (Upstream.resolveEndpoints config) >>= either (respondError . UpstreamFailed) pure
++  (verifier, challenge, _) <- PKCE.generatePkce
++  nonce <- newSecureToken
++  PendingSession {pendingId} <- Redis.liftRedis $ Redis.newPendingSession loginRequest verifier returnTo (Just (Aeson.object ["nonce" .= nonce]))
++  callback <- apiURL ["selfhost", "oidc", "callback"]
++  let target = Upstream.authorizationURI config endpoints callback (IDs.toText pendingId) nonce challenge
++  cookie <- pendingCookie (IDs.toText pendingId)
++  pure $ addHeader cookie (addHeader (show target) NoContent)
++
++-- | Binds the login to the browser that started it, so a callback URL can't be replayed elsewhere.
++pendingCookie :: Text -> WebApp Cookies.SetCookie
++pendingCookie value = do
++  settings <- asks (envCookieSettings . authEnv)
++  pure (Cookies.newSetCookie settings pendingCookieName value) {setCookieMaxAge = Just (5 * 60), setCookiePath = Just "/selfhost/oidc"}
++
++clearPendingCookie :: WebApp Cookies.SetCookie
++clearPendingCookie = do
++  settings <- asks (envCookieSettings . authEnv)
++  pure (Cookies.clearCookie settings pendingCookieName) {setCookiePath = Just "/selfhost/oidc"}
++
++pendingCookieName :: Text
++pendingCookieName = Text.pack (symbolVal (Proxy @PendingCookieName))
++
++callbackEndpoint ::
++  Maybe Text ->
++  Maybe PendingSessionId ->
++  Maybe Text ->
++  Maybe Text ->
++  Maybe (Cookies.CookieVal PendingCookieName PendingSessionId) ->
++  WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
++callbackEndpoint code state providerError providerErrorDescription (cookieVal -> cookiePendingId) = do
++  config <- brokerConfig
++  for_ providerError \err -> respondError (ProviderRefused err providerErrorDescription)
++  pendingId <- maybe (respondError MissingPendingSession) pure cookiePendingId
++  when (state /= Just pendingId) $ respondError MismatchedState
++  PendingSession {loginRequest, pkceVerifier, returnToURI, additionalData} <-
++    Redis.liftRedis (Redis.getPendingSession pendingId) >>= maybe (respondError MissingPendingSession) pure
++  Redis.liftRedis (Redis.failPendingSession pendingId)
++  nonce <- case additionalData of
++    Just (Aeson.Object o) | Just (Aeson.String n) <- KeyMap.lookup "nonce" o -> pure n
++    _ -> respondError MissingPendingSession
++  code' <- maybe (respondError (MissingCallbackParam "code")) pure code
++  endpoints <- liftIO (Upstream.resolveEndpoints config) >>= either (respondError . UpstreamFailed) pure
++  callback <- apiURL ["selfhost", "oidc", "callback"]
++  verified <- liftIO do
++    idToken <- Upstream.exchangeCode config endpoints callback code' pkceVerifier
++    either (pure . Left) (Upstream.verifyIdToken config endpoints nonce) idToken
++  identity <- either respondError pure . allowedIdentity config =<< either (respondError . UpstreamFailed) pure verified
++  tier <- asks envSelfHostDefaultTier
++  userId <- postgresM (PG.runTransaction (provisionUser tier identity)) >>= either (respondError . ProvisionFailed) pure
++  session <- sessionCookie userId
++  clear <- clearPendingCookie
++  target <- case loginRequest of
++    LoginPage -> cloudUIReturnTarget returnToURI
++    OAuthRequest authRequest -> codeRedirect userId authRequest
++  pure $ addHeader session (addHeader clear (addHeader (show target) NoContent))
++
++-- | Checks the allowlist like oauth2-proxy does, and picks out the claims provisioning needs.
++allowedIdentity :: OidcConfig -> VerifiedClaims -> Either BrokerError Identity
++allowedIdentity config VerifiedClaims {subject, claims} = do
++  let Allowlist {emails, emailDomains, groups} = config.allowlist
++      email = textClaim config.emailClaim
++      -- An unverified address could be anyone's, so it never matches an email allowlist.
++      verifiedEmail = case KeyMap.lookup "email_verified" claims of
++        Just (Aeson.Bool False) -> Nothing
++        _ -> Text.toLower <$> email
++      emailAllowed =
++        (Set.null emails && Set.null emailDomains) || case verifiedEmail of
++          Just e -> Set.member e emails || Set.member (Text.takeWhileEnd (/= '@') e) emailDomains
++          Nothing -> False
++      userGroups = case KeyMap.lookup (Key.fromText config.groupsClaim) claims of
++        Just (Aeson.Array gs) -> Set.fromList [g | Aeson.String g <- toList gs]
++        Just (Aeson.String g) -> Set.singleton g
++        _ -> Set.empty
++      groupsAllowed = Set.null groups || not (Set.disjoint groups userGroups)
++  unless' (emailAllowed && groupsAllowed) $ NotAllowed (subject <> maybe "" (" " <>) email)
++  pure Identity {issuer = config.issuer, subject, preferredUsername = textClaim config.handleClaim, email}
++  where
++    textClaim name = case KeyMap.lookup (Key.fromText name) claims of
++      Just (Aeson.String t) | not (Text.null t) -> Just t
++      _ -> Nothing
++    unless' ok err = if ok then Right () else Left err
++
++-- | Issues a one-time code for ucm and sends the browser back to ucm's loopback listener.
++codeRedirect :: UserId -> AuthenticationRequest -> WebApp URI
++codeRedirect userId authRequest@AuthenticationRequest {redirectURI = URIParam redirectURI, state} = do
++  iss <- enlilIssuer
++  aud <- enlilAud
++  (_, code) <- Redis.liftRedis $ Redis.createOAuth2Code iss (Set.singleton aud) userId authRequest
++  pure (redirectURI & addQueryParam "state" state & addQueryParam "code" code)
++
++authorizeEndpoint ::
++  ResponseType ->
++  OAuthClientId ->
++  URIParam ->
++  Scopes ->
++  Text ->
++  PKCEChallenge ->
++  PKCEChallengeMethod ->
++  Maybe Session ->
++  WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
++authorizeEndpoint ResponseTypeCode clientId redirectURI scopes state pkceChallenge pkceChallengeMethod existingSession = do
++  void brokerConfig
++  when (clientId /= ucmClientId) $ respondError (UnknownClient clientId)
++  unless (isLoopback (unpackURI redirectURI)) $ respondError (InvalidRedirectURI redirectURI)
++  case pkceChallengeMethod of
++    SHA256Method -> pure ()
++    PlainTextMethod -> respondError UnsupportedChallengeMethod
++  unless (containsScope OpenId scopes) $ respondError OpenIdScopeRequired
++  let authRequest = AuthenticationRequest {clientId, redirectURI, state, scopes, pkceChallenge, pkceChallengeMethod}
++  case existingSession of
++    Just Session {sessionUserId} -> do
++      target <- codeRedirect sessionUserId authRequest
++      pure $ noHeader (addHeader (show target) NoContent)
++    Nothing -> beginUpstreamLogin (OAuthRequest authRequest) Nothing
++
++-- | RFC 8252 §7.3: native clients listen on a loopback port chosen at runtime.
++isLoopback :: URI -> Bool
++isLoopback URI {uriScheme, uriAuthority, uriFragment} =
++  uriScheme == "http:"
++    && null uriFragment
++    && case uriAuthority of
++      Just URIAuth {uriUserInfo = "", uriRegName} -> uriRegName `elem` ["localhost", "127.0.0.1", "[::1]"]
++      _ -> False
++
++tokenEndpoint :: TokenRequest -> WebApp (Headers '[Header "Cache-Control" String] TokenResponse)
++tokenEndpoint request = do
++  void brokerConfig
++  (userId, sessionId, scope) <- case request of
++    AuthorizationCodeGrant code redirectURI clientId verifier -> do
++      when (clientId /= ucmClientId) $ respondError InvalidClient
++      try (Redis.liftRedis (Redis.exchangeOAuth2Code code clientId redirectURI verifier)) >>= \case
++        Left (_ :: OAuth2Error) -> respondError InvalidGrant
++        Right (sessionId, userId, AuthenticationRequest {scopes}) -> pure (userId, sessionId, scopes)
++    RefreshTokenGrant token ->
++      redeemRefreshToken token >>= \case
++        Nothing -> respondError InvalidGrant
++        Just (userId, scope) -> randomIO <&> \sessionId -> (userId, sessionId, scope)
++  access <- Tokens.accessToken userId sessionId scope
++  refresh <- issueRefreshToken userId scope
++  pure . addHeader "no-store" $
++    TokenResponse
++      { accessToken = ShareJWT.signedJWTToText access,
++        refreshToken = refresh,
++        expiresIn = accessTokenTTL,
++        scope
++      }
++
++userInfoEndpoint :: UserId -> WebApp UserInfo
++userInfoEndpoint userId = do
++  void brokerConfig
++  User {user_name, handle} <- PGO.expectUserById userId
++  pure UserInfo {sub = userId, name = user_name, handle = IDs.toText handle}
+--- a/src/Cloud/SelfHost/Provision.hs
++++ b/src/Cloud/SelfHost/Provision.hs
+@@ -5,6 +5,7 @@
+   )
+ where
+ 
++import Cloud.Errors (ErrorID (..), ToServerError (..))
+ import Cloud.Postgres qualified as PG
+ import Cloud.Postgres.Queries qualified as Q
+ import Cloud.Prelude
+@@ -14,9 +15,11 @@
+ import Control.Monad.Except (runExceptT, throwError)
+ import Control.Monad.Trans (lift)
+ import Crypto.Hash (Digest, MD5, hash)
++import Data.ByteString.Lazy (fromStrict)
+ import Data.Char qualified as Char
+ import Data.Text qualified as Text
+ import Data.Text.Encoding (encodeUtf8)
++import Servant (ServerError (..), err403, err409, err500)
+ import Share.OAuth.Types (UserId)
+ 
+ -- | An identity verified by the OIDC provider.
+@@ -34,6 +37,19 @@
+   | UnsupportedTier CloudTier
+   deriving stock (Show)
+ 
++instance ToServerError ProvisionError where
++  toServerError = \case
++    MissingClaim claim ->
++      (ErrorID "selfhost:missing-claim", err403 {errBody = "The identity provider didn't supply your " <> encode claim <> ", which a new account needs."})
++    InvalidHandle handle ->
++      (ErrorID "selfhost:invalid-handle", err403 {errBody = "Your username " <> encode handle <> " isn't a valid handle: it must start with a letter and contain only letters, digits and hyphens, at most 63 characters."})
++    HandleTaken handle ->
++      (ErrorID "selfhost:handle-taken", err409 {errBody = "The handle " <> encode handle <> " already belongs to another account."})
++    UnsupportedTier tier ->
++      (ErrorID "selfhost:unsupported-tier", err500 {errBody = "Unsupported default tier " <> encode (tshow tier) <> "."})
++    where
++      encode = fromStrict . encodeUtf8
++
+ -- | Finds or creates the user for an identity, and makes sure they're enrolled in the tier.
+ --
+ -- Every error is raised before the first write, so the caller's transaction can commit either way.
+--- a/src/Cloud/SelfHost/Tokens.hs
++++ b/src/Cloud/SelfHost/Tokens.hs
+@@ -0,0 +1,70 @@
++-- | Session cookies and access tokens for self-hosted logins, shared by the header-trust
++-- endpoints and the OIDC broker.
++module Cloud.SelfHost.Tokens
++  ( TokenError (..),
++    accessTokenTTL,
++    sessionCookie,
++    accessToken,
++    cloudUIReturnTarget,
++  )
++where
++
++import Cloud.Env (Env (..))
++import Cloud.Errors (ErrorID (..), ToServerError (..), respondError)
++import Cloud.Prelude
++import Cloud.User.App (authM)
++import Cloud.User.Env (AuthEnv (..))
++import Cloud.User.Impl (enlilAud, enlilIssuer)
++import Cloud.Utils.Logging qualified as Logging
++import Cloud.Web.App (WebApp, isCloudUILink)
++import Cloud.Web.Local.Impl (AccessTokenClaims (..), newStandardClaims, signJWT)
++import Control.Monad.Reader (ask, asks)
++import Crypto.JWT (SignedJWT)
++import Data.Set qualified as Set
++import Data.Time (NominalDiffTime, addUTCTime, nominalDay)
++import Network.URI (URI)
++import Servant (err500)
++import Share.JWT qualified as ShareJWT
++import Share.OAuth.Scopes (Scopes)
++import Share.OAuth.Session (Session (..))
++import Share.OAuth.Session qualified as Session
++import Share.OAuth.Types (SessionId, UserId)
++import Share.Utils.Servant.Cookies qualified as Cookies
++
++newtype TokenError = SigningFailed Text
++
++instance Logging.Loggable TokenError where
++  toLog (SigningFailed err) = Logging.withSeverity Logging.Error . Logging.textLog $ "selfhost login failed to sign a token: " <> err
++
++instance ToServerError TokenError where
++  toServerError SigningFailed {} = (ErrorID "selfhost:signing-failed", err500)
++
++-- | Shorter than the 300 days of the local-only tokens, since tokens can't be revoked.
++accessTokenTTL :: NominalDiffTime
++accessTokenTTL = 30 * nominalDay
++
++sessionCookie :: UserId -> WebApp Cookies.SetCookie
++sessionCookie userId = do
++  iss <- enlilIssuer
++  aud <- enlilAud
++  session <- Session.createSession iss (Set.singleton aud) userId
++  -- share-auth's sessions last a year; bound the cookie's JWT like the access tokens.
++  let session' = session {sessionExpiry = addUTCTime accessTokenTTL (sessionCreated session)}
++  cookie <- authM do
++    AuthEnv {envSessionCookieName, envCookieSettings, envJwtSettings} <- ask
++    ShareJWT.createSignedCookie envJwtSettings envCookieSettings envSessionCookieName session'
++  either (respondError . SigningFailed . tshow) pure cookie
++
++accessToken :: UserId -> SessionId -> Scopes -> WebApp SignedJWT
++accessToken userId sessionId scope = do
++  aud <- enlilAud
++  standardClaims <- newStandardClaims aud userId accessTokenTTL sessionId
++  signJWT AccessTokenClaims {standardClaims, scope}
++
++-- | Like the Share login callback, only return to the cloud UI, never an arbitrary site.
++cloudUIReturnTarget :: Maybe URI -> WebApp URI
++cloudUIReturnTarget returnTo = do
++  uiOrigin <- asks envCloudUiOrigin
++  case returnTo of
++    Just uri -> isCloudUILink uri <&> \valid -> if valid then uri else uiOrigin
++    Nothing -> pure uiOrigin
+--- a/src/Cloud/Web/API.hs
++++ b/src/Cloud/Web/API.hs
+@@ -38,6 +38,7 @@
+ import Stripe.Concepts (CouponId)
+ import Cloud.Web.Cluster.API (ClusterAPI)
+ import Cloud.SelfHost.HeaderAuth.API qualified as SelfHost
++import Cloud.SelfHost.Oidc.API qualified as Oidc
+ 
+ type API = ServiceProviderAPI :<|> CloudAPI
+ 
+@@ -74,6 +75,7 @@
+     :<|> ("enroll" :> EnrollFreeTierEndpoint)
+     :<|> (".well-known" :> "jwks.json" :> JWKSEndpoint)
+     :<|> ("selfhost" :> SelfHost.API)
++    :<|> Oidc.API
+ 
+ data CustomerInfo = CustomerInfo
+   { customerInfoName :: !Text,
+--- a/src/Cloud/Web/Impl.hs
++++ b/src/Cloud/Web/Impl.hs
+@@ -32,6 +32,7 @@
+ import Cloud.Postgres.Ops qualified as PGO
+ import Cloud.Postgres.Queries qualified as Q
+ import Cloud.SelfHost.HeaderAuth qualified as SelfHost
++import Cloud.SelfHost.Oidc qualified as Oidc
+ import Cloud.Prelude
+ import Cloud.Service.Impl (servicesV1Endpoint, servicesV2Endpoint)
+ import Cloud.Service.Types
+@@ -164,6 +165,7 @@
+     :<|> enrollFreeTierEndpoint envIdentityProvider envSpConfig
+     :<|> jwksEndpoint
+     :<|> SelfHost.server
++    :<|> Oidc.server
+   where
+     serviceProviderEndpoints = Auth.serviceProviderServer envIdentityProvider envSpConfig mySessionCallback
+ 
