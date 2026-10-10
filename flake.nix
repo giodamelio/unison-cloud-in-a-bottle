@@ -34,6 +34,11 @@
       else "demo-${system}";
     demoFor = pkgs: inputs.self.nixosConfigurations.${demoName pkgs.stdenv.hostPlatform.system};
     demoRun = pkgs: pkgs.callPackage ./nix/demo/run.nix {nixos = demoFor pkgs;};
+    demoLogin = pkgs:
+      pkgs.callPackage ./nix/demo/login.nix {
+        nixos = demoFor pkgs;
+        ucm = inputs.unison-nix.packages.${pkgs.stdenv.hostPlatform.system}.ucm-bin;
+      };
   in {
     nixosModules.default = import ./nixos inputs.self;
 
@@ -52,6 +57,12 @@
         type = "app";
         program = pkgs.lib.getExe (demoRun pkgs);
         meta.description = "Boot the self-hosted Unison Cloud demo VM and print its URLs and login";
+      };
+
+      demo-login = {
+        type = "app";
+        program = pkgs.lib.getExe (demoLogin pkgs);
+        meta.description = "Log ucm in to the running demo VM, for deploying with the cloud client";
       };
     });
 
@@ -141,6 +152,7 @@
           // {
             demo-vm = (demoFor pkgs).config.system.build.vm;
             demo-run = demoRun pkgs;
+            demo-login = demoLogin pkgs;
             demo-shell = inputs.self.devShells.${pkgs.stdenv.hostPlatform.system}.demo.inputDerivation;
           };
       };
@@ -160,7 +172,7 @@
         cfg = (demoFor pkgs).config.services.unison-cloud;
       in
         pkgs.mkShell {
-          packages = [unison.ucm-bin];
+          packages = [unison.ucm-bin (demoLogin pkgs)];
           UNISON_CLOUD_HOST = cfg.domains.api;
           UNISON_CLOUD_HTTP_PORT = toString cfg.ingress.port;
           UNISON_CLOUD_USE_TLS = "false";

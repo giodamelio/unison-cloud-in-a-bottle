@@ -134,15 +134,15 @@ in
         Admin:  admin@${cfg.domains.api} / $(cat "$state/xchg/dex-admin-password")
                 (inside the VM: ${cfg.stateDir}/secrets/dex-admin-password)
 
-      Deploy from ucm:
-        1. In another terminal, enter this flake's demo shell (nix develop <flake>#demo).
-           It provides ucm and points the cloud client at this VM.
-        2. Log in once, as demo@unison.localhost / demo in the browser window ucm opens:
-             UNISON_SHARE_HOST=${url.api} ucm
-             auth.login
-           Then quit that ucm. The login is stored for ${cfg.domains.api}:${toString cfg.ingress.port} only,
-           so your Share login is untouched.
-        3. Start ucm normally and run your Cloud.run program.
+      Deploy from ucm, in another terminal:
+        1. nix run <flake>#demo-login
+           Log in as demo@unison.localhost / demo at the URL it prints (it also tries to
+           open your browser). The login is stored for ${cfg.domains.api}:${toString cfg.ingress.port}
+           only, so your Share login is untouched.
+        2. nix develop <flake>#demo
+           This shell has ucm, and points the cloud client at this VM.
+        3. Start ucm and run your Cloud.run program. In the UI, each deployment's link
+           opens the service at ${url.apps}/services/...
 
       Console log: $console
       Press Ctrl-C to stop the VM $on_exit.

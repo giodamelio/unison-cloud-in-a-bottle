@@ -4,10 +4,25 @@
 }: {
   name = "unison-cloud-demo";
 
-  nodes.machine = {pkgs, ...}: {
+  nodes.machine = {
+    config,
+    pkgs,
+    ...
+  }: let
+    demoLogin = pkgs.callPackage ../nix/demo/login.nix {
+      nixos = {inherit config;};
+      ucm = self.inputs.unison-nix.packages.${pkgs.stdenv.hostPlatform.system}.ucm-bin;
+    };
+    # ucm opens the login page with xdg-open; this one logs in as the demo user instead.
+    fakeBrowser = pkgs.writeShellScriptBin "xdg-open" ''
+      ${pkgs.hurl}/bin/hurl --variable api=${config.services.unison-cloud.internal.publicUrl.api} \
+        --variable "url=$1" --variable user=demo@unison.localhost --secret password=demo \
+        ${./hurl/browser-login.hurl} > /tmp/fake-browser.log 2>&1
+    '';
+  in {
     imports = [(import ../nix/demo/configuration.nix self)];
 
-    environment.systemPackages = [deployProgram pkgs.hurl pkgs.jq];
+    environment.systemPackages = [deployProgram pkgs.hurl pkgs.jq demoLogin fakeBrowser];
 
     # Stands in for the listener ucm opens on a loopback port during `auth.login`.
     systemd.services.redirect-catcher = {
@@ -109,5 +124,20 @@
         assert body.startswith("Hello, world!"), body
         # Named, so the URL is stable, and owned by the account the demo login reaches.
         assert "/services/s/demo/hello" in url, url
+
+    with subtest("the UI links deployed services to this cluster's apps URL"):
+        machine.succeed("grep -rq '${url.apps}/services' ${cfg.ui.package}")
+        machine.fail("grep -rq unison-services.cloud ${cfg.ui.package}")
+
+    with subtest("unison-cloud-demo-login logs ucm in, and the cloud client deploys with those credentials"):
+        machine.succeed("unison-cloud-demo-login")
+        stored = json.loads(machine.succeed("cat /root/.local/share/unisonlanguage/credentials.json"))
+        assert "${domains.api}:${toString cfg.ingress.port}" in json.dumps(stored), stored
+        env = (
+            "UNISON_CLOUD_HOST=${domains.api} UNISON_CLOUD_HTTP_PORT=${toString cfg.ingress.port}"
+            " UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_CREDENTIALS_HOST=${domains.api}:${toString cfg.ingress.port}"
+        )
+        output = machine.succeed(f"env {env} deploy-program hello")
+        assert any(l.startswith("hello ") for l in output.splitlines()), output
   '';
 }
