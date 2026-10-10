@@ -52,7 +52,7 @@
             "extendedKeyUsage=serverAuth" \
             "subjectKeyIdentifier=hash" \
             "authorityKeyIdentifier=keyid" \
-            "subjectAltName=IP:127.0.0.1,DNS:localhost")
+            "subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:${cfg.internal.extenddbHost}")
         rm extenddb.csr
         mv extenddb.crt.tmp extenddb.crt
       fi

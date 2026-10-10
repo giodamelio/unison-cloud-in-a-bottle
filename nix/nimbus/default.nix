@@ -23,20 +23,31 @@
   # To move to a newer nimbus, take main's current causalHash from
   # https://api.unison-lang.org/users/unison/projects/nimbus/branches
   causalHash = "bjd01vj11ng56p2p1n2vf1ml127hg3aha3um5motl43avn2hibvobmcke61ajvu88npvm6mrfi536il3jtt50ltlhncao8akjd6eumo";
+
+  # Patches are scratch files in ../../patches/nimbus, copied into the transcript's working
+  # directory through `src`. `update` typechecks each one against the pinned causal, so a
+  # causal bump that conflicts with a patch fails here as a type error.
+  patchesDir = ../../patches/nimbus;
+  prepare = ''
+    scratch/main> pull @unison/nimbus/main
+    scratch/main> reset #${causalHash}
+    scratch/main> load 0001-dynamo-https.u
+    scratch/main> update
+  '';
 in
-  buildFromTranscript {
+  (buildFromTranscript {
     pname = "nimbus";
     version = "0-unstable-2026-10-08";
 
+    src = patchesDir;
     transcript = builtins.toFile "nimbus-compile.md" ''
       ```ucm
-      scratch/main> pull @unison/nimbus/main
-      scratch/main> reset #${causalHash}
+      ${prepare}
       scratch/main> compile main.nodeMain nimbus
       ```
     '';
 
-    compiledHash = "sha256-udpirAX/Vbmlea9Ynk95gtXY6VndRHhcogUN3KAYDmA=";
+    compiledHash = "sha256-dgythH+WCwK5kdOAPTJhkyOCUB8k75LVLvEECbsuVQg=";
 
     meta = {
       description = "Unison Cloud worker node";
@@ -44,4 +55,7 @@ in
       license = lib.licenses.mit;
       mainProgram = "nimbus";
     };
+  }).overrideAttrs {
+    # For compiling other programs against the same patched nimbus, such as test probes.
+    passthru = {inherit patchesDir prepare;};
   }

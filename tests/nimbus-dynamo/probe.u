@@ -1,0 +1,15 @@
+-- Decodes a nimbus `dynamo` config from $DYNAMO_CONFIG with nimbus's own decoder, then
+-- describes the configured table through nimbus's own request signing and HTTP client.
+dynamoProbe : '{IO, Exception} ()
+dynamoProbe = do
+  config =
+    unison_json_1_3_5.Decoder.run
+      ServerState.config.read.dynamoConfig (getEnv "DYNAMO_CONFIG")
+  request =
+    unison_json_1_3_5.core.Json.object
+      [("TableName", unison_json_1_3_5.core.Json.text (stateful.Dynamo.table config))]
+  tableStatus = do object.at! "Table" do object.at! "TableStatus" Decoder.text
+  status =
+    Threads.run do
+      client.Http.run do stateful.Dynamo.call config "DescribeTable" request tableStatus
+  printLine status

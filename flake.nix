@@ -27,6 +27,14 @@
 
     checks = forAllSystems (pkgs: {
       extenddb = pkgs.testers.runNixOSTest (import ./tests/extenddb.nix inputs.self);
+
+      nimbus-dynamo = pkgs.testers.runNixOSTest (import ./tests/nimbus-dynamo {
+        inherit (inputs) self;
+        dynamoProbe = pkgs.callPackage ./tests/nimbus-dynamo/probe.nix {
+          inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+          inherit (inputs.self.packages.${pkgs.stdenv.hostPlatform.system}) nimbus;
+        };
+      });
     });
 
     packages = forAllSystems (pkgs: {

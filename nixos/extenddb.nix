@@ -90,15 +90,29 @@
     '';
   };
 in {
-  options.services.unison-cloud.internal.dynamoCall = lib.mkOption {
-    type = lib.types.package;
-    internal = true;
-    readOnly = true;
-    default = dynamoCall;
-    description = "Client that signs DynamoDB requests with an empty region, as nimbus does.";
+  options.services.unison-cloud.internal = {
+    dynamoCall = lib.mkOption {
+      type = lib.types.package;
+      internal = true;
+      readOnly = true;
+      default = dynamoCall;
+      description = "Client that signs DynamoDB requests with an empty region, as nimbus does.";
+    };
+
+    # The Unison runtime's TLS client only checks DNS names, never IP SANs, so nimbus
+    # needs a name for ExtendDB's certificate to match.
+    extenddbHost = lib.mkOption {
+      type = lib.types.str;
+      internal = true;
+      readOnly = true;
+      default = "extenddb.unison-cloud.internal";
+      description = "Hostname ExtendDB's certificate is issued for, resolving to the namespace loopback.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    networking.hosts."127.0.0.1" = [cfg.internal.extenddbHost];
+
     users.users.${user} = {
       isSystemUser = true;
       group = user;

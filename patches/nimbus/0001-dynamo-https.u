@@ -1,0 +1,88 @@
+-- Adds a `local-https` DynamoDB config so nimbus can reach ExtendDB, which only serves
+-- TLS. Like `local` it signs with an empty region; unlike `local` it reads the table
+-- name from the config instead of hardcoding "test".
+
+type stateful.Dynamo.Config
+  = Cloud Region Credentials Text
+  | Local Credentials HostName Port Text
+  | LocalHttps Credentials HostName Port Text
+
+stateful.Dynamo.table : Dynamo.Config -> Text
+stateful.Dynamo.table = cases
+  Cloud _ _ name               -> name
+  Config.Local _ _ _ name      -> name
+  Config.LocalHttps _ _ _ name -> name
+
+ServerState.config.read.dynamoConfig : '{Decoder} Dynamo.Config
+ServerState.config.read.dynamoConfig =
+  do
+    match object.at! "type" Decoder.text with
+      "local" ->
+        Config.Local
+          (object.at! "credentials" aws.credentials)
+          (object.at! "host" json.hostName)
+          (object.at! "port" json.port)
+          "test"
+      "local-https" ->
+        Config.LocalHttps
+          (object.at! "credentials" aws.credentials)
+          (object.at! "host" json.hostName)
+          (object.at! "port" json.port)
+          (object.at! "table" Decoder.text)
+      "cloud" ->
+        Cloud
+          (object.at! "region" aws.region)
+          (object.at! "credentials" aws.credentials)
+          (object.at! "table" Decoder.text)
+      other ->
+        Decoder.fail ("Unknown DynamoDB config type: " Text.++ other)
+
+stateful.Dynamo.call :
+  Dynamo.Config
+  -> Text
+  -> Json
+  -> '{g, Exception, Decoder} a
+  ->{g, IO, Exception, Http} a
+stateful.Dynamo.call config opName op decoder =
+  use HttpRequest setHeader
+  use Text ++
+  service = unison_aws_5_2_0.Service.Service "dynamodb"
+  (region, creds, scheme, host, port) =
+    match config with
+      Config.Local credentials host port _ ->
+        (Region "", credentials, Scheme.http, HostName.toText host, Some port)
+      Config.LocalHttps credentials host port _ ->
+        (Region "", credentials, Scheme.https, HostName.toText host, Some port)
+      Cloud region credentials _ ->
+        ( region
+        , credentials
+        , Scheme.https
+        , "dynamodb." ++ Region.name region ++ ".amazonaws.com"
+        , None
+        )
+  uri =
+    URI
+      scheme
+      (Some (Authority None (HostName host) port))
+      Path.root
+      RawQuery.empty
+      Fragment.empty
+  instant = realtime()
+  date = Instant.toBasicISO8601 (truncateToSeconds instant)
+  payload = op |> unison_json_1_3_5.core.Json.toText |> Text.toUtf8
+  size = Nat.toText (Bytes.size payload)
+  req =
+    HttpRequest.post uri (Body payload)
+      |> setHeader "Accept-Encoding" ["identity"]
+      |> setHeader "User-Agent" ["Unison"]
+      |> setHeader "Content-Length" [size]
+      |> setHeader "X-AMZ-Date" [date]
+      |> setHeader "X-AMZ-Target" ["DynamoDB_20120810." ++ opName]
+      |> setHeader "Content-Type" ["application/x-amz-json-1.0"]
+      |> addSecurityTokenHeader creds
+      |> addAuthorizationHeader creds instant region service
+  Http.request req
+    |> HttpResponse.body
+    |> Body.toBytes
+    |> fromUtf8
+    |> unison_json_1_3_5.Decoder.run decoder
