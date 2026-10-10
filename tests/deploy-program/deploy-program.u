@@ -1,0 +1,101 @@
+-- Deploys to a Unison Cloud through @unison/cloud's client, configured from the
+-- UNISON_CLOUD_* environment variables (Cloud.ClientConfig.default). Each subcommand
+-- prints one line starting with its own name, which is what the VM tests match on: the
+-- client prints its own banners to stdout as well.
+deployProgram.main : '{IO, Exception} ()
+deployProgram.main = do
+  match getArgs() with
+    ["hello"]      -> Cloud.run deployProgram.hello
+    ["storage"]    -> Cloud.run deployProgram.storage
+    ["env-set"]    -> Cloud.run deployProgram.envSet
+    ["env-delete"] -> Cloud.run deployProgram.envDelete
+    ["daemon"]     -> Cloud.run deployProgram.daemon
+    args ->
+      Exception.raise
+        (failure
+          "usage: deploy-program hello|storage|env-set|env-delete|daemon" args)
+
+deployProgram.envName : Text
+deployProgram.envName = "deploy-program"
+
+deployProgram.envKey : Text
+deployProgram.envKey = "DEPLOY_PROGRAM_GREETING"
+
+deployProgram.daemonName : Text
+deployProgram.daemonName = "deploy-program"
+
+deployProgram.databaseName : Text
+deployProgram.databaseName = "deploy-program"
+
+deployProgram.storedValue : Text
+deployProgram.storedValue = "stored by deploy-program"
+
+deployProgram.helloService : HttpRequest ->{Log} HttpResponse
+deployProgram.helloService _ =
+  Log.info "deploy-program hello served" []
+  HttpResponse.ok (Body (Text.toUtf8 "hello from deploy-program"))
+
+deployProgram.envService : HttpRequest ->{Config, Exception} HttpResponse
+deployProgram.envService _ =
+  HttpResponse.ok (Body (Text.toUtf8 (Environment.Config.expect deployProgram.envKey)))
+
+deployProgram.daemonLoop : '{Log, Remote} ()
+deployProgram.daemonLoop = do
+  Log.info "deploy-program daemon tick" []
+  Remote.sleep (Duration.seconds 10)
+  deployProgram.daemonLoop()
+
+deployProgram.hello : '{IO, Exception, Cloud} ()
+deployProgram.hello = do
+  hash = deployHttp Environment.default() deployProgram.helloService
+  uri = exposeHttp hash
+  printLine ("hello hash=" ++ ServiceHash.toText hash ++ " url=" ++ deployProgram.uriText uri)
+
+-- The write and the read are separate transactions so the read has to come back from
+-- the storage backend rather than from the transaction's own write buffer.
+deployProgram.storage : '{IO, Exception, Cloud} ()
+deployProgram.storage = do
+  env = Environment.default()
+  db = Database.named deployProgram.databaseName
+  Database.assign db env
+  table : Table Text Text
+  table = Table "deploy-program"
+  value =
+    Cloud.submit env do
+      transact db do Transaction.write.tx table "key" deployProgram.storedValue
+      transact db do Transaction.read table "key"
+  if value === deployProgram.storedValue then
+    printLine ("storage ok database=" ++ Database.toText db ++ " value=" ++ value)
+  else
+    Exception.raise (failure "storage read back a different value" value)
+
+deployProgram.envSet : '{IO, Exception, Cloud} ()
+deployProgram.envSet = do
+  env = Environment.named deployProgram.envName
+  Environment.setValue env deployProgram.envKey "hello from the environment"
+  hash = deployHttp env deployProgram.envService
+  uri = exposeHttp hash
+  printLine
+    ("env-set env=" ++ Environment.Id.toText (Environment.id env)
+      ++ " hash=" ++ ServiceHash.toText hash
+      ++ " url=" ++ deployProgram.uriText uri)
+
+-- Environment.named creates the environment or returns the existing one, which is how
+-- this finds the environment env-set made.
+deployProgram.envDelete : '{IO, Exception, Cloud} ()
+deployProgram.envDelete = do
+  env = Environment.named deployProgram.envName
+  Environment.delete env
+  printLine ("env-delete env=" ++ Environment.Id.toText (Environment.id env))
+
+deployProgram.daemon : '{IO, Exception, Cloud} ()
+deployProgram.daemon = do
+  daemon = Daemon.named deployProgram.daemonName
+  hash = Daemon.deploy daemon Environment.default() deployProgram.daemonLoop
+  printLine
+    ("daemon name=" ++ deployProgram.daemonName ++ " hash=" ++ DaemonHash.toText hash)
+
+-- @unison/cloud pulls in two releases of base; URI here is the one the cloud client
+-- returns.
+deployProgram.uriText : URI -> Text
+deployProgram.uriText = unison_base_7_12_1.IO.net.URI.toText
