@@ -683,6 +683,7 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
+        "unison-cloud-ui": "unison-cloud-ui",
         "unison-nix": "unison-nix"
       }
     },
@@ -750,6 +751,22 @@
         "owner": "unisonweb",
         "ref": "release/1.1.0",
         "repo": "unison",
+        "type": "github"
+      }
+    },
+    "unison-cloud-ui": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791506650,
+        "narHash": "sha256-HS/Luhhorv2qM+of2MqdTvvguLvlbGWbQ8Kr93VzAF0=",
+        "owner": "unisonweb",
+        "repo": "unison-cloud-ui",
+        "rev": "e82605809a7d404365fa5d9e81fe492ef48f2ea2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "unisonweb",
+        "repo": "unison-cloud-ui",
         "type": "github"
       }
     },
