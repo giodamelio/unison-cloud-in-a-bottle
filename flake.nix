@@ -43,7 +43,12 @@
 
       auth = pkgs.testers.runNixOSTest (import ./tests/auth.nix inputs.self);
 
-      variants = pkgs.testers.runNixOSTest (import ./tests/variants.nix inputs.self);
+      variants = pkgs.testers.runNixOSTest (import ./tests/variants.nix {
+        inherit (inputs) self;
+        deployProgram = pkgs.callPackage ./tests/deploy-program {
+          inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+        };
+      });
 
       namespace = pkgs.testers.runNixOSTest (import ./tests/namespace.nix inputs.self);
 

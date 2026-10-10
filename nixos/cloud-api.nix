@@ -9,6 +9,7 @@
   secrets = "${cfg.stateDir}/secrets";
   psql = "${cfg.database.package}/bin/psql";
   pg = cfg.internal.postgres;
+  s3 = cfg.internal.s3;
   ext = cfg.database.external.cloudApi;
   database =
     if pg.external
@@ -124,9 +125,22 @@
       CLOUD_POSTGRES="$CLOUD_POSTGRES password='$password'"
     ''}
     export CLOUD_POSTGRES
+    ${lib.optionalString (cfg.sentry.dsnFile != null) ''
+      CLOUD_SENTRY_DSN=$(< "$creds/sentry-dsn")
+      export CLOUD_SENTRY_DSN
+    ''}
     exec ${lib.getExe' cfg.cloudApi.package "cloud-exe"}
   '';
 in {
+  options.services.unison-cloud.sentry.dsnFile = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    description = ''
+      File holding a Sentry DSN for cloud-api's error reports. Sentry is on the internet,
+      so setting this lets cloud-api send traffic out of the namespace.
+    '';
+  };
+
   options.services.unison-cloud.internal = {
     cloudApiPort = lib.mkOption {
       type = lib.types.port;
@@ -153,6 +167,7 @@ in {
     users.groups.${user} = {};
 
     services.unison-cloud.internal = {
+      egressUsers = lib.mkIf (!cfg.s3.bundled || cfg.sentry.dsnFile != null) [user];
       ingressSockets.cloud-api = cfg.internal.cloudApiPort;
       postgresRoles.${user} = {};
       # Untrusted extensions a database owner can't create; the migrations skip them once they exist.
@@ -207,18 +222,20 @@ in {
       {
         description = "Unison Cloud API";
         wantedBy = ["multi-user.target"];
-        requires = [
-          "unison-cloud-seed.service"
-          "redis-unison-cloud.service"
-          "unison-cloud-consul.service"
-          "unison-cloud-s3.service"
-        ];
-        after = [
-          "unison-cloud-seed.service"
-          "redis-unison-cloud.service"
-          "unison-cloud-consul.service"
-          "unison-cloud-s3.service"
-        ];
+        requires =
+          [
+            "unison-cloud-seed.service"
+            "redis-unison-cloud.service"
+            "unison-cloud-consul.service"
+          ]
+          ++ lib.optional (s3.unit != null) s3.unit;
+        after =
+          [
+            "unison-cloud-seed.service"
+            "redis-unison-cloud.service"
+            "unison-cloud-consul.service"
+          ]
+          ++ lib.optional (s3.unit != null) s3.unit;
         environment = pgEnvironment // {
           CLOUD_DEPLOYMENT = "production";
           CLOUD_COMMIT = cfg.cloudApi.package.version;
@@ -242,8 +259,15 @@ in {
           CLOUD_SECRETS_HOST = "127.0.0.1";
           CLOUD_SECRETS_PORT = toString cfg.internal.secretsPort;
 
-          AWS_REGION = "us-east-1";
-          CLOUD_S3_ENDPOINT = "http://127.0.0.1:${toString cfg.internal.s3Port}";
+          AWS_REGION = s3.region;
+          CLOUD_S3_ENDPOINT =
+            if cfg.s3.bundled
+            then "http://127.0.0.1:${toString cfg.internal.s3Port}"
+            else "${
+              if s3.https
+              then "https"
+              else "http"
+            }://${s3.host}:${toString s3.port}";
           CLOUD_S3_ADDRESSING = "path";
           CLOUD_CLOUD_SERVICE_BUCKET = "unison-cloud-services";
 
@@ -270,7 +294,8 @@ in {
             "cloud-hmac-key"
             "internal-auth-token"
           ]
-          ++ pgCredentials;
+          ++ pgCredentials
+          ++ lib.optional (cfg.sentry.dsnFile != null) "sentry-dsn:${cfg.sentry.dsnFile}";
           ExecStart = start;
           Restart = "on-failure";
         };

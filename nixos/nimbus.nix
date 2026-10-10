@@ -52,11 +52,9 @@
   groups);
 
   awsConfig = {
-    hostName = cfg.internal.s3Domain;
-    port = cfg.internal.s3Port;
-    region = "us-east-1";
+    hostName = cfg.internal.s3.host;
+    inherit (cfg.internal.s3) port region https;
     service = "s3";
-    https = false;
   };
 
   nodeConfig = node:
@@ -134,20 +132,22 @@
       {
         description = "Unison Cloud nimbus node ${node.name}";
         wantedBy = ["multi-user.target"];
-        requires = [
-          "unison-cloud-nimbus-ca.service"
-          "unison-cloud-extenddb-setup.service"
-          "unison-cloud-s3.service"
-          "unison-cloud-outbound-proxy.service"
-          "unison-cloud-api.service"
-        ];
-        after = [
-          "unison-cloud-nimbus-ca.service"
-          "unison-cloud-extenddb-setup.service"
-          "unison-cloud-s3.service"
-          "unison-cloud-outbound-proxy.service"
-          "unison-cloud-api.service"
-        ];
+        requires =
+          [
+            "unison-cloud-nimbus-ca.service"
+            "unison-cloud-extenddb-setup.service"
+            "unison-cloud-outbound-proxy.service"
+            "unison-cloud-api.service"
+          ]
+          ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
+        after =
+          [
+            "unison-cloud-nimbus-ca.service"
+            "unison-cloud-extenddb-setup.service"
+            "unison-cloud-outbound-proxy.service"
+            "unison-cloud-api.service"
+          ]
+          ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
         environment = {
           HOME = "%t/unison-cloud-nimbus-${node.name}";
           NIMBUS_CONFIG_FILE = "%t/unison-cloud-nimbus-${node.name}/config.json";
@@ -237,14 +237,17 @@ in {
     # Hosted code runs as this user too, so it gets only what nimbus itself connects to.
     # nimbus never reads Consul or Loki: cloud-api registers the nodes, and no
     # `logs.provider` is configured.
+    # nimbus talks to an external S3 directly, and it has no fixed address to allowlist.
+    services.unison-cloud.internal.egressUsers = lib.mkIf (!cfg.s3.bundled) [user];
+
     services.unison-cloud.internal.loopbackRestrictedUsers.${user} =
       [
         cfg.internal.outboundProxyPort
         cfg.internal.cloudApiPort
         cfg.internal.secretsPort
-        cfg.internal.s3Port
         cfg.extenddb.port
       ]
+      ++ lib.optional cfg.s3.bundled cfg.internal.s3Port
       ++ lib.concatMap (node: lib.attrValues node.ports) nodes;
 
     # cloud-api registers the nodes itself (`byoc-nimbus-http`) when they join; this is
