@@ -23,6 +23,12 @@
     systems = ["x86_64-linux" "aarch64-linux"];
     forAllSystems = f: inputs.nixpkgs.lib.genAttrs systems (system: f inputs.nixpkgs.legacyPackages.${system});
   in {
+    nixosModules.default = import ./nixos inputs.self;
+
+    checks = forAllSystems (pkgs: {
+      extenddb = pkgs.testers.runNixOSTest (import ./tests/extenddb.nix inputs.self);
+    });
+
     packages = forAllSystems (pkgs: {
       unison-cloud-ui = pkgs.callPackage ./nix/unison-cloud-ui {
         src = inputs.unison-cloud-ui;
