@@ -100,6 +100,17 @@
         scheme = "http";
       };
       cloudApiInstances = [{uri = "http://127.0.0.1:${toString cfg.internal.cloudApiPort}";}];
+      # The client's `Cloud.logs` gets a token from cloud-api and then asks nimbus, which
+      # queries Loki itself; the labels are the ones the log shipper sets.
+      logs.provider = {
+        type = "loki";
+        uri = "http://127.0.0.1:${toString cfg.internal.lokiPort}";
+        labels = {
+          job = "nomad_allocs";
+          namespace = "user";
+          task_name = "nimbus";
+        };
+      };
       blockedUsers = map (lib.replaceStrings ["-"] [""]) cfg.nimbus.blockedUsers;
     });
 
@@ -235,8 +246,7 @@ in {
     users.groups.${user} = {};
 
     # Hosted code runs as this user too, so it gets only what nimbus itself connects to.
-    # nimbus never reads Consul or Loki: cloud-api registers the nodes, and no
-    # `logs.provider` is configured.
+    # nimbus never reads Consul: cloud-api registers the nodes.
     # nimbus talks to an external S3 directly, and it has no fixed address to allowlist.
     services.unison-cloud.internal.egressUsers = lib.mkIf (!cfg.s3.bundled) [user];
 
@@ -245,6 +255,7 @@ in {
         cfg.internal.outboundProxyPort
         cfg.internal.cloudApiPort
         cfg.internal.secretsPort
+        cfg.internal.lokiPort
         cfg.extenddb.port
       ]
       ++ lib.optional cfg.s3.bundled cfg.internal.s3Port
