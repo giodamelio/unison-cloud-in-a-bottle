@@ -1,0 +1,29 @@
+diff --git a/src/UnisonCloud/Link.elm b/src/UnisonCloud/Link.elm
+--- a/src/UnisonCloud/Link.elm
++++ b/src/UnisonCloud/Link.elm
+@@ -93,11 +93,6 @@
+     Click.externalHref "https://www.unison-lang.org/community/code-of-conduct/"
+ 
+ 
+-status : Click msg
+-status =
+-    Click.externalHref "https://unison.statuspage.io"
+-
+-
+ discord : Click msg
+ discord =
+     Click.externalHref "https://unison-lang.com/discord"
+diff --git a/src/UnisonCloud/PageFooter.elm b/src/UnisonCloud/PageFooter.elm
+--- a/src/UnisonCloud/PageFooter.elm
++++ b/src/UnisonCloud/PageFooter.elm
+@@ -1,9 +1,8 @@
+ module UnisonCloud.PageFooter exposing (..)
+ 
+ import UI.PageLayout exposing (PageFooter(..))
+-import UnisonCloud.Link as Link
+ 
+ 
+ pageFooter : PageFooter msg
+ pageFooter =
+-    PageFooter [ Link.view "Status" Link.status ]
++    PageFooter []

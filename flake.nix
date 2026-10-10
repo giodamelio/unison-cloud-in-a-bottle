@@ -41,6 +41,9 @@
       unison-cloud-ui = pkgs.callPackage ./nix/unison-cloud-ui {
         src = inputs.unison-cloud-ui;
         version = "0-unstable-${inputs.unison-cloud-ui.lastModifiedDate}";
+        # Placeholders so the package builds standalone; the NixOS module overrides both.
+        apiUrl = "https://cloud.example.com/v2";
+        websiteUrl = "https://ui.example.com";
       };
 
       cloud-api = pkgs.callPackage ./nix/cloud-api {

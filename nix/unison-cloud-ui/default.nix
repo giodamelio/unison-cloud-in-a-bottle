@@ -5,6 +5,8 @@
   elmPackages,
   src,
   version,
+  apiUrl,
+  websiteUrl,
 }: let
   elmJson = lib.importJSON (src + "/elm.json");
   elmGitJson = lib.importJSON (src + "/elm-git.json");
@@ -20,12 +22,23 @@ in
     pname = "unison-cloud-ui";
     inherit version src;
 
+    patches = [
+      ../../patches/cloud-ui/0001-remove-intercom.patch
+      ../../patches/cloud-ui/0002-remove-billing.patch
+      ../../patches/cloud-ui/0003-remove-status-link.patch
+    ];
+
     npmDeps = importNpmLock {npmRoot = src;};
     npmConfigHook = importNpmLock.npmConfigHook;
 
     nativeBuildInputs = [elmPackages.elm];
 
-    env.npm_config_ignore_scripts = "true";
+    env = {
+      npm_config_ignore_scripts = "true";
+      # webpack.prod.js falls back to the hosted unison.cloud endpoints when these are unset.
+      API_URL = apiUrl;
+      WEBSITE_URL = websiteUrl;
+    };
 
     preConfigure = ''
       mkdir -p elm-stuff/gitdeps/github.com/unisonweb

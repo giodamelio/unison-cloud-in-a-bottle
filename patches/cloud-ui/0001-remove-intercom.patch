@@ -1,0 +1,98 @@
+diff --git a/src/UnisonCloud/App.elm b/src/UnisonCloud/App.elm
+--- a/src/UnisonCloud/App.elm
++++ b/src/UnisonCloud/App.elm
+@@ -18,7 +18,6 @@
+ import UnisonCloud.Route as Route exposing (Route)
+ import UnisonCloud.Service.ServiceName exposing (ServiceName)
+ import UnisonCloud.ServiceHash exposing (ServiceHash)
+-import UnisonCloud.SupportChatWidget as SupportChatWidget
+ import Url exposing (Url)
+ 
+ 
+@@ -294,4 +293,4 @@
+     AppDocument.view
+         appHeaderContext
+         appDocument
+-        [ SupportChatWidget.view model.appContext.session ]
++        []
+diff --git a/src/UnisonCloud/SupportChatWidget.elm b/src/UnisonCloud/SupportChatWidget.elm
+deleted file mode 100644
+--- a/src/UnisonCloud/SupportChatWidget.elm
++++ /dev/null
+@@ -1,20 +0,0 @@
+-module UnisonCloud.SupportChatWidget exposing (..)
+-
+-import Html exposing (Html, node)
+-import Html.Attributes exposing (attribute)
+-import Lib.UserHandle as UserHandle
+-import Maybe.Extra as MaybeE
+-import UnisonCloud.Account exposing (Account)
+-import Url
+-
+-
+-view : Account a -> Html msg
+-view account =
+-    node "support-chat-widget"
+-        (MaybeE.values
+-            [ Maybe.map (attribute "name") account.name
+-            , Just (attribute "handle" (UserHandle.toUnprefixedString account.handle))
+-            , Maybe.map (Url.toString >> attribute "avatar-url") account.avatarUrl
+-            ]
+-        )
+-        []
+diff --git a/src/UnisonCloud/SupportChatWidget.js b/src/UnisonCloud/SupportChatWidget.js
+deleted file mode 100644
+--- a/src/UnisonCloud/SupportChatWidget.js
++++ /dev/null
+@@ -1,40 +0,0 @@
+-class SupportChatWidget extends HTMLElement {
+-  constructor() {
+-    super();
+-  }
+-
+-  connectedCallback() {
+-    const name = this.getAttribute("name");
+-    const handle = this.getAttribute("handle");
+-    const avatarUrl = this.getAttribute("avatar-url");
+-
+-    let avatar;
+-    if (avatarUrl) {
+-      avatar = {
+-        type: "avatar",
+-        image_url: avatarUrl,
+-      };
+-    }
+-
+-    this.loadIntercom(() => {
+-      window.Intercom("boot", {
+-        api_base: "https://api-iam.intercom.io",
+-        app_id: "c4a188cp",
+-        name: name,
+-        user_id: handle,
+-        avatar: avatar,
+-      });
+-    });
+-  }
+-
+-  loadIntercom(onLoad) {
+-    let s = document.createElement("script");
+-    s.type = "text/javascript";
+-    s.async = true;
+-    s.src = "https://widget.intercom.io/widget/c4a188cp";
+-    s.addEventListener("load", onLoad);
+-    document.body.appendChild(s);
+-  }
+-}
+-
+-customElements.define("support-chat-widget", SupportChatWidget);
+diff --git a/src/unisonCloud.js b/src/unisonCloud.js
+--- a/src/unisonCloud.js
++++ b/src/unisonCloud.js
+@@ -4,7 +4,6 @@
+ import "ui-core/UI/CopyOnClick"; // Web component
+ import "ui-core/UI/CopyrightYear"; // Web component
+ import "ui-core/Lib/OnClickOutside"; // Web component
+-import "./UnisonCloud/SupportChatWidget"; // web component
+ import detectOs from "ui-core/Lib/detectOs";
+ import preventDefaultGlobalKeyboardEvents from "ui-core/Lib/preventDefaultGlobalKeyboardEvents";
+ 

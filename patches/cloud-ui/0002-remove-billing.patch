@@ -1,0 +1,279 @@
+diff --git a/src/css/unison-cloud/page/manage-subscription-page.css b/src/css/unison-cloud/page/manage-subscription-page.css
+deleted file mode 100644
+--- a/src/css/unison-cloud/page/manage-subscription-page.css
++++ /dev/null
+@@ -1,5 +0,0 @@
+-.manage-subscription-page .active-plan {
+-  display: flex;
+-  flex-direction: row;
+-  gap: 0.5rem;
+-}
+diff --git a/src/css/unison-cloud/page.css b/src/css/unison-cloud/page.css
+--- a/src/css/unison-cloud/page.css
++++ b/src/css/unison-cloud/page.css
+@@ -2,4 +2,3 @@
+ @import "./page/services-page.css";
+ @import "./page/service-page.css";
+ @import "./page/service-deploy-page.css";
+-@import "./page/manage-subscription-page.css";
+diff --git a/src/UnisonCloud/App.elm b/src/UnisonCloud/App.elm
+--- a/src/UnisonCloud/App.elm
++++ b/src/UnisonCloud/App.elm
+@@ -9,7 +9,6 @@
+ import UnisonCloud.AppError exposing (AppError)
+ import UnisonCloud.AppHeader as AppHeader
+ import UnisonCloud.Page.ErrorPage as ErrorPage
+-import UnisonCloud.Page.ManageSubscriptionPage as ManageSubscriptionPage
+ import UnisonCloud.Page.NotFoundPage as NotFoundPage
+ import UnisonCloud.Page.OverviewPage as OverviewPage
+ import UnisonCloud.Page.ServiceDeployPage as ServiceDeployPage
+@@ -27,7 +26,6 @@
+ 
+ type Page
+     = Overview
+-    | ManageSubscription
+     | Services ServicesPage.Model
+     | Service ServiceName ServicePage.Model
+     | ServiceDeploy ServiceHash ServiceDeployPage.Model
+@@ -55,9 +53,6 @@
+                 Route.Overview ->
+                     ( Overview, Cmd.none )
+ 
+-                Route.ManageSubscription ->
+-                    ( ManageSubscription, Cmd.none )
+-
+                 Route.Services ->
+                     let
+                         ( services, servicesCmd ) =
+@@ -154,9 +149,6 @@
+                         Route.Overview ->
+                             ( { model | page = Overview }, Cmd.none )
+ 
+-                        Route.ManageSubscription ->
+-                            ( { model | page = ManageSubscription }, Cmd.none )
+-
+                         Route.Services ->
+                             let
+                                 ( services, servicesCmd ) =
+@@ -266,9 +258,6 @@
+                 Overview ->
+                     OverviewPage.view
+ 
+-                ManageSubscription ->
+-                    ManageSubscriptionPage.view appContext
+-
+                 Services services ->
+                     AppDocument.map
+                         ServicesPageMsg
+diff --git a/src/UnisonCloud/AppHeader.elm b/src/UnisonCloud/AppHeader.elm
+--- a/src/UnisonCloud/AppHeader.elm
++++ b/src/UnisonCloud/AppHeader.elm
+@@ -106,9 +106,8 @@
+ 
+         accountMenu =
+             ActionMenu.items
+-                (ActionMenu.optionItem Icon.creditCard "Manage Subscription" Link.manageSubscription)
+-                [ ActionMenu.optionItem Icon.exitDoor "Sign Out" (Link.logout ctx.api ctx.currentUrl)
+-                ]
++                (ActionMenu.optionItem Icon.exitDoor "Sign Out" (Link.logout ctx.api ctx.currentUrl))
++                []
+                 |> ActionMenu.fromCustom ctx.toggleAccountMenuMsg viewAccountMenuTrigger
+                 |> ActionMenu.shouldBeOpen (isAccountMenuOpen ctx.openedAppHeaderMenu)
+                 |> ActionMenu.view
+diff --git a/src/UnisonCloud/Link.elm b/src/UnisonCloud/Link.elm
+--- a/src/UnisonCloud/Link.elm
++++ b/src/UnisonCloud/Link.elm
+@@ -13,7 +13,6 @@
+ import Html exposing (Html, text)
+ import Lib.HttpApi as HttpApi exposing (HttpApi)
+ import UI.Click as Click exposing (Click)
+-import UnisonCloud.Account exposing (Account)
+ import UnisonCloud.Route as Route exposing (Route)
+ import UnisonCloud.Service.ServiceName exposing (ServiceName)
+ import UnisonCloud.ServiceHash exposing (ServiceHash)
+@@ -34,16 +33,6 @@
+     Click.externalHref "https://unison.cloud"
+ 
+ 
+-cloudPricing : Click msg
+-cloudPricing =
+-    Click.externalHref "https://unison.cloud/#pricing"
+-
+-
+-starterSignup : Click msg
+-starterSignup =
+-    Click.externalHref "https://unison.cloud/signup?plan=Starter"
+-
+-
+ website : Click msg
+ website =
+     Click.externalHref "https://unison-lang.org"
+@@ -114,14 +103,6 @@
+     Click.externalHref "https://unison-lang.com/discord"
+ 
+ 
+-stripeCustomerPortal : Account a -> Click msg
+-stripeCustomerPortal account =
+-    Click.externalHref
+-        ("https://billing.stripe.com/p/login/fZe7wj02ZdXC3AIfYY?prefilled_email="
+-            ++ Url.percentEncode account.primaryEmail
+-        )
+-
+-
+ login : HttpApi -> Url -> Click msg
+ login api returnTo =
+     let
+@@ -163,11 +144,6 @@
+     toClick Route.overview
+ 
+ 
+-manageSubscription : Click msg
+-manageSubscription =
+-    toClick Route.manageSubscription
+-
+-
+ services : Click msg
+ services =
+     toClick Route.services
+diff --git a/src/UnisonCloud/Page/ManageSubscriptionPage.elm b/src/UnisonCloud/Page/ManageSubscriptionPage.elm
+deleted file mode 100644
+--- a/src/UnisonCloud/Page/ManageSubscriptionPage.elm
++++ /dev/null
+@@ -1,66 +0,0 @@
+-module UnisonCloud.Page.ManageSubscriptionPage exposing (..)
+-
+-import Html exposing (div, strong, text)
+-import Html.Attributes exposing (class)
+-import UI.Button as Button
+-import UI.Card as Card
+-import UI.Divider as Divider
+-import UI.Icon as Icon
+-import UI.PageContent as PageContent
+-import UI.PageLayout as PageLayout
+-import UI.PageTitle as PageTitle
+-import UnisonCloud.AppContext exposing (AppContext)
+-import UnisonCloud.AppDocument exposing (AppDocument)
+-import UnisonCloud.AppHeader as AppHeader
+-import UnisonCloud.CloudPlan as CloudPlan
+-import UnisonCloud.Link as Link
+-import UnisonCloud.PageFooter as PageFooter
+-
+-
+-view : AppContext -> AppDocument msg
+-view { session } =
+-    let
+-        managePlan =
+-            case session.cloudPlan of
+-                CloudPlan.Free ->
+-                    div [ class "upgrade" ]
+-                        [ text "Interested in the "
+-                        , Link.view_ (strong [] [ text "Starter" ]) Link.cloudPricing
+-                        , text " plan? "
+-                        , Button.button_ Link.starterSignup "Upgrade now!" |> Button.emphasized |> Button.view
+-                        ]
+-
+-                _ ->
+-                    div [ class "manage-in-stripe" ]
+-                        [ text ("Manage your " ++ CloudPlan.toString session.cloudPlan ++ " plan via the ")
+-                        , Button.iconThenLabel_ (Link.stripeCustomerPortal session) Icon.creditCard "Stripe Customer Portal"
+-                            |> Button.emphasized
+-                            |> Button.view
+-                        ]
+-
+-        content =
+-            [ Card.card
+-                [ div [ class "active-plan" ]
+-                    [ div [] [ text "Active plan:" ]
+-                    , strong [] [ text (CloudPlan.toString session.cloudPlan) ]
+-                    ]
+-                , Divider.divider |> Divider.small |> Divider.withoutMargin |> Divider.view
+-                , managePlan
+-                ]
+-                |> Card.asContained
+-                |> Card.view
+-            ]
+-
+-        page =
+-            PageLayout.centeredLayout
+-                (PageContent.oneColumn content
+-                    |> PageContent.withPageTitle (PageTitle.title "Manage Subscription")
+-                )
+-                PageFooter.pageFooter
+-    in
+-    { pageId = "manage-subscription-page"
+-    , title = "Manage Subscription"
+-    , appHeader = AppHeader.appHeader
+-    , page = PageLayout.view page
+-    , modal = Nothing
+-    }
+diff --git a/src/UnisonCloud/Route.elm b/src/UnisonCloud/Route.elm
+--- a/src/UnisonCloud/Route.elm
++++ b/src/UnisonCloud/Route.elm
+@@ -10,7 +10,6 @@
+     ( Route(..)
+     , ServiceRoute(..)
+     , fromUrl
+-    , manageSubscription
+     , navigate
+     , overview
+     , service
+@@ -36,7 +35,6 @@
+ 
+ type Route
+     = Overview
+-    | ManageSubscription
+     | Services
+     | Service ServiceName ServiceRoute
+     | ServiceDeploy ServiceHash
+@@ -62,11 +60,6 @@
+     Overview
+ 
+ 
+-manageSubscription : Route
+-manageSubscription =
+-    ManageSubscription
+-
+-
+ services : Route
+ services =
+     Services
+@@ -105,7 +98,6 @@
+ toRoute queryString =
+     oneOf
+         [ b overviewParser
+-        , b manageSubscriptionParser
+         , b servicesParser
+         , b serviceParser
+         , b serviceDeployParser
+@@ -120,11 +112,6 @@
+     succeed Services |. slash |. end
+ 
+ 
+-manageSubscriptionParser : Parser Route
+-manageSubscriptionParser =
+-    succeed ManageSubscription |. slash |. s "manage-subscription" |. end
+-
+-
+ servicesParser : Parser Route
+ servicesParser =
+     succeed Services |. slash |. s "services" |. end
+@@ -255,9 +242,6 @@
+         Overview ->
+             "overview"
+ 
+-        ManageSubscription ->
+-            "manage-subscription"
+-
+         Services ->
+             "services"
+ 
+@@ -288,9 +272,6 @@
+                 Overview ->
+                     ( [], [] )
+ 
+-                ManageSubscription ->
+-                    ( [ "manage-subscription" ], [] )
+-
+                 Services ->
+                     ( [ "services" ], [] )
+ 
