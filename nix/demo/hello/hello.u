@@ -1,0 +1,18 @@
+-- The demo's pre-deployed service. It's the same code a demo user would write by hand:
+-- deploy an HTTP handler and give it a name, so its URL is stable across redeploys.
+demoHello.service : HttpRequest ->{Log} HttpResponse
+demoHello.service _ =
+  Log.info "hello served" []
+  HttpResponse.ok (Body (Text.toUtf8 "Hello, world! This service was deployed to your own Unison Cloud when the demo started.\n"))
+
+demoHello.main : '{IO, Exception} ()
+demoHello.main = do
+  Cloud.run do
+    hash = deployHttp Environment.default() demoHello.service
+    uri = ServiceName.assign (ServiceName.named "hello") hash
+    printLine ("url=" ++ demoHello.uriText uri)
+
+-- @unison/cloud pulls in two releases of base; URI here is the one the cloud client
+-- returns.
+demoHello.uriText : URI -> Text
+demoHello.uriText = unison_base_7_12_1.IO.net.URI.toText

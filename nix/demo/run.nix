@@ -102,7 +102,8 @@ in
         $(http_status ${url.api}/dex/.well-known/openid-configuration) == 200 &&
         $(http_status ${url.api}/v2/account) == 401 &&
         $(http_status ${url.apps}/) != @(000|5??) &&
-        -s $state/xchg/dex-admin-password ]]; do
+        -s $state/xchg/dex-admin-password &&
+        -s $state/xchg/hello-url ]]; do
         if ! kill -0 "$vm_pid" 2>/dev/null; then
           vm_pid=
           tail -n 40 "$console" >&2
@@ -128,6 +129,8 @@ in
         UI:     ${url.ui}
         API:    ${url.api}
         Login:  demo@unison.localhost / demo
+        Hello:  $(cat "$state/xchg/hello-url")
+                (a hello-world service already deployed as the demo user)
         Admin:  admin@${cfg.domains.api} / $(cat "$state/xchg/dex-admin-password")
                 (inside the VM: ${cfg.stateDir}/secrets/dex-admin-password)
 

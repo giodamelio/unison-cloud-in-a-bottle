@@ -42,6 +42,7 @@ in {
       UI:    ${url.ui}
       API:   ${url.api}
       Login: demo@unison.localhost / demo
+      Hello: the demo user's pre-deployed service, URL in /var/lib/unison-cloud-demo/hello-url
       Admin: admin@${cfg.domains.api}, password in ${cfg.stateDir}/secrets/dex-admin-password
 
   '';
@@ -57,6 +58,20 @@ in {
       Type = "oneshot";
       RemainAfterExit = true;
       ExecStart = "${lib.getExe' pkgs.coreutils "cp"} ${cfg.stateDir}/secrets/dex-admin-password /tmp/xchg/dex-admin-password";
+    };
+  };
+
+  # The run script prints the pre-deployed service's URL from the same shared directory.
+  systemd.services.unison-cloud-demo-hello-url = {
+    description = "Share the demo's hello service URL with the demo's run script";
+    wantedBy = ["multi-user.target"];
+    requires = ["unison-cloud-demo-hello.service"];
+    after = ["unison-cloud-demo-hello.service"];
+    unitConfig.RequiresMountsFor = "/tmp/xchg";
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = "${lib.getExe' pkgs.coreutils "cp"} /var/lib/unison-cloud-demo/hello-url /tmp/xchg/hello-url";
     };
   };
 

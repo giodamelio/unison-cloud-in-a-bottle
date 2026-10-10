@@ -100,5 +100,14 @@
         assert hello["url"].startswith("${url.apps}/"), hello
         hurl("${hurl "service.hurl"}", "--test", f"--variable url={shlex.quote(hello['url'])}",
              "--variable 'expected=hello from deploy-program'")
+
+    with subtest("the demo user's hello-world service is deployed on boot and answers"):
+        machine.wait_for_unit("unison-cloud-demo-hello.service", timeout=900)
+        url = machine.succeed("cat /var/lib/unison-cloud-demo/hello-url").strip()
+        assert url.startswith("${url.apps}/services/"), url
+        body = machine.succeed(f"curl -sf {shlex.quote(url)}")
+        assert body.startswith("Hello, world!"), body
+        # Named, so the URL is stable, and owned by the account the demo login reaches.
+        assert "/services/s/demo/hello" in url, url
   '';
 }
