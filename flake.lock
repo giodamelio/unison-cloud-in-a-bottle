@@ -83,6 +83,22 @@
         "type": "github"
       }
     },
+    "cloud-api": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789427370,
+        "narHash": "sha256-eqdRpqalk+6bZQee4eQSQNm8U1wk+zaIGZ+J8cad/IE=",
+        "owner": "unisonweb",
+        "repo": "cloud-api",
+        "rev": "520dcedb37bf05d639ff233746f1c72a08ad9bf1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "unisonweb",
+        "repo": "cloud-api",
+        "type": "github"
+      }
+    },
     "extenddb": {
       "flake": false,
       "locked": {
@@ -699,8 +715,10 @@
     },
     "root": {
       "inputs": {
+        "cloud-api": "cloud-api",
         "extenddb": "extenddb",
         "nixpkgs": "nixpkgs",
+        "stacklock2nix": "stacklock2nix",
         "unison-cloud-ui": "unison-cloud-ui",
         "unison-nix": "unison-nix"
       }
@@ -718,6 +736,22 @@
       "original": {
         "owner": "input-output-hk",
         "repo": "stackage.nix",
+        "type": "github"
+      }
+    },
+    "stacklock2nix": {
+      "locked": {
+        "lastModified": 1769669881,
+        "narHash": "sha256-ZEE1ENBUM+Lj2yX0RtG7BdwvgAQQL6DCgpxDht9e6Ro=",
+        "owner": "cdepillabout",
+        "repo": "stacklock2nix",
+        "rev": "27c7a46f9a4c73d3aef95d4a011213af0ce1e700",
+        "type": "github"
+      },
+      "original": {
+        "owner": "cdepillabout",
+        "ref": "v5.2.3",
+        "repo": "stacklock2nix",
         "type": "github"
       }
     },

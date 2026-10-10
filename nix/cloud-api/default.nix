@@ -1,0 +1,47 @@
+{
+  haskell,
+  libpq,
+  stacklock2nix,
+  src,
+}: let
+  stacklock = stacklock2nix {
+    stackYaml = src + "/stack.yaml";
+    # postgresql-libpq links the C libpq, but inside the Haskell package set the name
+    # resolves to the unrelated (and broken) Hackage package libpq.
+    cabal2nixArgsOverrides = args:
+      args
+      // {
+        "postgresql-libpq" = _version: {inherit libpq;};
+      };
+    additionalHaskellPkgSetOverrides = hfinal: hprev: {
+      cloud = haskell.lib.appendPatches hprev.cloud [
+        ../../patches/cloud-api/0001-remove-unused-api-types.patch
+      ];
+
+      # Its tests need tmp-postgres, which isn't in the snapshot and is marked broken in nixpkgs.
+      hasql-interpolate = haskell.lib.dontCheck hprev.hasql-interpolate;
+      # Their tests need a running PostgreSQL server.
+      hasql = haskell.lib.dontCheck hprev.hasql;
+      hasql-pool = haskell.lib.dontCheck hprev.hasql-pool;
+      postgresql-binary = haskell.lib.dontCheck hprev.postgresql-binary;
+      # Its tests pull in wreq -> snap-server <-> http-streams, whose test suites depend on each other.
+      servant-auth-server = haskell.lib.dontCheck hprev.servant-auth-server;
+      # Its tests need tasty >=1.5; the snapshot has 1.4. Its Setup.hs locates libpq with pg_config.
+      postgresql-libpq = haskell.lib.addBuildTool (haskell.lib.dontCheck hprev.postgresql-libpq) libpq.pg_config;
+      # Its tests need hspec <2.11; the snapshot has a newer one.
+      http-api-data = haskell.lib.dontCheck hprev.http-api-data;
+      # Its tests run scripts/local-htfpp as a preprocessor, which the Hackage tarball ships without the executable bit.
+      HTF = haskell.lib.dontCheck hprev.HTF;
+      # Its "Large - Pinned" tests fail under GHC 9.6.7.
+      pvar = haskell.lib.dontCheck hprev.pvar;
+      # Its tests don't compile against the snapshot's QuickCheck.
+      xmlgen = haskell.lib.dontCheck hprev.xmlgen;
+      # Its cbits declare `void check_impl_specific();` and define it with arguments, which
+      # C23 (GCC 15's default) rejects. Fixed upstream in 1.4, but the snapshot pins 1.3.1.
+      hashtables = haskell.lib.appendConfigureFlag hprev.hashtables "--ghc-option=-optc-std=gnu17";
+    };
+    # lts-22.26 targets GHC 9.6.5; nixpkgs only carries the latest 9.6 point release.
+    baseHaskellPkgSet = haskell.packages.ghc96;
+  };
+in
+  haskell.lib.justStaticExecutables stacklock.pkgSet.cloud

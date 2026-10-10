@@ -1,0 +1,24 @@
+diff --git a/src/Cloud/Web/API.hs b/src/Cloud/Web/API.hs
+--- a/src/Cloud/Web/API.hs
++++ b/src/Cloud/Web/API.hs
+@@ -101,20 +101,12 @@
+   (AuthenticatedUserId :> Get '[JSON] UserAccountInfo)
+     :<|> ("subscription" :> AuthenticatedUserId :> ReqBody '[JSON] CreateSubscription :> Post '[JSON] IncompleteSubscription)
+ 
+-type SbtbAPI = AuthenticatedUserId :> "workshop" :> Get '[JSON] NoContent
+-
+ -- Redirect through Share, creating an account if necessary, then enrolling in the free tier
+ -- of cloud upon success.
+ type EnrollFreeTierEndpoint =
+   QueryParam "return_to" URIParam
+     :> Verb 'GET 302 '[PlainText] (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
+ 
+--- Redirect through Share, creating an account if necessary, then enrolling in the free tier
+--- of cloud upon success.
+-type EnrollPaidTeirEndpoint =
+-  QueryParam "return_to" URIParam
+-    :> Verb 'GET 302 '[PlainText] (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
+-
+ 
+ api :: Proxy API
+ api = Proxy

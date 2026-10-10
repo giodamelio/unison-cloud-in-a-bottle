@@ -10,6 +10,11 @@
     unison-cloud-ui.url = "github:unisonweb/unison-cloud-ui";
     unison-cloud-ui.flake = false;
 
+    cloud-api.url = "github:unisonweb/cloud-api";
+    cloud-api.flake = false;
+
+    stacklock2nix.url = "github:cdepillabout/stacklock2nix/v5.2.3";
+
     extenddb.url = "github:ExtendDB/extenddb/v0.1.13";
     extenddb.flake = false;
   };
@@ -22,6 +27,11 @@
       unison-cloud-ui = pkgs.callPackage ./nix/unison-cloud-ui {
         src = inputs.unison-cloud-ui;
         version = "0-unstable-${inputs.unison-cloud-ui.lastModifiedDate}";
+      };
+
+      cloud-api = pkgs.callPackage ./nix/cloud-api {
+        src = inputs.cloud-api;
+        stacklock2nix = pkgs.callPackage "${inputs.stacklock2nix}/nix/build-support/stacklock2nix" {};
       };
 
       extenddb = pkgs.callPackage ./nix/extenddb {
