@@ -10,6 +10,8 @@ self: {
   }: {
     imports = [self.nixosModules.default];
 
+    networking.nftables.enable = true;
+
     services.postgresql = {
       enable = true;
       package = pkgs.postgresql_17;

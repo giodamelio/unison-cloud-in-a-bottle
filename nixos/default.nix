@@ -9,6 +9,7 @@ self: {
 in {
   imports = [
     ./netns.nix
+    ./egress.nix
     ./secrets.nix
     ./ingress.nix
     ./dex.nix
@@ -20,6 +21,7 @@ in {
     ./redis.nix
     ./consul.nix
     ./cloud-api.nix
+    ./outbound-proxy.nix
   ];
 
   options.services.unison-cloud = {

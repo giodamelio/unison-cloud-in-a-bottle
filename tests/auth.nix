@@ -14,6 +14,8 @@ self: {
   in {
     imports = [self.nixosModules.default];
 
+    networking.nftables.enable = true;
+
     services.unison-cloud = {
       enable = true;
       domains = {

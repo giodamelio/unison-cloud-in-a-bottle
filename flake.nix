@@ -45,6 +45,8 @@
 
       variants = pkgs.testers.runNixOSTest (import ./tests/variants.nix inputs.self);
 
+      namespace = pkgs.testers.runNixOSTest (import ./tests/namespace.nix inputs.self);
+
       nimbus-dynamo = pkgs.testers.runNixOSTest (import ./tests/nimbus-dynamo {
         inherit (inputs) self;
         dynamoProbe = pkgs.callPackage ./tests/nimbus-dynamo/probe.nix {

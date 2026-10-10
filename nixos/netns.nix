@@ -14,7 +14,8 @@ in {
     readOnly = true;
     default = {
       bindsTo = ["unison-cloud-netns.service"];
-      after = ["unison-cloud-netns.service"];
+      requires = ["unison-cloud-netns-firewall.service"];
+      after = ["unison-cloud-netns.service" "unison-cloud-netns-firewall.service"];
       serviceConfig.NetworkNamespacePath = "/run/netns/${ns}";
     };
     description = "Unit settings that place a service inside the namespace.";

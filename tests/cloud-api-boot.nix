@@ -4,6 +4,8 @@ self: {
   nodes.machine = {config, pkgs, ...}: {
     imports = [self.nixosModules.default];
 
+    networking.nftables.enable = true;
+
     services.unison-cloud = {
       enable = true;
       domains = {
