@@ -1,6 +1,11 @@
 {
   description = "Unison Cloud as a in a NixOS module";
 
+  nixConfig = {
+    extra-substituters = ["https://unison-cloud-in-a-bottle.cachix.org"];
+    extra-trusted-public-keys = ["unison-cloud-in-a-bottle.cachix.org-1:egpjVQf3JrKM0bo39Gh3JKOMeEbyyk8t0VSH6455r8w="];
+  };
+
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
 
@@ -70,6 +75,10 @@
 
       nimbus = pkgs.callPackage ./nix/nimbus {
         inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+      };
+
+      push-cache = pkgs.callPackage ./nix/push-cache {
+        packages = removeAttrs inputs.self.packages.${pkgs.stdenv.hostPlatform.system} ["push-cache"];
       };
     });
 
