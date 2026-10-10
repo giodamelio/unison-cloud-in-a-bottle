@@ -22,6 +22,8 @@ in {
     ./consul.nix
     ./cloud-api.nix
     ./outbound-proxy.nix
+    ./loki.nix
+    ./nimbus.nix
   ];
 
   options.services.unison-cloud = {
@@ -73,6 +75,13 @@ in {
       default = packages.cloud-api;
       defaultText = lib.literalExpression "self.packages.\${system}.cloud-api";
       description = "Patched cloud-api package. Its `sql` passthru holds the migrations.";
+    };
+
+    nimbus.package = lib.mkOption {
+      type = lib.types.package;
+      default = packages.nimbus;
+      defaultText = lib.literalExpression "self.packages.\${system}.nimbus";
+      description = "Patched nimbus package, run once per node.";
     };
 
     extenddb = {

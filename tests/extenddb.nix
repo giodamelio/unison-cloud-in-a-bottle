@@ -8,6 +8,8 @@ self: {
 
     services.unison-cloud = {
       enable = true;
+      # This rung doesn't need nimbus, and its nodes would not fit in the VM's memory.
+      nimbus.enable = false;
       domains = {
         api = "cloud.test";
         apps = "apps.test";
@@ -17,7 +19,7 @@ self: {
 
     environment.systemPackages = [config.services.unison-cloud.internal.dynamoCall];
 
-    virtualisation.memorySize = 2048;
+    virtualisation.memorySize = 3072;
   };
 
   testScript = ''

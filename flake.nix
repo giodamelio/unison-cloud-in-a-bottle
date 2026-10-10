@@ -54,6 +54,13 @@
           inherit (inputs.self.packages.${pkgs.stdenv.hostPlatform.system}) nimbus;
         };
       });
+
+      nimbus-single = pkgs.testers.runNixOSTest (import ./tests/nimbus-single.nix {
+        inherit (inputs) self;
+        deployProgram = pkgs.callPackage ./tests/deploy-program {
+          inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+        };
+      });
     });
 
     packages = forAllSystems (pkgs: {

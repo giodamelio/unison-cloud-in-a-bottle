@@ -33,6 +33,8 @@
     scratch/main> reset #${causalHash}
     scratch/main> load 0001-dynamo-https.u
     scratch/main> update
+    scratch/main> load 0002-unproxied-internal-traffic.u
+    scratch/main> update
   '';
 in
   (buildFromTranscript {
@@ -47,7 +49,7 @@ in
       ```
     '';
 
-    compiledHash = "sha256-dgythH+WCwK5kdOAPTJhkyOCUB8k75LVLvEECbsuVQg=";
+    compiledHash = "sha256-uaWWQTMjIrvwf6t0zaPE/F5IkyGGbpdoE4m790NMQn8=";
 
     meta = {
       description = "Unison Cloud worker node";

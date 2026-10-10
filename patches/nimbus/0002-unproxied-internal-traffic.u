@@ -1,0 +1,269 @@
+-- Keeps nimbus's own S3, DynamoDB and user-blob traffic off the outbound proxy, so the
+-- proxy only ever carries hosted code's requests and can refuse every loopback and
+-- private address without exceptions for ExtendDB and S3.
+--
+-- Hosted code reaches the network through `http.run`, `tcpConnect.connect.local` and
+-- `websocketclients.run`, which read `outboundProxy` or `proxiedHttpConf` themselves and
+-- are left alone. Everything that uses the `proxiedHttpClient` field is nimbus's own
+-- traffic (`stateful.runStorage`, `blobs.run`, and the S3 writes and deletes in
+-- `http.handleIncomingAuthenticatedRequest`, `user.undeployService` and
+-- `user.unexposeService`), so `freshState` fills that field with the unproxied client
+-- instead of patching each of those call sites. The service and daemon fetches build
+-- their own client from `proxiedHttpConf`, so they switch to `unproxiedHttpConf`.
+
+daemons.fetchDaemon :
+  ServerState
+  -> DynamicConfig
+  -> DaemonHash
+  ->{IO, Exception, Abort, Threads} daemons.Daemon
+daemons.fetchDaemon state dynConf daemonHash =
+  httpConf = state |> ServerState.config |> unproxiedHttpConf
+  runConfigured httpConf do
+    fetchDaemon.impl
+      state (blobFetcherConfig dynConf) daemonHash
+
+ServerState.Config.unproxiedHttpConf :
+  ServerState.Config -> client.Config
+ServerState.Config.unproxiedHttpConf _ = client.Config.Config None []
+
+ServerState.freshState :
+  FilePath ->{IO, Exception, Threads} ServerState
+ServerState.freshState configPath =
+  use Client start
+  use IO ref
+  use Nat ==
+  use getEnv impl
+  (config, initialDynamicConfig) =
+    Random.run do
+      readFile configPath
+        |> fromUtf8
+        |> json_1_2_1.Decoder.run config.read
+  logger = LogBuffer.new 10000
+  dynConf =
+    systemfw_concurrent_9_0_0.Signal.new
+      (StateIndex 0, initialDynamicConfig)
+  metrics =
+    setupMetrics =
+      do
+        use Metrics createHistogram
+        usTiming = Config.log 10 3000 24
+        msTiming = Config.log 10000 3000000 24
+        createHistogram
+          usTiming "check_native_service_cache_micros"
+        createHistogram
+          usTiming "decode_native_service_micros"
+        createHistogram
+          msTiming "deployment_request_h2_micros"
+        createHistogram msTiming "deployment_request_micros"
+        createHistogram
+          (Config.log 100 100000 24) "detach_local_micros"
+        createHistogram msTiming "detach_remote_micros"
+        createHistogram
+          (Config.hdr 1 48 2)
+          "detach_remote_num_term_requests"
+        createHistogram
+          (Config.log 500 300000 24)
+          "fetch_environment_micros"
+        createHistogram msTiming "fetch_from_s3_micros"
+        createHistogram msTiming "fetch_native_service_micros"
+        createHistogram
+          msTiming "handle_service_http_request_micros"
+        createHistogram
+          (Config.log 30 30000 24)
+          "lookup_storage_pool_micros"
+        createHistogram
+          (Config.log 100 5000 24) "node_candidates_micros"
+        createHistogram usTiming "record_local_thread_micros"
+        createHistogram usTiming "ref_write_local_micros"
+        createHistogram msTiming "ref_write_remote_micros"
+        createHistogram
+          msTiming "resolve_by_user_and_name_micros"
+        createHistogram msTiming "resolve_name_micros"
+        createHistogram msTiming "service_request_micros"
+        createHistogram usTiming "service_call_micros"
+        createHistogram msTiming "state_transaction_micros"
+        createHistogram
+          msTiming "state_batch_transaction_micros"
+        createHistogram usTiming "try_cancel_local_micros"
+        createHistogram msTiming "try_cancel_remote_micros"
+        createHistogram
+          usTiming "user_code_validate_sandbox_micros"
+    cfg = MetricsConfig.default
+    m = buffer.new cfg
+    runMetrics m setupMetrics ()
+    m
+  firstByte : Bytes -> Nat
+  firstByte bs = match Bytes.at 0 bs with
+    Some n -> n
+    None   -> 0
+  firstUIDByte : UID -> Nat
+  firstUIDByte = cases UID bs -> firstByte bs
+  firstPromiseByte = cases Promise.Id.Id id -> firstUIDByte id
+  firstThreadByte = cases Thread.Id.Id id -> firstUIDByte id
+  webSocketByte = cases WebSocket.Id.Id id -> firstByte id
+  (proxiedHttpClient, unproxiedHttpClient) =
+    maxPerKey =
+      match impl "NIMBUS_MAX_CONNECTIONS_PER_HOST" with
+        Right t -> fromTextOrFail t
+        Left _  -> 10
+    Function.ignore
+      "https://github.com/minio/minio/issues/21633#issuecomment-3388024508"
+    reuseConnection defaultPolicy =
+      match impl "NIMBUS_MINIO_412_WORKAROUND" with
+        Right t ->
+          if List.contains (Text.toLowercase t) ["true", "1"] then
+            defaultTimeout httpResponse ->
+              (if
+                Status.code (HttpResponse.status httpResponse)
+                  == 412 then None
+              else defaultPolicy defaultTimeout httpResponse)
+          else defaultPolicy
+        Left _ -> defaultPolicy
+    unproxiedConf =
+      Client.Config.default
+        |> Client.Config.idleTimeout.set
+             (time.Duration.seconds +2)
+        |> statsBufferSize.set 1000000
+        |> maxPerKey.set maxPerKey
+        |> reuseConnection.modify reuseConnection
+    client = start unproxiedConf
+    (client, client)
+  storageRunner =
+    dynamoConfig : '{IO} Dynamo.Config
+    dynamoConfig =
+      do
+        DynamicConfig.dynamo
+          (systemfw_concurrent_9_0_0.Signal.readNow dynConf
+            |> at2)
+    timeout = time.Duration.minutes +10
+    convertLogLevel : Level -> LogLevel
+    convertLogLevel = cases
+      Level.Debug -> LogLevel.Debug
+      Level.Info  -> LogLevel.Info
+      Level.Warn  -> LogLevel.Warn
+      Level.Error -> LogLevel.Error
+      Custom _    -> LogLevel.Error
+    storageLogger ctx =
+      log lvl fields =
+        logEvent
+          logger
+          (convertLogLevel lvl)
+          (StatefulLog ctx fields)
+      stateful.Logger.Logger log
+    StorageRunner
+      (ctx dbs ->
+        stateful.runStorage
+          (storageLogger ctx)
+          proxiedHttpClient
+          dynamoConfig
+          timeout
+          dbs)
+  pool =
+    ConnectionPool.new (ServerState.poolConfig config logger)
+  peers =
+    Peers
+      SemispaceCache.new()
+      (ref PeerMap.empty)
+      (ref PendingReads.empty)
+      pool
+  ServerState
+    config
+    dynConf
+    (StripedMap.empty firstPromiseByte 256)
+    (StripedMap.empty firstThreadByte 256)
+    (StripedMap.empty firstUIDByte 256)
+    logger
+    SemispaceCache.new()
+    SemispaceCache.new()
+    SemispaceCache.new()
+    (StripedMap.empty webSocketByte 256)
+    SemispaceCache.new()
+    SemispaceCache.new()
+    storageRunner
+    metrics
+    SemispaceCache.new()
+    SemispaceCache.new()
+    SemispaceCache.new()
+    (ref EmptyJwkCache)
+    proxiedHttpClient
+    unproxiedHttpClient
+    Promise.new()
+    SemispaceCache.new()
+    ConcurrentMap.empty()
+    ConcurrentMap.empty()
+    peers
+
+services.fetchHttpService :
+  ServerState
+  -> ServiceHash
+    HttpRequest
+    (Either
+      HttpResponse
+      (unison_cloud_27_2_1.websockets.WebSocket
+      ->{Remote, WebSockets} ()))
+  ->{IO, Exception, Abort, Threads} services.Service
+    HttpRequest
+    (Either
+      HttpResponse
+      (unison_cloud_27_2_1.websockets.WebSocket
+      ->{Remote, WebSockets} ()))
+services.fetchHttpService state serviceHash =
+  cachedServices = httpServiceCache state
+  match SemispaceCache.lookup serviceHash cachedServices with
+    Some service ->
+      updateMetric
+        state (CounterUpdate "cache_http_service_hit" 1)
+      service
+    None ->
+      updateMetric
+        state (CounterUpdate "cache_http_service_miss" 1)
+      dynConf = currentDynamicConfig state
+      blobFetcherCfg = blobFetcherConfig dynConf
+      httpConf =
+        state |> ServerState.config |> unproxiedHttpConf
+      fetchedService = 
+        runConfigured httpConf do
+          fetchHttpService.withoutCaching
+            state blobFetcherCfg serviceHash
+      insertWithSizeLimit
+        10000 cachedServices serviceHash fetchedService
+      fetchedService
+
+services.fetchNativeService :
+  ServerState
+  -> ServiceHash a b
+  ->{IO, Exception, Abort, Threads} services.Service a b
+services.fetchNativeService state serviceHash =
+  use services Service
+  untypedServiceHash = fromTyped serviceHash
+  cachedServices = nativeServiceCache state
+  match timeMicros
+    state
+    "check_native_service_cache_micros"
+    (do SemispaceCache.lookup)
+    untypedServiceHash
+    cachedServices with
+    Some existentialService ->
+      updateMetric
+        state (CounterUpdate "cache_native_service_hit" 1)
+      coerceTypes : Service x y -> Service a b
+      coerceTypes = unsafeCoerce
+      Exists2.apply coerceTypes existentialService
+    None ->
+      timeMicros state "fetch_native_service_micros" do
+        updateMetric
+          state (CounterUpdate "cache_native_service_miss" 1)
+        dynConf = currentDynamicConfig state
+        blobFetcherCfg = blobFetcherConfig dynConf
+        httpConf =
+          state |> ServerState.config |> unproxiedHttpConf
+        fetchedService = 
+          runConfigured httpConf do
+            fetchNativeService.withoutCaching
+              state blobFetcherCfg serviceHash
+        insertWithSizeLimit
+          10000
+          cachedServices
+          untypedServiceHash
+          (Exists2.wrap fetchedService)
+        fetchedService
