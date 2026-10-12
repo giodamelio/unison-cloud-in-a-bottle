@@ -11,11 +11,11 @@
     ../../patches/cloud-api/0001-remove-unused-api-types.patch
     ../../patches/cloud-api/0002-production-mode-fixes.patch
     ../../patches/cloud-api/0003-vault-to-postgres.patch
-    ../../patches/cloud-api/0004-header-trust-login.patch
-    ../../patches/cloud-api/0005-session-error-redirect.patch
-    ../../patches/cloud-api/0006-environment-access-check.patch
-    ../../patches/cloud-api/0007-cookie-secure-from-origin.patch
-    ../../patches/cloud-api/0008-oidc-broker.patch
+    ../../patches/cloud-api/0004-selfhost-user-provisioning.patch
+    ../../patches/cloud-api/0005-environment-access-check.patch
+    ../../patches/cloud-api/0006-cookie-secure-from-origin.patch
+    ../../patches/cloud-api/0007-oidc-broker.patch
+    ../../patches/cloud-api/0008-remove-unauthenticated-routes.patch
   ];
 
   stacklock = stacklock2nix {

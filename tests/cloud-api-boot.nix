@@ -37,7 +37,6 @@ self: {
   testScript = {nodes, ...}: let
     sql = nodes.machine.services.unison-cloud.cloudApi.package.sql;
   in ''
-    import json
     import shlex
 
     secrets = "/var/lib/unison-cloud/secrets"
@@ -146,19 +145,12 @@ self: {
         ))
         assert psql(f"SELECT count(*) FROM selfhost.environment_secrets WHERE environment_id = '{env}'") == "0"
 
-    with subtest("header login provisions a user and issues a working token"):
-        headers = "-H 'X-Auth-Request-User: sub-alice' -H 'X-Auth-Request-Preferred-Username: Alice' -H 'X-Auth-Request-Email: alice@example.com'"
-        token = machine.succeed(api(f"-f {headers} http://127.0.0.1:5424/selfhost/access-token")).strip()
-        account = json.loads(machine.succeed(api(f"-f -H 'Authorization: Bearer {token}' http://127.0.0.1:5424/v2/account")))
-        assert account["handle"] == "alice", account
-        assert psql("SELECT count(*) FROM selfhost.oidc_identities WHERE subject = 'sub-alice' AND issuer = 'https://cloud.test/dex'") == "1"
-        assert psql("SELECT count(*) FROM cloud_users cu JOIN users u ON u.id = cu.user_id WHERE u.handle = 'alice'") == "1"
-        again = machine.succeed(api(f"-f {headers} http://127.0.0.1:5424/selfhost/access-token")).strip()
-        second = json.loads(machine.succeed(api(f"-f -H 'Authorization: Bearer {again}' http://127.0.0.1:5424/v2/account")))
-        assert second["handle"] == "alice"
-
-    with subtest("login without the identity header is refused"):
-        assert machine.succeed(api("-o /dev/null -w '%{http_code}' http://127.0.0.1:5424/selfhost/access-token")) == "401"
+    with subtest("on its loopback port, cloud-api has no way in but the OIDC login, forged headers or not"):
+        machine.succeed(ns(
+            "hurl --test --variable api=http://127.0.0.1:5424 --variable cluster=d3ee426c-c252-4910-a861-08fccf85fb66"
+            f" --secret internal_token=$(cat {secrets}/internal-auth-token) ${./hurl/removed-routes.hurl}"
+        ))
+        assert psql("SELECT count(*) FROM users WHERE handle = 'forged'") == "0"
 
     with subtest("nothing listens outside the namespace"):
         machine.fail("ss -Hltn | grep -E ':(7070|6379|8500|18443|5424|5426) '")

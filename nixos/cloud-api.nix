@@ -278,7 +278,6 @@ in {
             CLOUD_S3_ADDRESSING = "path";
             CLOUD_CLOUD_SERVICE_BUCKET = cfg.s3.buckets.services;
 
-            CLOUD_SELFHOST_OIDC_ISSUER = cfg.internal.oidcIssuer;
             CLOUD_SELFHOST_DEFAULT_TIER = cfg.auth.defaultTier;
 
             # Hosted-business integrations a self-hosted user never reaches.

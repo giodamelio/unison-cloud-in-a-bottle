@@ -1,0 +1,578 @@
+--- a/cloud.cabal
++++ b/cloud.cabal
+@@ -130,7 +130,6 @@
+       Cloud.Web.Internal.API
+       Cloud.Web.Internal.Impl
+       Cloud.Web.Internal.Types
+-      Cloud.Web.Local.API
+       Cloud.Web.Local.Impl
+       Cloud.Web.Loki
+       Cloud.Web.RawRequest
+--- a/src/Cloud/Web/API.hs
++++ b/src/Cloud/Web/API.hs
+@@ -25,21 +25,20 @@
+ import Cloud.User.Types
+ import Cloud.User.UserHandle (UserHandle)
+ import Cloud.Web.Internal.API qualified as Internal
+-import Cloud.Web.Local.API qualified as Local
+-import Cloud.Web.Types (IncompleteSubscription, StripeSignature, WithRawBody, CloudApiHost, DeploymentDetails)
++import Cloud.Web.Types (IncompleteSubscription, CloudApiHost, DeploymentDetails)
+ import Crypto.JOSE.JWK qualified as JWK
+-import Data.Aeson.Types (FromJSON, Value, explicitParseFieldMaybe, parseJSON, withObject, (.:), (.:?))
++import Data.Aeson.Types (FromJSON, explicitParseFieldMaybe, parseJSON, withObject, (.:), (.:?))
+ import Data.Text
+ import Servant
+-import Share.OAuth.API
++import Share.OAuth.API (LogoutEndpoint)
+ import Share.OAuth.Session (AuthenticatedUserId)
+-import Share.Utils.Servant.Cookies qualified as Cookies
+-import Share.Utils.URI (URIParam)
+ import Stripe.Concepts (CouponId)
+ import Cloud.Web.Cluster.API (ClusterAPI)
+ import Cloud.SelfHost.Oidc.API qualified as Oidc
+ 
+-type API = ServiceProviderAPI :<|> CloudAPI
++-- | Of share-auth's routes only /logout is kept: /login and /oauth/redirect log in through
++-- Share, which a self-hosted deployment never uses.
++type API = ("logout" :> LogoutEndpoint) :<|> CloudAPI
+ 
+ type CloudAPI =
+   ( "v1"
+@@ -62,7 +61,6 @@
+                     :<|> LogsAPI
+                     :<|> StoragePoolAPI
+                     :<|> UserV2API
+-                    :<|> "stripe" :> StripeAPI
+                     :<|> DaemonAPI
+                     :<|> DomainAPI
+                     :<|> "byoc" :> ByocAPI
+@@ -70,8 +68,6 @@
+                 )
+          )
+     :<|> ("internal" :> Internal.API)
+-    :<|> ("local" :> Local.API)
+-    :<|> ("enroll" :> EnrollFreeTierEndpoint)
+     :<|> (".well-known" :> "jwks.json" :> JWKSEndpoint)
+     :<|> Oidc.API
+ 
+@@ -103,13 +99,6 @@
+   (AuthenticatedUserId :> Get '[JSON] UserAccountInfo)
+     :<|> ("subscription" :> AuthenticatedUserId :> ReqBody '[JSON] CreateSubscription :> Post '[JSON] IncompleteSubscription)
+ 
+--- Redirect through Share, creating an account if necessary, then enrolling in the free tier
+--- of cloud upon success.
+-type EnrollFreeTierEndpoint =
+-  QueryParam "return_to" URIParam
+-    :> Verb 'GET 302 '[PlainText] (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
+-
+-
+ api :: Proxy API
+ api = Proxy
+ 
+@@ -211,11 +200,3 @@
+ 
+ type JWKSEndpoint =
+   Get '[JSON] JWK.JWKSet
+-
+--- Stripe
+-
+-type StripeAPI =
+-  "events"
+-    :> Header' '[Required, Strict] "Stripe-Signature" StripeSignature
+-    :> ReqBody '[JSON] (WithRawBody Value)
+-    :> PostNoContent
+--- a/src/Cloud/Web/Impl.hs
++++ b/src/Cloud/Web/Impl.hs
+@@ -14,21 +14,14 @@
+     ( DeploymentDetails(deploymentDetailsHash),
+       EnvironmentId,
+       IncompleteSubscription(..),
+-      StripeSignature(..),
+-      WithRawBody(..),
+       CloudApiHost )
+ import Cloud.Domain.Impl qualified as Domain
+-import Cloud.Email.Client
+-  ( Email (Email),
+-    registerEmail,
+-  )
+ import Cloud.Env (Env (..))
+ import Cloud.Environment.Types
+ import Cloud.Errors (redirectToRoot, respondError)
+ import Cloud.Log.Types
+ import Cloud.Postgres qualified as PG
+ import Cloud.Postgres.App (postgresM)
+-import Cloud.Postgres.Ops (saveStripeEvent)
+ import Cloud.Postgres.Ops qualified as PGO
+ import Cloud.Postgres.Queries qualified as Q
+ import Cloud.SelfHost.Oidc qualified as Oidc
+@@ -42,100 +35,37 @@
+     ServiceURI (..),
+   )
+ import Cloud.Storage.Impl (storageEndpoint)
+-import Cloud.Stripe.API (StripeConfig (..))
+ import Cloud.Stripe.Subscriptions (SubscriptionWithClientSecret (SubscriptionWithClientSecret))
+ import Cloud.Stripe.Subscriptions qualified as Subscription (Subscription (subscriptionId))
+-import Cloud.Stripe.WebhookHandlers (handleEvent)
+ import Cloud.User.Env (AuthEnv (..))
+ import Cloud.User.Impl
+-import Cloud.User.Types (User (..))
+ import Cloud.User.UserHandle (UserHandle (..))
+ import Cloud.Web.Util (validDNSName)
+ import Cloud.Web.API (CreateSubscription (..))
+ import Cloud.Web.API qualified as Cloud
+-import Cloud.Web.App (WebApp, isCloudUILink)
++import Cloud.Web.App (WebApp)
+ import Cloud.Web.Cluster.Impl qualified as Cluster
+ import Cloud.Web.Environment qualified as Envs
+ import Cloud.Web.Errors
+ import Cloud.Web.Internal.Impl qualified as Internal
+-import Cloud.Web.Local.Impl qualified as Local
+ import Cloud.Web.Loki (nsFromUTCTime, servicesLogQuery, userLogQuery)
+-import Control.Monad.Reader (MonadTrans (lift), asks)
+-import Control.Monad.Trans.Maybe (MaybeT (..))
+-import Data.Aeson (Result (..), Value, fromJSON)
+-import Data.Aeson qualified as Aeson
+-import Data.ByteString qualified as BS
+ import Data.Maybe (fromJust)
+ import Data.Text qualified as Text
+-import Hasql.Interpolate (Json (..))
+ import Network.URI qualified as URI
+ import Servant
+-import Share.OAuth.IdentityProvider.Types (IdentityProviderConfig)
+-import Share.OAuth.ServiceProvider (ServiceProviderConfig (..), SessionCallbackData (..))
++import Share.OAuth.ServiceProvider (ServiceProviderConfig (..))
+ import Share.OAuth.ServiceProvider qualified as Auth
+-import Share.OAuth.Session (Session (..))
+ import Share.OAuth.Types hiding (AuthenticationRequest (..), OAuthClientConfig (..))
+-import Share.Utils.Servant.Cookies qualified as Cookies
+ import Share.Utils.Show (tShow)
+-import Share.Utils.URI (URIParam)
+-import Stripe.Signature (isSigValid)
+ import UnliftIO (throwIO)
+ 
+ -- | A helper function for constructing URIs from constant strings.
+ unsafeURI :: (HasCallStack) => String -> URI.URI
+ unsafeURI = fromJust . URI.parseURI
+ 
+-data EnrollInCloud = None | Free | Paid
+-  deriving (Generic, Eq, Show)
+-
+-instance Aeson.FromJSON EnrollInCloud where
+-  parseJSON = Aeson.withObject "EnrollInCloud" $ \o -> do
+-    enrollInCloud <- o Aeson..: "enrollInCloud"
+-    case enrollInCloud of
+-      "None" -> pure None
+-      "Free" -> pure Free
+-      "Paid" -> pure Paid
+-      _ -> fail $ "Invalid EnrollInCloud value: " <> Text.unpack enrollInCloud
+-
+-instance Aeson.ToJSON EnrollInCloud where
+-  toJSON e =
+-    Aeson.object
+-      [ "enrollInCloud" Aeson..= show e
+-      ]
+-
+--- | A session callback which redirects the user to either an error page
+--- or the authed handler endpoint depending on whether the oauth2 login succeeds.
+-mySessionCallback :: Either RedirectReceiverErr SessionCallbackData -> WebApp URI
+-mySessionCallback (Left _err) = pure . fromJust . URI.parseURI $ "https://app.unison.cloud/error?appError=UnspecifiedError" -- <> show err
+-mySessionCallback (Right (SessionCallbackData {returnToURI = unvalidatedReturnToURI, additionalData, session = Session {sessionUserId}})) = do
+-  let enrollInCloud = fromMaybe None $ do
+-        val <- additionalData
+-        case Aeson.fromJSON val of
+-          Aeson.Success enroll -> Just enroll
+-          Aeson.Error {} -> Nothing
+-
+-  when (enrollInCloud == Free) $ do
+-    user <- PGO.expectUserById sessionUserId
+-
+-    registerEmail (Email (user_email user) Nothing)
+-    PGO.addToFreeTier sessionUserId
+-  when (enrollInCloud == Paid) $ do
+-    user <- PGO.expectUserById sessionUserId
+-
+-    registerEmail (Email (user_email user) Nothing)
+-    PGO.addToPaidTier user
+-
+-  appURI <- asks envCloudUiOrigin
+-  mayReturnToURI <- runMaybeT do
+-    uri <- MaybeT . pure $ unvalidatedReturnToURI
+-    isValid <- lift $ isCloudUILink uri
+-    guard isValid
+-    pure uri
+-  pure $ fromMaybe appURI mayReturnToURI
+-
+ server :: Env () -> ServerT Cloud.API WebApp
+-server Env {authEnv = AuthEnv {envSpConfig, envIdentityProvider}} =
+-  serviceProviderEndpoints
++server Env {authEnv = AuthEnv {envSpConfig = ServiceProviderConfig {redirectAfterLogout, cookieSettings, sessionCookieKey}}} =
++  Auth.logoutEndpoint redirectAfterLogout cookieSettings sessionCookieKey
+     :<|> ( accountEndpoints
+              :<|> servicesV1Endpoint
+              :<|> deploymentsV1Endpoint
+@@ -153,20 +83,15 @@
+              :<|> logs
+              :<|> storageEndpoint
+              :<|> userV2
+-             :<|> stripeWebhookEndpoint
+              :<|> Daemon.server
+              :<|> Domain.server
+              :<|> Byoc.server
+              :<|> Cluster.server
+          )
+     :<|> Internal.server
+-    :<|> Local.server
+-    :<|> enrollFreeTierEndpoint envIdentityProvider envSpConfig
+     :<|> jwksEndpoint
+     :<|> Oidc.server
+   where
+-    serviceProviderEndpoints = Auth.serviceProviderServer envIdentityProvider envSpConfig mySessionCallback
+-
+     accountEndpoints = userAccountInfo :<|> createSubscriptionEndpoint
+ 
+     environment =
+@@ -202,30 +127,6 @@
+   e <- redirectToRoot
+   UnliftIO.throwIO e
+ 
+-enrollFreeTierEndpoint ::
+-  IdentityProviderConfig ->
+-  ServiceProviderConfig ->
+-  Maybe URIParam ->
+-  WebApp
+-    ( Headers
+-        '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String]
+-        NoContent
+-    )
+-enrollFreeTierEndpoint envIdentityProvider envSpConfig returnTo = do
+-  Auth.loginEndpointWithData envIdentityProvider envSpConfig (Just Free) returnTo
+-
+-enrollPaidTierEndpoint ::
+-  IdentityProviderConfig ->
+-  ServiceProviderConfig ->
+-  Maybe URIParam ->
+-  WebApp
+-    ( Headers
+-        '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String]
+-        NoContent
+-    )
+-enrollPaidTierEndpoint envIdentityProvider envSpConfig returnTo = do
+-  Auth.loginEndpointWithData envIdentityProvider envSpConfig (Just Paid) returnTo
+-
+ acceptTermsEndpoint :: UserId -> WebApp NoContent
+ acceptTermsEndpoint userId = do
+   PGO.acceptTerms userId
+@@ -432,25 +333,6 @@
+ 
+ -- Stripe
+ 
+--- We use `WithRawBody Value` instead of `WithRawBody Stripe.Event` because we
+--- want to keep the raw JSON to store in Postgres.
+--- See https://stripe.com/docs/billing/subscriptions/webhooks
+-stripeWebhookEndpoint :: StripeSignature -> WithRawBody Value -> WebApp NoContent
+-stripeWebhookEndpoint (StripeSignature sig) body = do
+-  stripeWebhookSecret <- asks (stripeWebhookSecretKey . envStripeConfig)
+-  if isSigValid sig stripeWebhookSecret (BS.toStrict . rawBody $ body)
+-    then case value body of
+-      Left err ->
+-        respondError $ BadRequest $ "Invalid JSON body: " <> err
+-      Right json ->
+-        case fromJSON json of
+-          Aeson.Error err ->
+-            respondError $ BadRequest $ "Invalid Stripe event: " <> Text.pack err
+-          Success event -> do
+-            saveStripeEvent event (Json json)
+-            handleEvent event $> NoContent
+-    else respondError $ BadRequest "Invalid signature"
+-
+ createSubscriptionEndpoint :: UserId -> CreateSubscription -> WebApp IncompleteSubscription
+ createSubscriptionEndpoint userId (CreateSubscription cloudTier coupon address) =
+   toIncomplete <$> createSubscription userId address cloudTier coupon
+--- a/src/Cloud/Web/Internal/API.hs
++++ b/src/Cloud/Web/Internal/API.hs
+@@ -2,34 +2,15 @@
+ 
+ module Cloud.Web.Internal.API where
+ 
+-import Cloud.Service.Types (ServiceId, ServiceName)
+-import Cloud.User.UserHandle (UserHandle)
+-import Cloud.Web.Internal.Types
+ import Servant
+ import Cloud.Consul.API (ServiceInstanceId)
+ import Cloud.Byoc.Env (ClusterId, Event, PeerNodeResult)
+-import Cloud.Web.Types (EnvironmentId, CloudApiHost)
+ import Data.Text (Text)
+ 
++-- | The unauthenticated lookups by handle, environment and service are removed: nimbus
++-- uses the cluster-token versions under /v2/cluster, and these answered anyone.
+ type API =
+-  ( "userByHandle"
+-      :> Capture "user" UserHandle
+-      :> Get '[JSON] UserIdResult
+-  )
+-    :<|> ("storageByEnvironmentId")
+-      :> Header' [Required, Strict] "Host" CloudApiHost
+-      :> Capture "environment" EnvironmentId
+-      :> Get '[JSON] [StoragePoolIdResult]
+-    :<|> ("deploymentByServiceId")
+-      :> Header' [Required, Strict] "Host" CloudApiHost
+-      :> Capture "serviceId" ServiceId
+-      :> Get '[JSON] DeploymentHashResult
+-    :<|> ("deploymentByServiceName")
+-      :> Header' [Required, Strict] "Host" CloudApiHost
+-      :> Capture "userHandle" UserHandle
+-      :> Capture "serviceName" ServiceName
+-      :> Get '[JSON] DeploymentHashResult
+-    :<|> ("byoc"
++  ("byoc"
+         :> "health"
+         :> Capture "clusterId" ClusterId
+         :> Capture "instanceId" ServiceInstanceId
+@@ -38,8 +19,7 @@
+ 
+ -- | Internal cloud-api-to-cloud-api RPC: deliver an invalidation to the nodes
+ -- connected to the receiving instance, returning per-node results. Guarded by a
+--- shared-secret header when CLOUD_INTERNAL_AUTH_TOKEN is set (optional so local
+--- test environments without the secret keep working).
++-- shared-secret header, and refused outright when CLOUD_INTERNAL_AUTH_TOKEN is unset.
+ type InvalidateRoute =
+   "invalidate"
+     :> Header "X-Cloud-Internal-Auth" Text
+--- a/src/Cloud/Web/Internal/Impl.hs
++++ b/src/Cloud/Web/Internal/Impl.hs
+@@ -6,15 +6,8 @@
+ import Servant
+ import Cloud.Web.Internal.API
+ import Cloud.Web.App (WebApp)
+-import Cloud.User.UserHandle (UserHandle)
+-import Cloud.Web.Types ( ServiceId, ServiceName, CloudApiHost )
+-import Cloud.Postgres qualified as PG
+-import Cloud.Postgres.Queries qualified as Q
+-import Cloud.User.Types (User(..))
+ import Cloud.Web.Errors
+ import Cloud.Errors
+-import Cloud.Web.Internal.Types
+-import Share.OAuth.Types
+ import Cloud.Prelude
+ import Cloud.Byoc.Env (ClusterEnv (..), Connection (..), ClusterId)
+ import Control.Monad.RWS
+@@ -22,10 +15,7 @@
+ import Control.Concurrent.STM (atomically)
+ import Cloud.Consul.API (CheckStatus(..), ServiceInstanceId)
+ import Cloud.Web.Environment (Env(..))
+-import Cloud.Postgres.App (postgresM)
+ import Cloud.Byoc.Env (Cluster(..))
+-import Cloud.Web.Types (EnvironmentId)
+-import qualified Cloud.Postgres.Ops.Byoc as PGO
+ import Cloud.Byoc.Env (Event, eventCluster, PeerNodeResult (..))
+ import Cloud.Web.Cluster.Impl (invalidateLocalForCluster, invalidationTimeoutMicros)
+ import Data.Text qualified as Text
+@@ -33,41 +23,9 @@
+ 
+ server :: ServerT API WebApp
+ server = do
+-    userIdByHandle
+-        :<|> storageByEnvironmentId
+-        :<|> deploymentByServiceId
+-        :<|> deploymentByServiceName
+-        :<|> byocHealth
++    byocHealth
+         :<|> invalidatePeer
+ 
+-userIdByHandle :: UserHandle -> WebApp UserIdResult
+-userIdByHandle handle = do
+-   user <- postgresM $ PG.runTransaction $ Q.userByHandle handle
+-   case user of
+-      Nothing -> respondError $ UserNotFoundForHandle handle
+-      Just (User (UserId id) _ _ _ _ _) -> pure $ UserIdResult id
+-
+-storageByEnvironmentId :: CloudApiHost -> EnvironmentId -> WebApp [StoragePoolIdResult]
+-storageByEnvironmentId host envId = do
+-    clusterId <- PGO.clusterIdByHost host
+-    postgresM $ PG.runTransaction $ fmap StoragePoolIdResult <$> Q.storageByEnvironmentId clusterId envId
+-
+-deploymentByServiceId :: CloudApiHost -> ServiceId -> WebApp DeploymentHashResult
+-deploymentByServiceId host serviceId = do
+-    clusterId <- PGO.clusterIdByHost host
+-    deployment <- postgresM $ PG.runTransaction (Q.deploymentByServiceId clusterId serviceId)
+-    case deployment of
+-        Nothing -> respondError $ ServiceIdNotFound serviceId
+-        Just deployment -> pure $ DeploymentHashResult deployment
+-
+-deploymentByServiceName :: CloudApiHost -> UserHandle -> ServiceName -> WebApp DeploymentHashResult
+-deploymentByServiceName host userHandle serviceName = do
+-    clusterId <- PGO.clusterIdByHost host
+-    deployment <- postgresM $ PG.runTransaction (Q.deploymentByServiceName clusterId userHandle serviceName)
+-    case deployment of
+-        Nothing -> respondError $ ServiceNameNotFound serviceName
+-        Just deployment -> pure $ DeploymentHashResult deployment
+-
+ err429 :: ServerError
+ err429 = ServerError { errHTTPCode = 429
+                     , errReasonPhrase = "Too Many Requests"
+@@ -103,15 +61,14 @@
+ 
+ -- | Internal peer RPC: apply an invalidation to the nodes connected to THIS
+ -- instance and return per-node results. (Local-only — the fan-out across peers
+--- is driven by 'invalidateSync' on the originating instance.) When
+--- CLOUD_INTERNAL_AUTH_TOKEN is set, callers must present it in
+--- X-Cloud-Internal-Auth; this route triggers work across every connected node,
+--- so it gets a stronger guard than the read-only internal routes.
++-- is driven by 'invalidateSync' on the originating instance.) Callers must
++-- present CLOUD_INTERNAL_AUTH_TOKEN in X-Cloud-Internal-Auth. Without the
++-- variable every call is refused, since any local process can reach this port.
+ invalidatePeer :: Maybe Text -> Event -> WebApp [PeerNodeResult]
+ invalidatePeer auth ev = do
+   expected <- liftIO $ lookupEnv "CLOUD_INTERNAL_AUTH_TOKEN"
+   case expected of
+-    Just secret | auth /= Just (Text.pack secret) -> throwIO err403 {errBody = "missing or invalid X-Cloud-Internal-Auth"}
+-    _ -> pure ()
++    Just secret | not (null secret), auth == Just (Text.pack secret) -> pure ()
++    _ -> throwIO err403 {errBody = "missing or invalid X-Cloud-Internal-Auth"}
+   results <- invalidateLocalForCluster invalidationTimeoutMicros (eventCluster ev) ev
+   pure [PeerNodeResult nid d | (nid, d) <- results]
+--- a/src/Cloud/Web/Local/API.hs
++++ /dev/null
+@@ -1,29 +0,0 @@
+-{-# LANGUAGE DataKinds #-}
+-{-# LANGUAGE TypeOperators #-}
+-
+-{- Endpoints which are only active on the local deployment -}
+-module Cloud.Web.Local.API (API) where
+-
+-import Cloud.Prelude
+-import Cloud.User.UserHandle (UserHandle)
+-import Servant
+-import Servant.Auth.Server
+-
+-type API =
+-  ( "user"
+-      :> Capture "user_handle" UserHandle
+-      :> ( "login" :> LocalLoginEndpoint
+-             :<|> "access-token" :> LocalAccessTokenEndpoint
+-         )
+-  )
+-
+--- | GET /local/login
+--- Logs the user in to the specified account without needing to redirect through an
+--- auth provider.
+-type LocalLoginEndpoint =
+-  Get '[PlainText] (Headers '[Header "Set-Cookie" SetCookie] Text)
+-
+--- | GET /local/access-token
+--- Gets an access token for the specified user.
+-type LocalAccessTokenEndpoint =
+-  Get '[PlainText] Text
+--- a/src/Cloud/Web/Local/Impl.hs
++++ b/src/Cloud/Web/Local/Impl.hs
+@@ -7,7 +7,7 @@
+ -- https://github.com/unisonweb/unison/issues/5153
+ {-# OPTIONS_GHC -Wno-deprecations #-}
+ 
+-{- Endpoints which are only active on the local deployment -}
++{- Access-token signing. The local-only endpoints that issued tokens without credentials are removed. -}
+ module Cloud.Web.Local.Impl where
+ 
+ import Cloud.App (AppM)
+@@ -15,19 +15,10 @@
+ import Cloud.Env
+ import Cloud.Errors
+     ( InternalServerError(InternalServerError),
+-      ErrorID(ErrorID),
+       respondError )
+-import Cloud.Errors qualified as Errors
+-import Cloud.Postgres qualified as PG
+-import Cloud.Postgres.Queries qualified as Q
+ import Cloud.Prelude
+-import Cloud.User.Types
+-import Cloud.User.UserHandle (UserHandle)
+ import Cloud.Web.App
+-import Cloud.Web.Errors qualified as Errors
+-import Cloud.Web.Local.API
+ import Control.Lens
+-import Control.Monad.Random (randomIO)
+ import Control.Monad.Reader
+ import Crypto.JWT (SignedJWT)
+ import Crypto.JWT qualified as JWT
+@@ -35,45 +26,13 @@
+ import Data.Set qualified as Set
+ import Data.Time (NominalDiffTime, addUTCTime, getCurrentTime, nominalDay)
+ import Servant
+-import Servant.Auth.Server
+ import Share.JWT (JWTParam (..))
+ import Share.JWT qualified as ShareJWT
+-import Share.OAuth.Scopes (Scopes (Scopes))
+-import Share.OAuth.Scopes qualified as Scopes
+-import Share.OAuth.Session (Session)
+-import Share.OAuth.Session qualified as Session
++import Share.OAuth.Scopes (Scopes)
+ import Share.OAuth.Types (AccessToken (..), JTI (JTI), SessionId (SessionId), UserId)
+ import Share.Utils.IDs qualified as IDs
+ import Cloud.User.Env (AuthEnv(..))
+-import Cloud.Postgres.App (postgresM)
+-import Cloud.User.Impl (enlilIssuer, enlilAud)
+-import Cloud.User.App (authM)
+-import qualified Cloud.Deployment as Deployment
+-
+--- | Login to the specified user without checking credentials.
+--- Only available when running locally.
+-localLoginEndpoint :: UserHandle -> WebApp (Headers '[Header "Set-Cookie" SetCookie] Text)
+-localLoginEndpoint userHandle = do
+-  (User {user_id}) <-
+-    postgresM (PG.runTransaction (Q.userByHandle userHandle)) >>= \case
+-      Nothing -> Errors.respondError $ Errors.EntityMissing (ErrorID "no-user-for-handle") "No user for this handle"
+-      Just u -> pure u
+-
+-  iss <- enlilIssuer
+-  aud <- enlilAud
+-
+-  session <- liftIO $ Session.createSession iss (Set.singleton aud) user_id
+-  setSessionCookie session >>= \case
+-    Nothing -> Errors.respondError $ Errors.InternalServerError "local:failed-create-session" ("Failed to create session" :: Text)
+-    Just setAuthHeaders -> do
+-      pure $ setAuthHeaders "Logged in to the test account."
+-  where
+-    setSessionCookie :: (AddHeader "Set-Cookie" SetCookie resp resp') => Session -> WebApp (Maybe (resp -> resp'))
+-    setSessionCookie sess = authM $ do
+-      AuthEnv {envSessionCookieName, envCookieSettings, envJwtSettings} <- ask
+-      liftIO (ShareJWT.createSignedCookie envJwtSettings envCookieSettings envSessionCookieName sess) >>= \case
+-        Left _err -> pure Nothing
+-        Right cookie -> pure . Just $ addHeader @"Set-Cookie" cookie
++import Cloud.User.Impl (enlilIssuer)
+ 
+ data AccessTokenClaims = AccessTokenClaims
+   { standardClaims :: ShareJWT.StandardClaims,
+@@ -131,33 +90,3 @@
+   let accessTokenClaims = AccessTokenClaims {scope, standardClaims}
+   signedJWT <- signJWT accessTokenClaims
+   pure (AccessToken (JWTParam signedJWT))
+-
+--- | Return an access token for the specified user.
+--- Only available when running locally.
+-localAccessTokenEndpoint ::
+-  UserHandle ->
+-  WebApp Text
+-localAccessTokenEndpoint userHandle = do
+-  (User {user_id}) <-
+-    postgresM (PG.runTransaction (Q.userByHandle userHandle)) >>= \case
+-      Nothing -> Errors.respondError $ Errors.EntityMissing (ErrorID "no-user-for-handle") "No user for this handle"
+-      Just u -> pure u
+-  sessionID <- randomIO
+-  aud <- enlilAud
+-  AccessToken (JWTParam accessToken) <- createAccessToken aud user_id sessionID (Scopes $ Set.fromList [Scopes.OpenId])
+-  pure (ShareJWT.signedJWTToText accessToken)
+-
+--- | All of these endpoints are only accessible on the local deployment, otherwise they just 404.
+-server :: ServerT API WebApp
+-server = do
+-  let userRoutes userHandle =
+-        localLoginEndpoint userHandle
+-          :<|> localAccessTokenEndpoint userHandle
+-  hoistServer (Proxy @API) guardLocal userRoutes
+-  where
+-    -- Local endpoints should just 404 on any other deployment.
+-    guardLocal :: forall x. WebApp x -> WebApp x
+-    guardLocal m =
+-      if Deployment.onLocal
+-        then m
+-        else Errors.respondError $ Errors.EntityMissing (ErrorID "local-on-nonlocal") "Not Found"

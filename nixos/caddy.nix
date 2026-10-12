@@ -25,10 +25,11 @@ in {
           description =
             {
               api = ''
-                Body of the API domain's Caddy site block. It drops client-sent
-                `X-Auth-Request-*` headers, sends `/login` to cloud-api's OIDC login,
-                answers 404 for the routes that trust identity headers or are internal,
-                and proxies the rest to cloud-api's ingress socket.
+                Body of the API domain's Caddy site block. It sends `/login` to cloud-api's
+                OIDC login, answers 404 for cloud-api's `/internal/*` routes, and proxies the
+                rest to cloud-api's ingress socket. cloud-api itself has no login other than
+                OIDC, so these rules aren't what keeps it safe; it also drops client-sent
+                `X-Auth-Request-*` headers, which nothing reads any more.
 
                 For a monitor, `GET /.well-known/openid-configuration` needs no login and
                 cloud-api answers it from memory, so a 200 means Caddy, the socket and
@@ -72,10 +73,8 @@ in {
         reverse_proxy ${sock "cloud-api"}
       }
 
-      # The header-trust login routes would believe any X-Auth-Request-* header, and
-      # nothing in front of them vouches for one, so they stay unreachable.
-      @blocked path /oauth/* /oauth2/* /enroll* /local/* /internal/* /selfhost/login /selfhost/access-token
-      handle @blocked {
+      # cloud-api's own health check and peer RPC; neither is for the public.
+      handle /internal/* {
         respond 404
       }
 

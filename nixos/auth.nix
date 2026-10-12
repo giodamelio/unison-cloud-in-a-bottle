@@ -193,7 +193,7 @@ in {
       }
     ];
 
-    # cloud-api is the OIDC client (cloud-api patch 0008): it runs the login against the
+    # cloud-api is the OIDC client (cloud-api patch 0007): it runs the login against the
     # provider, provisions the user, and serves ucm's authorization endpoints itself.
     # Without a bridge, an external provider is out on the network, which only egress
     # users may reach.

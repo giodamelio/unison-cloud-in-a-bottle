@@ -88,7 +88,7 @@ in {
       ui = "ui.example.com";
     };
 
-    # Your Caddy serves the three sites; the bodies carry every routing and security rule.
+    # Your Caddy serves the three sites from the module's site bodies.
     caddy.enable = false;
 
     auth = {
@@ -152,7 +152,7 @@ in {
 
 Here's what each piece expects from the host:
 
-- **Caddy.** It must run as group `caddy`, or set `ingressGroup` to its group. The sockets under `/run/unison-cloud/` trust identity headers, so nothing else may be in that group. Point a monitor at `https://cloud.example.com/.well-known/openid-configuration`. It needs no login, and a 200 means Caddy and cloud-api are up.
+- **Caddy.** It must run as group `caddy`, or set `ingressGroup` to its group. The sockets under `/run/unison-cloud/` reach cloud-api's `/internal/*` routes, which Caddy keeps private, so keep that group to Caddy. They grant no login: cloud-api only logs you in through OIDC. Point a monitor at `https://cloud.example.com/.well-known/openid-configuration`. It needs no login, and a 200 means Caddy and cloud-api are up.
 - **The login provider.** Give it a confidential client with the redirect URI `https://cloud.example.com/selfhost/oidc/callback`. cloud-api still checks every ID token's `iss` against the public issuer.
 - **PostgreSQL.** The module creates `unison-cloud-api` and `unison-cloud-extenddb` roles, both `NOSUPERUSER` and `NOCREATEROLE`, and their databases, then logs in over `/run/postgresql` with peer authentication. It never touches `pg_hba.conf`, so keep a rule that lets those system users log in as their own roles. NixOS's default `local all all peer` does.
 - **S3.** Create both buckets and a key that can read and write them. Requests through the bridge keep the `Host` header the clients sign, `<bucket>.<host>:7070`, so the store must accept a non-default port there. Garage does.
@@ -263,11 +263,11 @@ cloud-api (`patches/cloud-api/`):
 - `0001-remove-unused-api-types`: Drops two unused API type aliases.
 - `0002-production-mode-fixes`: Lets you set the S3 endpoint and addressing style, and makes the email service optional.
 - `0003-vault-to-postgres`: Replaces Vault with a Postgres table for environment secrets, served over the bit of Vault's API that nimbus uses.
-- `0004-header-trust-login`: Adds a self-hosted login that trusts identity headers from a reverse proxy and auto-provisions users.
-- `0005-session-error-redirect`: Sends login errors to your own UI instead of `app.unison.cloud`.
-- `0006-environment-access-check`: Actually rejects the request when the environment access check fails, instead of ignoring the result.
-- `0007-cookie-secure-from-origin`: Sets the cookie `Secure` flag from the API's scheme, so login works over plain HTTP.
-- `0008-oidc-broker`: Makes cloud-api an OIDC client of Dex or any other provider, and the login server `ucm auth.login` talks to.
+- `0004-selfhost-user-provisioning`: Creates a cloud-api user the first time an OIDC identity logs in, keyed on the provider's subject, and enrolls it in the default tier.
+- `0005-environment-access-check`: Actually rejects the request when the environment access check fails, instead of ignoring the result.
+- `0006-cookie-secure-from-origin`: Sets the cookie `Secure` flag from the API's scheme, so login works over plain HTTP.
+- `0007-oidc-broker`: Makes cloud-api an OIDC client of Dex or any other provider, and the login server `ucm auth.login` talks to. It's the only way to log in.
+- `0008-remove-unauthenticated-routes`: Removes the routes that answer without a real login, so nothing on the host can reach cloud-api's port and become a user or change state. That covers the Share login (`/login`, `/oauth/redirect`, `/enroll`), the credential-free `/local/*` logins, the Stripe webhook (its secret is a public placeholder), and the `/internal` lookups nimbus replaced with `/v2/cluster`. `/internal/invalidate` now refuses every call when its token is unset.
 
 unison-cloud-ui (`patches/cloud-ui/`):
 

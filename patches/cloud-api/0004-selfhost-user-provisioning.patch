@@ -1,0 +1,162 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -20,6 +20,7 @@
+ import Cloud.Prelude
+ import Cloud.Stripe.API (StripeConfig (..))
+ import Cloud.User.Env (AuthEnv (..))
++import Cloud.User.Types (CloudTier (..))
+ import Cloud.Utils.Logging qualified as Logging
+ import Control.Lens ((.~))
+ import Data.ByteString.Char8 qualified as BS
+@@ -255,6 +256,10 @@
+ 
+   envClusters <- TMap.newIO
+   envAPISuffix <- fromEnv "CLOUD_API_SUFFIX" (pure . Right . Text.pack)
++  envSelfHostDefaultTier <- fromEnv "CLOUD_SELFHOST_DEFAULT_TIER" \case
++    "free" -> pure (Right Free)
++    "starter" -> pure (Right Starter)
++    other -> pure (Left ("must be free or starter, got " <> other))
+ 
+   let postgresEnv = PostgresEnv {..}
+   let clusterEnv = ClusterEnv {..}
+--- a/cloud.cabal
++++ b/cloud.cabal
+@@ -87,6 +87,7 @@
+       Cloud.Postgres.Queries.User
+       Cloud.Prelude
+       Cloud.Prelude.Orphans
++      Cloud.SelfHost.Provision
+       Cloud.SelfHost.Secrets.Listener
+       Cloud.SelfHost.Secrets.Queries
+       Cloud.Service.API
+--- a/docker/sql/2099-01-02-00_selfhost_oidc_identities.sql
++++ b/docker/sql/2099-01-02-00_selfhost_oidc_identities.sql
+@@ -0,0 +1,17 @@
++CREATE SCHEMA IF NOT EXISTS selfhost;
++
++-- Keyed on the provider's subject, not the username, so renaming yourself at the
++-- provider never maps you onto someone else's account.
++CREATE TABLE selfhost.oidc_identities (
++  issuer text NOT NULL,
++  subject text NOT NULL,
++  user_id uuid NOT NULL REFERENCES public.users (id) ON DELETE CASCADE,
++  created_at timestamptz NOT NULL DEFAULT now(),
++  PRIMARY KEY (issuer, subject)
++);
++
++-- Upstream only seeds cloud_tiers from its test fixtures, and the fake Starter
++-- subscription given to new users needs the Starter tier's product ID.
++INSERT INTO public.cloud_tiers (stripe_product_id, name, default_stripe_price_id)
++  VALUES ('prod_selfhost_starter', 'Starter', 'price_selfhost_starter')
++  ON CONFLICT DO NOTHING;
+--- a/src/Cloud/Env.hs
++++ b/src/Cloud/Env.hs
+@@ -11,6 +11,7 @@
+ import Cloud.Prelude
+ import Cloud.Stripe.API (StripeConfig)
+ import Cloud.User.Env (AuthEnv)
++import Cloud.User.Types (CloudTier)
+ import Cloud.Utils.Logging.Types qualified as Logging
+ import Database.Redis qualified as R
+ import Network.Socket (HostName, ServiceName)
+@@ -48,6 +49,7 @@
+     envRequestCtx :: reqCtx,
+     envSentryService :: SentryService,
+     envServerPort :: Int,
++    envSelfHostDefaultTier :: CloudTier,
+     envZendeskAuth :: S.BasicAuthData,
+     envStripeConfig :: StripeConfig
+   }
+--- a/src/Cloud/SelfHost/Provision.hs
++++ b/src/Cloud/SelfHost/Provision.hs
+@@ -0,0 +1,90 @@
++module Cloud.SelfHost.Provision
++  ( Identity (..),
++    ProvisionError (..),
++    provisionUser,
++  )
++where
++
++import Cloud.Postgres qualified as PG
++import Cloud.Postgres.Queries qualified as Q
++import Cloud.Prelude
++import Cloud.User.Types (CloudTier (..))
++import Cloud.Utils (isValidDNSName)
++import Control.Monad (unless)
++import Control.Monad.Except (runExceptT, throwError)
++import Control.Monad.Trans (lift)
++import Crypto.Hash (Digest, MD5, hash)
++import Data.Char qualified as Char
++import Data.Text qualified as Text
++import Data.Text.Encoding (encodeUtf8)
++import Share.OAuth.Types (UserId)
++
++-- | An identity verified by the OIDC provider.
++data Identity = Identity
++  { issuer :: Text,
++    subject :: Text,
++    preferredUsername :: Maybe Text,
++    email :: Maybe Text
++  }
++
++data ProvisionError
++  = MissingClaim Text
++  | InvalidHandle Text
++  | HandleTaken Text
++  | UnsupportedTier CloudTier
++  deriving stock (Show)
++
++-- | Finds or creates the user for an identity, and makes sure they're enrolled in the tier.
++--
++-- Every error is raised before the first write, so the caller's transaction can commit either way.
++provisionUser :: CloudTier -> Identity -> PG.Transaction e (Either ProvisionError UserId)
++provisionUser tier Identity {issuer, subject, preferredUsername, email} = runExceptT do
++  enroll <- case tier of
++    Free -> pure Q.addToFreeTier
++    Starter -> pure \userId -> Q.userByUserId userId >>= maybe (error "provisionUser: user vanished mid-transaction") Q.addToPaidTier
++    Pro -> throwError (UnsupportedTier tier)
++  existing <-
++    lift $
++      PG.query1Col
++        [PG.sql|
++            SELECT user_id FROM selfhost.oidc_identities
++              WHERE issuer = #{issuer} AND subject = #{subject}
++          |]
++  userId <- maybe createUser pure existing
++  lift do
++    enroll userId
++    -- Upstream grants daemons only to paying users and the cloud org; self-hosted users all get them.
++    PG.execute_
++      [PG.sql|
++          INSERT INTO cloud_daemon_users (id) VALUES (#{userId})
++            ON CONFLICT DO NOTHING
++        |]
++  pure userId
++  where
++    createUser = do
++      username <- maybe (throwError (MissingClaim "preferred username")) pure preferredUsername
++      primaryEmail <- maybe (throwError (MissingClaim "email")) pure email
++      let handle = Text.toLower username
++      -- Handles end up as DNS labels in service hostnames.
++      unless (Text.all Char.isAscii handle && isValidDNSName handle) $ throwError (InvalidHandle handle)
++      taken <- lift $ PG.queryExpect1Col [PG.sql| SELECT EXISTS (SELECT 1 FROM users WHERE handle = #{handle}) |]
++      when taken $ throwError (HandleTaken handle)
++      -- cloud-api decodes avatar_url as non-null, so every user needs one.
++      let avatarUrl = "https://www.gravatar.com/avatar/" <> tshow (gravatarHash primaryEmail) <> "?d=identicon"
++      lift do
++        userId <-
++          PG.queryExpect1Col
++            [PG.sql|
++                INSERT INTO users (primary_email, email_verified, avatar_url, handle)
++                  VALUES (#{primaryEmail}, true, #{avatarUrl}, #{handle})
++                  RETURNING id
++              |]
++        PG.execute_
++          [PG.sql|
++              INSERT INTO selfhost.oidc_identities (issuer, subject, user_id)
++                VALUES (#{issuer}, #{subject}, #{userId})
++            |]
++        pure userId
++
++    gravatarHash :: Text -> Digest MD5
++    gravatarHash = hash . encodeUtf8 . Text.toLower . Text.strip

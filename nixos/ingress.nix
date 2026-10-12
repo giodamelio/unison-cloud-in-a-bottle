@@ -19,9 +19,10 @@ in {
       description = ''
         Group that may open the ingress sockets under `${dir}/`.
 
-        cloud-api trusts the `X-Auth-Request-*` identity headers on its login routes,
-        so only the reverse proxy may be in this group. Any other member can open the
-        sockets and log in as anyone.
+        Members reach cloud-api and Dex without Caddy's rules in between. cloud-api has no
+        route that logs anyone in without the OIDC login, so membership grants no identity,
+        but it does reach `/internal/*`, which Caddy keeps private. Keep the group to the
+        reverse proxy.
       '';
     };
 

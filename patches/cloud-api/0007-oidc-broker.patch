@@ -8,7 +8,7 @@
  import Cloud.Stripe.API (StripeConfig (..))
  import Cloud.User.Env (AuthEnv (..))
  import Cloud.User.Types (CloudTier (..))
-@@ -264,6 +265,7 @@
+@@ -263,6 +264,7 @@
      "free" -> pure (Right Free)
      "starter" -> pure (Right Starter)
      other -> pure (Left ("must be free or starter, got " <> other))
@@ -18,10 +18,10 @@
    let clusterEnv = ClusterEnv {..}
 --- a/cloud.cabal
 +++ b/cloud.cabal
-@@ -89,9 +89,15 @@
+@@ -87,9 +87,15 @@
+       Cloud.Postgres.Queries.User
+       Cloud.Prelude
        Cloud.Prelude.Orphans
-       Cloud.SelfHost.HeaderAuth
-       Cloud.SelfHost.HeaderAuth.API
 +      Cloud.SelfHost.Oidc
 +      Cloud.SelfHost.Oidc.API
 +      Cloud.SelfHost.Oidc.Config
@@ -44,111 +44,14 @@
  import Cloud.Stripe.API (StripeConfig)
  import Cloud.User.Env (AuthEnv)
  import Cloud.User.Types (CloudTier)
-@@ -51,6 +52,7 @@
+@@ -50,6 +51,7 @@
+     envSentryService :: SentryService,
      envServerPort :: Int,
-     envSelfHostOidcIssuer :: Text,
      envSelfHostDefaultTier :: CloudTier,
 +    envSelfHostOidc :: Maybe OidcConfig,
      envZendeskAuth :: S.BasicAuthData,
      envStripeConfig :: StripeConfig
    }
---- a/src/Cloud/SelfHost/HeaderAuth.hs
-+++ b/src/Cloud/SelfHost/HeaderAuth.hs
-@@ -14,24 +14,16 @@
- import Cloud.Prelude
- import Cloud.SelfHost.HeaderAuth.API (API)
- import Cloud.SelfHost.Provision (Identity (..), ProvisionError (..), provisionUser)
--import Cloud.User.App (authM)
--import Cloud.User.Env (AuthEnv (..))
--import Cloud.User.Impl (enlilAud, enlilIssuer)
-+import Cloud.SelfHost.Tokens (accessToken, cloudUIReturnTarget, sessionCookie)
- import Cloud.Utils.Logging qualified as Logging
--import Cloud.Web.App (WebApp, isCloudUILink)
--import Cloud.Web.Local.Impl (AccessTokenClaims (..), newStandardClaims, signJWT)
-+import Cloud.Web.App (WebApp)
- import Control.Monad.Random (randomIO)
--import Control.Monad.Reader (ask, asks)
--import Data.ByteString.Lazy (fromStrict)
-+import Control.Monad.Reader (asks)
- import Data.Set qualified as Set
--import Data.Text.Encoding (encodeUtf8)
--import Data.Time (NominalDiffTime, addUTCTime, nominalDay)
- import Servant
- import Share.JWT qualified as ShareJWT
- import Share.OAuth.Scopes (Scopes (..))
- import Share.OAuth.Scopes qualified as Scopes
--import Share.OAuth.Session (Session (..))
--import Share.OAuth.Session qualified as Session
- import Share.OAuth.Types (UserId)
- import Share.Utils.Servant.Cookies qualified as Cookies
- import Share.Utils.URI (URIParam (..))
-@@ -39,34 +31,17 @@
- data HeaderAuthError
-   = MissingUserHeader
-   | ProvisionFailed ProvisionError
--  | SigningFailed Text
- 
- instance Logging.Loggable HeaderAuthError where
-   toLog = \case
-     MissingUserHeader -> Logging.withSeverity Logging.UserFault $ Logging.textLog "selfhost login without X-Auth-Request-User"
-     ProvisionFailed err -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "selfhost login failed: " <> tshow err
--    SigningFailed err -> Logging.withSeverity Logging.Error . Logging.textLog $ "selfhost login failed to sign a token: " <> err
- 
- instance ToServerError HeaderAuthError where
-   toServerError = \case
-     MissingUserHeader ->
-       (ErrorID "selfhost:unauthenticated", err401 {errBody = "Missing X-Auth-Request-User: this endpoint must sit behind the login proxy."})
--    ProvisionFailed err -> case err of
--      MissingClaim claim ->
--        (ErrorID "selfhost:missing-claim", err403 {errBody = "The identity provider didn't supply your " <> encode claim <> ", which a new account needs."})
--      InvalidHandle handle ->
--        (ErrorID "selfhost:invalid-handle", err403 {errBody = "Your username " <> encode handle <> " isn't a valid handle: it must start with a letter and contain only letters, digits and hyphens, at most 63 characters."})
--      HandleTaken handle ->
--        (ErrorID "selfhost:handle-taken", err409 {errBody = "The handle " <> encode handle <> " already belongs to another account."})
--      UnsupportedTier tier ->
--        (ErrorID "selfhost:unsupported-tier", err500 {errBody = "Unsupported default tier " <> encode (tshow tier) <> "."})
--    SigningFailed _ -> (ErrorID "selfhost:signing-failed", err500)
--    where
--      encode = fromStrict . encodeUtf8
--
---- | Shorter than the 300 days of the local-only tokens, since tokens can't be revoked.
--accessTokenTTL :: NominalDiffTime
--accessTokenTTL = 30 * nominalDay
-+    ProvisionFailed err -> toServerError err
- 
- server :: ServerT API WebApp
- server userHeader usernameHeader emailHeader =
-@@ -83,27 +58,13 @@
-     loginEndpoint :: Maybe URIParam -> WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
-     loginEndpoint returnTo = do
-       userId <- provision
--      iss <- enlilIssuer
--      aud <- enlilAud
--      session <- Session.createSession iss (Set.singleton aud) userId
--      -- share-auth's sessions last a year; bound the cookie's JWT like the access tokens.
--      let session' = session {sessionExpiry = addUTCTime accessTokenTTL (sessionCreated session)}
--      cookie <- authM do
--        AuthEnv {envSessionCookieName, envCookieSettings, envJwtSettings} <- ask
--        ShareJWT.createSignedCookie envJwtSettings envCookieSettings envSessionCookieName session'
--      setCookie <- either (respondError . SigningFailed . tshow) pure cookie
--      uiOrigin <- asks envCloudUiOrigin
--      -- Like the Share login callback, only return to the cloud UI, never an arbitrary site.
--      target <- case returnTo of
--        Just (URIParam uri) -> isCloudUILink uri <&> \valid -> if valid then uri else uiOrigin
--        Nothing -> pure uiOrigin
-+      setCookie <- sessionCookie userId
-+      target <- cloudUIReturnTarget (unpackURI <$> returnTo)
-       pure $ addHeader setCookie (addHeader (show target) NoContent)
- 
-     accessTokenEndpoint :: WebApp Text
-     accessTokenEndpoint = do
-       userId <- provision
-       sessionId <- randomIO
--      aud <- enlilAud
--      standardClaims <- newStandardClaims aud userId accessTokenTTL sessionId
--      signed <- signJWT AccessTokenClaims {standardClaims, scope = Scopes (Set.fromList [Scopes.OpenId, Scopes.Cloud])}
-+      signed <- accessToken userId sessionId (Scopes (Set.fromList [Scopes.OpenId, Scopes.Cloud]))
-       pure (ShareJWT.signedJWTToText signed)
 --- a/src/Cloud/SelfHost/Oidc/API.hs
 +++ b/src/Cloud/SelfHost/Oidc/API.hs
 @@ -0,0 +1,113 @@
@@ -987,9 +890,8 @@
  -- Every error is raised before the first write, so the caller's transaction can commit either way.
 --- a/src/Cloud/SelfHost/Tokens.hs
 +++ b/src/Cloud/SelfHost/Tokens.hs
-@@ -0,0 +1,70 @@
-+-- | Session cookies and access tokens for self-hosted logins, shared by the header-trust
-+-- endpoints and the OIDC broker.
+@@ -0,0 +1,69 @@
++-- | Session cookies and access tokens for self-hosted logins.
 +module Cloud.SelfHost.Tokens
 +  ( TokenError (..),
 +    accessTokenTTL,
@@ -1060,36 +962,36 @@
 +    Nothing -> pure uiOrigin
 --- a/src/Cloud/Web/API.hs
 +++ b/src/Cloud/Web/API.hs
-@@ -38,6 +38,7 @@
+@@ -37,6 +37,7 @@
+ import Share.Utils.URI (URIParam)
  import Stripe.Concepts (CouponId)
  import Cloud.Web.Cluster.API (ClusterAPI)
- import Cloud.SelfHost.HeaderAuth.API qualified as SelfHost
 +import Cloud.SelfHost.Oidc.API qualified as Oidc
  
  type API = ServiceProviderAPI :<|> CloudAPI
  
-@@ -74,6 +75,7 @@
+@@ -72,6 +73,7 @@
+     :<|> ("local" :> Local.API)
      :<|> ("enroll" :> EnrollFreeTierEndpoint)
      :<|> (".well-known" :> "jwks.json" :> JWKSEndpoint)
-     :<|> ("selfhost" :> SelfHost.API)
 +    :<|> Oidc.API
  
  data CustomerInfo = CustomerInfo
    { customerInfoName :: !Text,
 --- a/src/Cloud/Web/Impl.hs
 +++ b/src/Cloud/Web/Impl.hs
-@@ -32,6 +32,7 @@
+@@ -31,6 +31,7 @@
+ import Cloud.Postgres.Ops (saveStripeEvent)
  import Cloud.Postgres.Ops qualified as PGO
  import Cloud.Postgres.Queries qualified as Q
- import Cloud.SelfHost.HeaderAuth qualified as SelfHost
 +import Cloud.SelfHost.Oidc qualified as Oidc
  import Cloud.Prelude
  import Cloud.Service.Impl (servicesV1Endpoint, servicesV2Endpoint)
  import Cloud.Service.Types
-@@ -164,6 +165,7 @@
+@@ -162,6 +163,7 @@
+     :<|> Local.server
      :<|> enrollFreeTierEndpoint envIdentityProvider envSpConfig
      :<|> jwksEndpoint
-     :<|> SelfHost.server
 +    :<|> Oidc.server
    where
      serviceProviderEndpoints = Auth.serviceProviderServer envIdentityProvider envSpConfig mySessionCallback
