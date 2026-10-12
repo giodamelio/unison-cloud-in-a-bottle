@@ -8,6 +8,7 @@
   user = "unison-cloud-api";
   psql = "${pkgs.postgresql}/bin/psql";
   inherit (cfg) s3;
+  secret = cfg.internal.secretPath;
 
   # libpq's environment variables configure every client here: psql in the migrate and
   # seed units, and cloud-api's connection string, assembled at start.
@@ -18,7 +19,7 @@
     PGUSER = cfg.database.cloudApi.user;
   };
   exportPassword = ''
-    PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/cloud-api-db-password")
+    PGPASSWORD=$(< "${secret "cloud-api-db-password"}")
     export PGPASSWORD
   '';
 
@@ -100,24 +101,23 @@
   sentry = cfg.secrets.files ? sentry-dsn || cfg.secrets.credentials ? sentry-dsn;
 
   start = pkgs.writeShellScript "unison-cloud-api-start" ''
-    creds=$CREDENTIALS_DIRECTORY
-    export AWS_ACCESS_KEY_ID=$(< "$creds/s3-access-key-id")
-    export AWS_SECRET_ACCESS_KEY=$(< "$creds/s3-secret-access-key")
-    export CLOUD_EDDSA_KEY=$(< "$creds/cloud-eddsa-key")
-    export SHARE_EDDSA_KEY=$(< "$creds/share-eddsa-key")
-    export CLOUD_HMAC_KEY=$(< "$creds/cloud-hmac-key")
-    export CLOUD_INTERNAL_AUTH_TOKEN=$(< "$creds/internal-auth-token")
-    export CONSUL_HTTP_TOKEN=$(< "$creds/consul-token")
-    export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/oidc-client-secret")
+    export AWS_ACCESS_KEY_ID=$(< "${secret "s3-access-key-id"}")
+    export AWS_SECRET_ACCESS_KEY=$(< "${secret "s3-secret-access-key"}")
+    export CLOUD_EDDSA_KEY=$(< "${secret "cloud-eddsa-key"}")
+    export SHARE_EDDSA_KEY=$(< "${secret "share-eddsa-key"}")
+    export CLOUD_HMAC_KEY=$(< "${secret "cloud-hmac-key"}")
+    export CLOUD_INTERNAL_AUTH_TOKEN=$(< "${secret "internal-auth-token"}")
+    export CONSUL_HTTP_TOKEN=$(< "${secret "consul-token"}")
+    export CLOUD_OIDC_CLIENT_SECRET=$(< "${secret "oidc-client-secret"}")
     CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
     # libpq keyword values are single-quoted, with backslash and quote escaped.
-    password=$(< "$creds/cloud-api-db-password")
+    password=$(< "${secret "cloud-api-db-password"}")
     password=''${password//\\/\\\\}
     password=''${password//\'/\\\'}
     CLOUD_POSTGRES="$CLOUD_POSTGRES password='$password'"
     export CLOUD_POSTGRES
     ${lib.optionalString sentry ''
-      CLOUD_SENTRY_DSN=$(< "$creds/sentry-dsn")
+      CLOUD_SENTRY_DSN=$(< "${secret "sentry-dsn"}")
       export CLOUD_SENTRY_DSN
     ''}
     exec ${lib.getExe' cfg.cloudApi.package "cloud-exe"}
@@ -226,7 +226,7 @@ in {
             ExecStart = pkgs.writeShellScript "unison-cloud-seed" ''
               ${exportPassword}
               ${psql} -X -q -v ON_ERROR_STOP=1 -1 \
-                -v token="$(< "$CREDENTIALS_DIRECTORY/cluster-token")" -f ${seedSql}
+                -v token="$(< "${secret "cluster-token"}")" -f ${seedSql}
             '';
           }
         ];

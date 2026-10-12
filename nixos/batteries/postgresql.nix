@@ -42,7 +42,7 @@
   roleSql = name: credential: ''
     SELECT format('CREATE ROLE %I', '${name}') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${name}') \gexec
     ALTER ROLE "${name}" LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS;
-    \set password `${pkgs.coreutils}/bin/cat "$CREDENTIALS_DIRECTORY/${credential}"`
+    \set password `${pkgs.coreutils}/bin/cat "${cfg.internal.secretPath credential}"`
     ALTER ROLE "${name}" PASSWORD :'password';
   '';
   databaseSql = name: database: ''

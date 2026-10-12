@@ -30,7 +30,7 @@
       local method=$1 path=$2
       shift 2
       curl -sS --fail-with-body --retry 10 --retry-connrefused -X "$method" \
-        -H @<(printf 'X-Consul-Token: %s\n' "$(< "$CREDENTIALS_DIRECTORY/consul-token")") \
+        -H @<(printf 'X-Consul-Token: %s\n' "$(< "${cfg.internal.secretPath "consul-token"}")") \
         "${cfg.consul.address}$path" "$@"
     }
   '';

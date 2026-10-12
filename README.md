@@ -128,15 +128,15 @@ in {
     database.host = "127.0.0.1";
     logs.lokiUrl = "http://127.0.0.1:3100";
 
-    # Each encrypted under its own name, for example
-    # systemd-creds encrypt --name=oidc-client-secret - /etc/credstore.encrypted/unison-cloud-oidc-client-secret
+    # Each encrypted under its own credstore name, or with no --name at all, for example
+    # systemd-creds encrypt - /etc/credstore.encrypted/unison_cloud_oidc_client_secret
     secrets.credentials = {
-      oidc-client-secret = "unison-cloud-oidc-client-secret";
-      s3-access-key-id = "unison-cloud-s3-access-key-id";
-      s3-secret-access-key = "unison-cloud-s3-secret-access-key";
-      cloud-api-db-password = "unison-cloud-cloud-api-db-password";
-      nimbus-db-password = "unison-cloud-nimbus-db-password";
-      consul-token = "unison-cloud-consul-token";
+      oidc-client-secret = "unison_cloud_oidc_client_secret";
+      s3-access-key-id = "unison_cloud_s3_access_key_id";
+      s3-secret-access-key = "unison_cloud_s3_secret_access_key";
+      cloud-api-db-password = "unison_cloud_cloud_api_db_password";
+      nimbus-db-password = "unison_cloud_nimbus_db_password";
+      consul-token = "unison_cloud_consul_token";
     };
   };
 
@@ -186,8 +186,8 @@ Then supply the token's secret ID as `consul-token`. cloud-api talks to the host
 
 ```nix
 services.unison-cloud = {
-  # Encrypted with --name=consul-token.
-  secrets.credentials.consul-token = "unison-cloud-consul-token";
+  # Encrypted under its credstore name, or with no --name at all.
+  secrets.credentials.consul-token = "unison_cloud_consul_token";
 };
 ```
 

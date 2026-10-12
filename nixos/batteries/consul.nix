@@ -10,6 +10,7 @@
   dataDir = "${cfg.stateDir}/consul";
   address = "http://127.0.0.1:${toString battery.port}";
   clients = ["unison-cloud-consul-services.service"] ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service";
+  secret = cfg.internal.secretPath;
 
   # What a client agent needs to register its own node and sync its services.
   agentPolicy = pkgs.writeText "unison-cloud-consul-agent-policy.hcl" ''
@@ -45,8 +46,8 @@
   # instead of the one in the Nix store.
   writeTokens = pkgs.writeShellScript "unison-cloud-consul-tokens" ''
     ${lib.getExe pkgs.jq} -n \
-      --rawfile management "$CREDENTIALS_DIRECTORY/consul-management-token" \
-      --rawfile agent "$CREDENTIALS_DIRECTORY/consul-agent-token" \
+      --rawfile management "${secret "consul-management-token"}" \
+      --rawfile agent "${secret "consul-agent-token"}" \
       '{acl: {tokens: {initial_management: ($management | rtrimstr("\n")), agent: ($agent | rtrimstr("\n"))}}}' \
       > "$RUNTIME_DIRECTORY/tokens.json"
   '';
@@ -58,14 +59,18 @@
     name = "unison-cloud-consul-acl";
     runtimeInputs = [pkgs.curl pkgs.jq];
     text = ''
-      creds=$CREDENTIALS_DIRECTORY
+      declare -A creds=(
+        [consul-management-token]="${secret "consul-management-token"}"
+        [consul-agent-token]="${secret "consul-agent-token"}"
+        [consul-token]="${secret "consul-token"}"
+      )
 
       # The header comes from a pipe so no token appears in a command line.
       consul() {
         local token=$1 method=$2 path=$3
         shift 3
         curl -sS --fail-with-body -X "$method" \
-          -H @<(printf 'X-Consul-Token: %s\n' "$(< "$creds/$token")") \
+          -H @<(printf 'X-Consul-Token: %s\n' "$(< "''${creds[$token]}")") \
           "${address}$path" "$@"
       }
 
@@ -86,7 +91,7 @@
       ensure_token() {
         local token=$1 policy=$2 description=$3
         if ! consul "$token" GET /v1/acl/token/self -o /dev/null 2> /dev/null; then
-          jq -n --rawfile secret "$creds/$token" --arg policy "$policy" --arg description "$description" \
+          jq -n --rawfile secret "''${creds[$token]}" --arg policy "$policy" --arg description "$description" \
             '{SecretID: ($secret | rtrimstr("\n")), Description: $description, Policies: [{Name: $policy}]}' |
             consul consul-management-token PUT /v1/acl/token --data @- > /dev/null
         fi

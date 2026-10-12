@@ -57,7 +57,7 @@
         users}
       jq \
         --argjson passwords "$passwords" \
-        --arg secret "$(< /run/credentials/unison-cloud-dex.service/oidc-client-secret)" \
+        --arg secret "$(< /run/credentials/unison-cloud-dex.service/${baseNameOf (cfg.internal.secretPath "oidc-client-secret")})" \
         '. + {staticPasswords: $passwords, staticClients: [{
           id: "cloud-api",
           name: "Unison Cloud",

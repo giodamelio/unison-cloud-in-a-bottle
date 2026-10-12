@@ -140,11 +140,11 @@ in {
 
       secrets.credentials = {
         oidc-client-secret = "unison-cloud-oidc-client-secret";
-        s3-access-key-id = "unison-cloud-s3-access-key-id";
-        s3-secret-access-key = "unison-cloud-s3-secret-access-key";
+        s3-access-key-id = "unison_cloud_s3_access_key_id";
+        s3-secret-access-key = "unison_cloud_s3_secret_access_key";
         cloud-api-db-password = "unison-cloud-cloud-api-db-password";
-        nimbus-db-password = "unison-cloud-nimbus-db-password";
-        consul-token = "unison-cloud-consul-token";
+        nimbus-db-password = "/etc/credstore.encrypted/unison_cloud_nimbus_db_password";
+        consul-token = "unison_cloud_consul_token";
       };
     };
 
@@ -318,15 +318,17 @@ in {
       };
       script = ''
         mkdir -p /etc/credstore.encrypted
+        # Each under its own credstore name, as a secret manager with one namespace per host does.
         encrypt() {
-          printf %s "$3" | ${config.systemd.package}/bin/systemd-creds encrypt --with-key=host --name="$1" - "/etc/credstore.encrypted/$2"
+          printf %s "$2" | ${config.systemd.package}/bin/systemd-creds encrypt --with-key=host --name="$1" - "/etc/credstore.encrypted/$1"
         }
-        encrypt oidc-client-secret unison-cloud-oidc-client-secret ${oidcClientSecret}
-        encrypt s3-access-key-id unison-cloud-s3-access-key-id ${s3KeyId}
-        encrypt s3-secret-access-key unison-cloud-s3-secret-access-key ${s3Secret}
-        encrypt cloud-api-db-password unison-cloud-cloud-api-db-password ${dbPasswords.cloudApi}
-        encrypt nimbus-db-password unison-cloud-nimbus-db-password ${dbPasswords.nimbus}
-        encrypt consul-token unison-cloud-consul-token ${consulTokens.unisonCloud}
+        encrypt unison-cloud-oidc-client-secret ${oidcClientSecret}
+        encrypt unison_cloud_s3_access_key_id ${s3KeyId}
+        encrypt unison_cloud_s3_secret_access_key ${s3Secret}
+        encrypt unison-cloud-cloud-api-db-password ${dbPasswords.cloudApi}
+        encrypt unison_cloud_consul_token ${consulTokens.unisonCloud}
+        # Without --name, systemd-creds names the credential after its file.
+        printf %s ${dbPasswords.nimbus} | ${config.systemd.package}/bin/systemd-creds encrypt --with-key=host - /etc/credstore.encrypted/unison_cloud_nimbus_db_password
       '';
     };
 
@@ -558,6 +560,10 @@ in {
             machine.fail(f"systemctl cat {unit}.service")
         generated = sorted(machine.succeed(f"ls {secrets}").split())
         assert generated == ["cloud-eddsa-key", "cloud-hmac-key", "cluster-token", "internal-auth-token", "share-eddsa-key"], generated
+
+    with subtest("every unit that decrypts a credential under its credstore name or file basename starts"):
+        for unit in ["unison-cloud-nimbus-storage.service", "unison-cloud-consul-services.service", "unison-cloud-api.service", interactive_unit]:
+            machine.succeed(f"systemctl is-active {unit}")
 
     with subtest("credential-supplied secrets are never written in plaintext"):
         machine.fail("grep -rqs ${s3Secret} /var/lib/unison-cloud /etc/credstore.encrypted")

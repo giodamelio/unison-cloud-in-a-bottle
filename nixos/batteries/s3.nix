@@ -97,8 +97,8 @@ in {
             # The sidecar directory holds object metadata, so the data directory needs no
             # extended-attribute support.
             ExecStart = pkgs.writeShellScript "unison-cloud-s3" ''
-              ROOT_ACCESS_KEY=$(< "$CREDENTIALS_DIRECTORY/s3-access-key-id") \
-              ROOT_SECRET_KEY=$(< "$CREDENTIALS_DIRECTORY/s3-secret-access-key") \
+              ROOT_ACCESS_KEY=$(< "${cfg.internal.secretPath "s3-access-key-id"}") \
+              ROOT_SECRET_KEY=$(< "${cfg.internal.secretPath "s3-secret-access-key"}") \
                 exec ${lib.getExe pkgs.versitygw} \
                   --port 127.0.0.1:${toString battery.port} \
                   --virtual-domain ${domain} \

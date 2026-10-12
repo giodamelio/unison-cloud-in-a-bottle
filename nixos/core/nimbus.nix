@@ -14,6 +14,7 @@
     table = "nimbus_kv";
   };
   dbPassword = cfg.internal.loadSecrets ["nimbus-db-password"];
+  secret = cfg.internal.secretPath;
 
   createTable = pkgs.writeText "unison-cloud-nimbus-storage.sql" ''
     CREATE TABLE IF NOT EXISTS ${db.table} (
@@ -132,11 +133,10 @@
   renderConfig = node:
     pkgs.writeShellScript "unison-cloud-nimbus-${node.name}-config" ''
       umask 077
-      creds=$CREDENTIALS_DIRECTORY
       ${lib.getExe pkgs.jq} \
-        --rawfile s3Id "$creds/s3-access-key-id" --rawfile s3Secret "$creds/s3-secret-access-key" \
-        --rawfile dbPassword "$creds/nimbus-db-password" \
-        --rawfile token "$creds/cluster-token" \
+        --rawfile s3Id "${secret "s3-access-key-id"}" --rawfile s3Secret "${secret "s3-secret-access-key"}" \
+        --rawfile dbPassword "${secret "nimbus-db-password"}" \
+        --rawfile token "${secret "cluster-token"}" \
         'def trim: rtrimstr("\n");
          def s3: {awsConfig: {credentials: {accessKey: ($s3Id | trim), secretKey: ($s3Secret | trim)}}};
          . * {
@@ -341,7 +341,7 @@ in {
                 User = user;
                 Group = user;
                 ExecStart = pkgs.writeShellScript "unison-cloud-nimbus-storage" ''
-                  PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/nimbus-db-password")
+                  PGPASSWORD=$(< "${secret "nimbus-db-password"}")
                   export PGPASSWORD
                   ${pkgs.postgresql}/bin/psql -X -q -v ON_ERROR_STOP=1 -f ${createTable}
                 '';

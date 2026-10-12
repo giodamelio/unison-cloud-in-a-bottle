@@ -61,6 +61,22 @@
   noDatabase = eval {services.unison-cloud.database.host = lib.mkForce null;};
   nimbusOnLoopback = eval {services.unison-cloud.cloudApi.enable = false;};
   noConsulToken = eval {services.unison-cloud.secrets.files = lib.mkForce (files (lib.remove "consul-token" suppliedSecrets));};
+  withCredentials = credentials:
+    eval {
+      services.unison-cloud.secrets = {
+        files = lib.mkForce (files (lib.subtractLists (lib.attrNames credentials) suppliedSecrets));
+        inherit credentials;
+      };
+    };
+  credstoreNames = withCredentials {
+    s3-access-key-id = "unison_cloud_s3_access_key_id";
+    s3-secret-access-key = "/etc/credstore.encrypted/unison_cloud_s3_secret_access_key";
+  };
+  sharedCredentialId = withCredentials {
+    s3-access-key-id = "unison_cloud_s3";
+    s3-secret-access-key = "/etc/credstore.encrypted/unison_cloud_s3";
+  };
+  credentialIdTakesSecretName = withCredentials {s3-access-key-id = "cluster-token";};
 
   services = minimal.config.systemd.services;
 in
@@ -70,6 +86,14 @@ in
   assert lib.assertMsg (failsWith "database.host" noDatabase) "a host without database.host evaluates";
   assert lib.assertMsg (failsWith "nimbus.cloudApiHost" nimbusOnLoopback) "a nimbus-only host pointing at its own loopback evaluates";
   assert lib.assertMsg (failsWith "consul-token" noConsulToken) "a host without consul-token evaluates";
+  assert lib.assertMsg (failed credstoreNames == []) "a host with credentials under their credstore names fails: ${toString (failed credstoreNames)}";
+  assert lib.assertMsg (credstoreNames.config.systemd.services.unison-cloud-api.serviceConfig.LoadCredentialEncrypted
+    == [
+      "unison_cloud_s3_access_key_id:unison_cloud_s3_access_key_id"
+      "unison_cloud_s3_secret_access_key:/etc/credstore.encrypted/unison_cloud_s3_secret_access_key"
+    ]) "cloud-api loads a credential under another name than its credstore name or file basename";
+  assert lib.assertMsg (failsWith "unison_cloud_s3 is taken" sharedCredentialId) "two credentials with one name evaluate";
+  assert lib.assertMsg (failsWith "cluster-token is taken" credentialIdTakesSecretName) "a credential named after another secret evaluates";
   assert lib.assertMsg (lib.all (name: !(services ? ${name})) [
     "unison-cloud-postgresql"
     "unison-cloud-s3"
