@@ -113,6 +113,16 @@ self: {
         assert psql("SELECT u.handle FROM selfhost.oidc_identities i JOIN users u ON u.id = i.user_id WHERE i.issuer = 'https://cloud.test:8443/dex'") == "alice"
         assert psql("SELECT count(*) FROM cloud_users cu JOIN users u ON u.id = cu.user_id WHERE u.handle = 'alice'") == "1"
 
+    # Dex accepts shorter verifiers, so the length is checked where cloud-api stores it.
+    with subtest("cloud-api sends the provider a PKCE verifier of at least 43 characters, as RFC 7636 requires"):
+        machine.succeed(f"curl -sf --cacert {ca} -o /dev/null {api}/selfhost/oidc/login")
+        shortest = psql(
+            # Values are JSON in Data.Binary's framing, which puts an 8-byte length first.
+            "SELECT min(length(convert_from(substring(value FROM 9), 'UTF8')::jsonb->>'pkceVerifier')) FROM selfhost.ephemeral"
+            " WHERE key LIKE 'sessions:pending:%'"
+        )
+        assert int(shortest) >= 43, f"shortest stored verifier has {shortest} characters"
+
     with subtest("the UI login sets a session cookie and returns to the UI"):
         hurl("${hurl "login-ui.hurl"}", "--test", "--variable ui=https://ui.test:8443", "--variable user=alice@example.com",
              "--variable handle=alice", "--secret password=alice-password")

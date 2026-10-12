@@ -1,0 +1,73 @@
+--- a/src/Cloud/SelfHost/Oidc.hs
++++ b/src/Cloud/SelfHost/Oidc.hs
+@@ -46,7 +46,6 @@
+ import Servant
+ import Share.JWT qualified as ShareJWT
+ import Share.OAuth.Errors (OAuth2Error)
+-import Share.OAuth.PKCE qualified as PKCE
+ import Share.OAuth.Scopes (Scopes, UnisonScope (OpenId), containsScope)
+ import Share.OAuth.Session (LoginRequest (..), PendingSession (..), Session (..))
+ import Share.OAuth.Types (AuthenticationRequest (..), OAuthClientId (..), PKCEChallenge, PKCEChallengeMethod (..), PendingSessionId, ResponseType (..), UserId)
+@@ -175,7 +174,7 @@
+ beginUpstreamLogin loginRequest returnTo = do
+   config <- brokerConfig
+   endpoints <- liftIO (Upstream.resolveEndpoints config) >>= either (respondError . UpstreamFailed) pure
+-  (verifier, challenge, _) <- PKCE.generatePkce
++  (verifier, challenge) <- liftIO Upstream.generatePkce
+   nonce <- newSecureToken
+   PendingSession {pendingId} <- OAuthState.newPendingSession loginRequest verifier returnTo (Just (Aeson.object ["nonce" .= nonce]))
+   callback <- apiURL ["selfhost", "oidc", "callback"]
+--- a/src/Cloud/SelfHost/Oidc/Upstream.hs
++++ b/src/Cloud/SelfHost/Oidc/Upstream.hs
+@@ -3,6 +3,7 @@
+   ( UpstreamError (..),
+     VerifiedClaims (..),
+     resolveEndpoints,
++    generatePkce,
+     authorizationURI,
+     exchangeCode,
+     verifyIdToken,
+@@ -13,11 +14,15 @@
+ import Cloud.SelfHost.Oidc.Config (Allowlist (..), EndpointSource (..), Endpoints (..), OidcConfig (..))
+ import Control.Lens (lens, review, view, (.~))
+ import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
++import Crypto.Hash qualified as Crypto
+ import Crypto.JOSE.JWA.JWS qualified as JWS
+ import Crypto.JWT qualified as JWT
++import Crypto.Random.Types qualified as Crypto
+ import Data.Aeson (FromJSON (..), (.:))
+ import Data.Aeson qualified as Aeson
+ import Data.Aeson.KeyMap qualified as KeyMap
++import Data.ByteArray (ByteArrayAccess)
++import Data.ByteArray.Encoding qualified as BE
+ import Data.ByteString.Lazy qualified as BL
+ import Data.Maybe (isNothing)
+ import Data.Set qualified as Set
+@@ -26,7 +31,7 @@
+ import Network.HTTP.Client qualified as HTTP
+ import Network.HTTP.Types (hAccept, statusCode, urlEncode)
+ import Network.URI (URI, parseAbsoluteURI)
+-import Share.OAuth.Types (PKCEChallenge, PKCEVerifier (..))
++import Share.OAuth.Types (PKCEChallenge (..), PKCEVerifier (..))
+ import Share.Utils.URI (addQueryParam)
+ 
+ data UpstreamError
+@@ -54,6 +59,18 @@
+       throwError $ DiscoveryFailed ("discovery document names issuer " <> discoveredIssuer <> ", expected " <> config.issuer)
+     pure discovered
+ 
++-- | An S256 pair for the login against the provider. share-auth's generatePkce encodes
++-- 30 random bytes, a 40-character verifier, under RFC 7636 §4.1's minimum of 43, which
++-- providers such as Pocket ID enforce. 32 bytes make 43 characters.
++generatePkce :: IO (PKCEVerifier, PKCEChallenge)
++generatePkce = do
++  verifier <- base64URL <$> Crypto.getRandomBytes @IO @ByteString 32
++  let challenge = base64URL (Crypto.hashWith Crypto.SHA256 (Text.encodeUtf8 verifier))
++  pure (PKCEVerifier verifier, PKCEChallenge challenge)
++  where
++    base64URL :: (ByteArrayAccess bytes) => bytes -> Text
++    base64URL = Text.decodeUtf8 . BE.convertToBase BE.Base64URLUnpadded
++
+ authorizationURI :: OidcConfig -> Endpoints -> URI -> Text -> Text -> PKCEChallenge -> URI
+ authorizationURI config Endpoints {authorizationEndpoint} redirectURI state nonce challenge =
+   authorizationEndpoint

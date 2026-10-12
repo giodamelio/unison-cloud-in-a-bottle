@@ -18,6 +18,7 @@
     ../../patches/cloud-api/0008-remove-unauthenticated-routes.patch
     ../../patches/cloud-api/0009-redis-to-postgres.patch
     ../../patches/cloud-api/0010-consul-token-and-prefix.patch
+    ../../patches/cloud-api/0011-pkce-verifier-length.patch
   ];
 
   stacklock = stacklock2nix {
