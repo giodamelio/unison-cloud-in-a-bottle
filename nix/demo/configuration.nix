@@ -74,7 +74,7 @@ in {
         username = "demo";
         # A literal rather than a hash built at evaluation time: bcrypt salts randomly, so
         # a built hash would change the VM's store paths on every build.
-        passwordHashFile = pkgs.writeText "unison-cloud-demo-password.bcrypt" "$2b$10$/Lfz.yT3xdZwUBTJwkK29ObMuNl5lrS2rHlKJkJk054huJV4Vb9gm";
+        passwordHashFile = "${pkgs.writeText "unison-cloud-demo-password.bcrypt" "$2b$10$/Lfz.yT3xdZwUBTJwkK29ObMuNl5lrS2rHlKJkJk054huJV4Vb9gm"}";
       }
     ];
   };

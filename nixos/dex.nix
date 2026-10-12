@@ -81,8 +81,11 @@ in {
               description = "Becomes the cloud-api handle on first login.";
             };
             passwordHashFile = lib.mkOption {
-              type = lib.types.path;
-              description = "File holding a bcrypt hash of the password, for example from `mkpasswd -m bcrypt`.";
+              type = lib.types.str;
+              description = ''
+                File holding a bcrypt hash of the password, for example from `mkpasswd -m bcrypt`.
+                A string, so the hash never enters the Nix store.
+              '';
             };
           };
         });

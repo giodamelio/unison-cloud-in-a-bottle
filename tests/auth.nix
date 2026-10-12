@@ -7,10 +7,9 @@ self: {
     ...
   }: let
     # Built at evaluation time from a known test password; bcrypt's random salt doesn't matter here.
-    hash = name: password:
-      pkgs.runCommand "${name}.bcrypt" {} ''
-        printf %s ${password} | ${pkgs.mkpasswd}/bin/mkpasswd -m bcrypt -R 10 -s > $out
-      '';
+    hash = name: password: "${pkgs.runCommand "${name}.bcrypt" {} ''
+      printf %s ${password} | ${pkgs.mkpasswd}/bin/mkpasswd -m bcrypt -R 10 -s > $out
+    ''}";
   in {
     imports = [self.nixosModules.default];
 
