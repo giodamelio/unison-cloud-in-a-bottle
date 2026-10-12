@@ -7,8 +7,9 @@ location: true
 HTTP 200
 [Captures]
 action: xpath "string(//form/@action)"
+provider: url regex "^(https?://[^/]+)"
 
-POST {{api}}{{action}}
+POST {{provider}}{{action}}
 [Options]
 location: true
 [FormParams]

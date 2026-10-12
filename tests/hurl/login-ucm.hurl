@@ -26,9 +26,10 @@ location: true
 HTTP 200
 [Captures]
 action: xpath "string(//form/@action)"
+provider: url regex "^(https?://[^/]+)"
 
 # The redirects end at the loopback listener, which answers 404 for any path.
-POST {{api}}{{action}}
+POST {{provider}}{{action}}
 [Options]
 location: true
 [FormParams]

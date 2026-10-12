@@ -127,6 +127,14 @@
         };
       });
 
+      shared-host = pkgs.testers.runNixOSTest (import ./tests/shared-host.nix {
+        inherit (inputs) self;
+        inherit pkgs;
+        deployProgram = pkgs.callPackage ./tests/deploy-program {
+          inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+        };
+      });
+
       demo = pkgs.testers.runNixOSTest (import ./tests/demo.nix {
         inherit (inputs) self;
         deployProgram = pkgs.callPackage ./tests/deploy-program {

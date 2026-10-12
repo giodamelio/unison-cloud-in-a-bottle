@@ -1,6 +1,6 @@
 # Plays the browser that ucm's `auth.login` opens: follows the authorization URL to the
 # login form, logs in, and follows the redirects back to ucm's loopback listener.
-# Variables: api (origin), url (the URL ucm opened), user; secret: password.
+# Variables: url (the URL ucm opened), user; secret: password.
 
 GET {{url}}
 [Options]
@@ -8,8 +8,9 @@ location: true
 HTTP 200
 [Captures]
 action: xpath "string(//form/@action)"
+provider: url regex "^(https?://[^/]+)"
 
-POST {{api}}{{action}}
+POST {{provider}}{{action}}
 [Options]
 location: true
 [FormParams]

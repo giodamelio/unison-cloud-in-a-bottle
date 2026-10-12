@@ -121,7 +121,7 @@ self: {
         assert psql("SELECT count(*) FROM users WHERE handle = 'mallory'") == "0"
 
     with subtest("the API refuses everything that needs a login, and forged headers do nothing"):
-        hurl("${hurl "auth-boundaries.hurl"}", "--test", f"--secret token={token}")
+        hurl("${hurl "auth-boundaries.hurl"}", "--test", f"--variable authorize={api}/dex/auth", f"--secret token={token}")
 
     with subtest("the generated admin user can log in"):
         password = machine.succeed(f"cat {secrets}/dex-admin-password").strip()

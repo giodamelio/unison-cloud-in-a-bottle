@@ -68,6 +68,95 @@ Even I have barely done this, so YMMV to the extreme. To run it on a real machin
 
 Keep the UI and API domains under the same parent domain. The session cookie only rides along on the UI's requests when they're the same site. Add users to log in with through `services.unison-cloud.auth.dex.users`, or use the generated admin account. `nix/demo/configuration.nix` is a good full example.
 
+## Deploy on a shared host
+
+If the host already runs its own Caddy, login provider, PostgreSQL and S3 store, the module can use all four. Hosted code runs as `unison-cloud-nimbus`, and the network namespace only isolates TCP and UDP. So the module sandboxes nimbus so it can't see the host's unix sockets or `/run` and `/var` at all. Every path out to a host service is a bridge that only the users who need it can open.
+
+This example is for a host whose Caddy wraps each vhost's body in its own `tls` block, with Pocket ID on `127.0.0.1:1411`, the host's PostgreSQL, and Garage on a private network:
+
+```nix
+{config, ...}: let
+  cloud = config.services.unison-cloud;
+in {
+  imports = [inputs.unison-cloud-nix.nixosModules.default];
+
+  services.unison-cloud = {
+    enable = true;
+    domains = {
+      api = "cloud.example.com";
+      apps = "apps.example.com";
+      ui = "ui.example.com";
+    };
+
+    # Your Caddy serves the three sites; the bodies carry every routing and security rule.
+    caddy.enable = false;
+
+    auth = {
+      dex.enable = false;
+      oidc = {
+        issuer = "https://login.example.com";
+        clientId = "unison-cloud";
+        # systemd-creds encrypt --name=oidc-client-secret - /etc/credstore.encrypted/unison-cloud-oidc-client-secret
+        clientSecretCredential = "unison-cloud-oidc-client-secret";
+        # The browser follows the public authorization URL. cloud-api fetches tokens and
+        # keys through a bridge to Pocket ID's own listener, so it needs no egress.
+        endpoints.authorization = "https://login.example.com/authorize";
+        bridge = {
+          target = "127.0.0.1:1411";
+          tokenPath = "/api/oidc/token";
+          jwksPath = "/.well-known/jwks.json";
+        };
+        allowedGroups = ["unison-cloud"];
+      };
+    };
+
+    s3 = {
+      bundled = false;
+      buckets = {
+        services = "unison-cloud-example-services";
+        userBlobs = "unison-cloud-example-user-blobs";
+      };
+      external = {
+        # Garage's root_domain is ".s3.garage.example.com". The bucket names resolve to
+        # the bridge inside cloud-api and nimbus only.
+        host = "s3.garage.example.com";
+        https = false;
+        region = "garage";
+        bridge.target = "10.100.0.3:3900";
+      };
+    };
+    # Encrypted with --name=s3-access-key-id and --name=s3-secret-access-key.
+    secrets.credentials = {
+      s3-access-key-id = "unison-cloud-s3-access-key-id";
+      s3-secret-access-key = "unison-cloud-s3-secret-access-key";
+    };
+
+    database = {
+      mode = "host";
+      package = config.services.postgresql.package;
+    };
+    extenddb.database = "unison_cloud_extenddb";
+  };
+
+  services.caddy.virtualHosts = {
+    "cloud.example.com".extraConfig = cloud.caddy.siteConfig.api;
+    "apps.example.com".extraConfig = cloud.caddy.siteConfig.apps;
+    "ui.example.com".extraConfig = cloud.caddy.siteConfig.ui;
+  };
+
+  networking.nftables.enable = true;
+  # Egress turns on IPv4 forwarding; this keeps the host from routing anything else.
+  networking.firewall.filterForward = true;
+}
+```
+
+Here's what each piece expects from the host:
+
+- **Caddy.** It must run as group `caddy`, or set `ingressGroup` to its group. The sockets under `/run/unison-cloud/` trust identity headers, so nothing else may be in that group. Point a monitor at `https://cloud.example.com/.well-known/openid-configuration`. It needs no login, and a 200 means Caddy and cloud-api are up.
+- **The login provider.** Give it a confidential client with the redirect URI `https://cloud.example.com/selfhost/oidc/callback`. cloud-api still checks every ID token's `iss` against the public issuer.
+- **PostgreSQL.** The module creates `unison-cloud-api` and `unison-cloud-extenddb` roles, both `NOSUPERUSER` and `NOCREATEROLE`, and their databases, then logs in over `/run/postgresql` with peer authentication. It never touches `pg_hba.conf`, so keep a rule that lets those system users log in as their own roles. NixOS's default `local all all peer` does.
+- **S3.** Create both buckets and a key that can read and write them. Requests through the bridge keep the `Host` header the clients sign, `<bucket>.<host>:7070`, so the store must accept a non-default port there. Garage does.
+
 ## Use the binary cache
 
 Building cloud-api and nimbus from scratch takes a long time, so I push the builds to a Cachix cache, [unison-cloud-in-a-bottle](https://unison-cloud-in-a-bottle.cachix.org). The flake already lists it in `nixConfig`, so when you `nix run` or `nix develop` here Nix asks whether to trust it. Say yes and it pulls the binaries instead of building them.
@@ -155,14 +244,15 @@ flowchart TB
 - **Dex** is the bundled login provider. cloud-api acts as an OIDC client of Dex (or any external OIDC provider you point it at), and as a tiny authorization server for `ucm auth.login`.
 - **PostgreSQL** holds cloud-api's data and environment secrets, and backs ExtendDB.
 - **ExtendDB** stands in for DynamoDB, which is where nimbus keeps its transactional storage.
-- **versitygw** stands in for S3, for deployed service code and blobs. You can point it at a real S3 instead.
+- **versitygw** stands in for S3, for deployed service code and blobs. You can point it at a real S3 instead, reached through a host bridge.
 - **Redis** holds login state and refresh tokens.
 - **Consul** is a single-node service registry that cloud-api uses to find the nimbus nodes.
 - **Loki and Vector** collect the logs. Vector ships nimbus's journal into Loki with the labels cloud-api expects when the UI asks for logs.
 - **Squid and Unbound** form the outbound proxy for hosted code. Your services can reach the internet, but never loopback or private addresses.
-- **nftables** locks down egress from the namespace so only the services that need the outside world can reach it.
+- **nftables** locks down egress from the namespace so only the services that need the outside world can reach it. Host bridges (`network.hostBridges`) give named users a path to one host-side service each, such as an S3 store or a login provider, without any general egress.
+- **systemd sandboxing** covers what the namespace can't: unix sockets and files. nimbus and cloud-api run with `/run` and `/var` emptied, and nimbus can't open a unix socket at all.
 
-All secrets (keys, passwords, an internal CA) are generated on first boot under the state directory, and any of them can be overridden with your own files.
+All secrets (keys, passwords, an internal CA) are generated on first boot under the state directory. You can override any of them with your own files (`secrets.files`), and most of them with systemd encrypted credentials (`secrets.credentials`).
 
 ## See what I patched
 

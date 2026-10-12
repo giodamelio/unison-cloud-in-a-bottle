@@ -1,10 +1,11 @@
-# What the API domain refuses without a login. Variables: api; secret: token.
+# What the API domain refuses without a login. Variables: api, authorize (the
+# provider's authorization endpoint); secret: token.
 
 # Logging in starts at the provider.
 GET {{api}}/login
 HTTP 302
 [Asserts]
-header "Location" contains "/dex/auth"
+header "Location" startsWith "{{authorize}}?"
 
 # The header-trust routes are unreachable, so forged identity headers get nowhere.
 GET {{api}}/selfhost/access-token
