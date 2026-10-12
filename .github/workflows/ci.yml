@@ -37,8 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # TODO: add ubuntu-24.04-arm back once the initial aarch64 push from nixbuild.net is done.
-        runner: [ubuntu-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       # cloud-api's Haskell build doesn't fit in the runner's default free space.
