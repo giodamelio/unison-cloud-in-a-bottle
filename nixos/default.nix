@@ -8,6 +8,7 @@ in {
   imports = [
     ./netns.nix
     ./egress.nix
+    ./bridges.nix
     ./secrets.nix
     ./ingress.nix
     ./dex.nix

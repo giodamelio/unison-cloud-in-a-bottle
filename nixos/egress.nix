@@ -87,6 +87,10 @@
     + ''
       meta skuid "${user}" reject
     '';
+  # Comes before the per-user port lists, so a bridge is refused even to users with no list.
+  bridgeRule = _: bridge: ''
+    ip daddr 127.0.0.0/8 tcp dport ${toString bridge.port} meta skuid != { ${lib.concatStringsSep ", " (quoted bridge.users)} } reject
+  '';
 
   # Loaded inside the namespace, where a socket's owner is still visible. Deleting the
   # table in the same transaction makes the file safe to load again on reload.
@@ -95,6 +99,7 @@
     delete table inet unison-cloud-boundary
     table inet unison-cloud-boundary {
       chain loopback {
+        ${lib.concatStrings (lib.mapAttrsToList bridgeRule cfg.network.hostBridges)}
         ${lib.concatStrings (lib.mapAttrsToList loopbackRule cfg.internal.loopbackRestrictedUsers)}
       }
 
