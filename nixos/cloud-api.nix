@@ -6,7 +6,6 @@
 }: let
   cfg = config.services.unison-cloud;
   user = "unison-cloud-api";
-  secrets = "${cfg.stateDir}/secrets";
   psql = "${cfg.database.package}/bin/psql";
   pg = cfg.internal.postgres;
   s3 = cfg.internal.s3;
@@ -116,7 +115,7 @@
     export SHARE_EDDSA_KEY=$(< "$creds/share-eddsa-key")
     export CLOUD_HMAC_KEY=$(< "$creds/cloud-hmac-key")
     export CLOUD_INTERNAL_AUTH_TOKEN=$(< "$creds/internal-auth-token")
-    export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/oidc-client-secret")
+    export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/${cfg.internal.oidcSecretCredential}")
     CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
     ${lib.optionalString pg.external ''
       # libpq keyword values are single-quoted, with backslash and quote escaped.
@@ -168,7 +167,7 @@ in {
     users.groups.${user} = {};
 
     services.unison-cloud.internal = {
-      egressUsers = lib.mkIf (!cfg.s3.bundled || cfg.sentry.dsnFile != null) [user];
+      egressUsers = lib.mkIf (cfg.sentry.dsnFile != null) [user];
       ingressSockets.cloud-api = cfg.internal.cloudApiPort;
       postgresRoles.${user} = {};
       # Untrusted extensions a database owner can't create; the migrations skip them once they exist.
@@ -203,18 +202,21 @@ in {
         requires = ["unison-cloud-migrate.service" "unison-cloud-secrets.service"];
         after = ["unison-cloud-migrate.service" "unison-cloud-secrets.service"];
         environment = pgEnvironment;
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = user;
-          Group = user;
-          LoadCredential = ["cluster-token:${secrets}/cluster-token"] ++ pgCredentials;
-          ExecStart = pkgs.writeShellScript "unison-cloud-seed" ''
-            ${exportPassword}
-            ${psql} -X -q -v ON_ERROR_STOP=1 -1 \
-              -v token="$(< "$CREDENTIALS_DIRECTORY/cluster-token")" -f ${seedSql}
-          '';
-        };
+        serviceConfig = lib.mkMerge [
+          (cfg.internal.loadSecrets ["cluster-token"])
+          {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            User = user;
+            Group = user;
+            LoadCredential = pgCredentials;
+            ExecStart = pkgs.writeShellScript "unison-cloud-seed" ''
+              ${exportPassword}
+              ${psql} -X -q -v ON_ERROR_STOP=1 -1 \
+                -v token="$(< "$CREDENTIALS_DIRECTORY/cluster-token")" -f ${seedSql}
+            '';
+          }
+        ];
       }
     ];
 
@@ -271,8 +273,10 @@ in {
                 then "https"
                 else "http"
               }://${s3.host}:${toString s3.port}";
+            # Path style needs only the store's own name to resolve, and every S3 store
+            # accepts it there; nimbus is the one that needs virtual hosts.
             CLOUD_S3_ADDRESSING = "path";
-            CLOUD_CLOUD_SERVICE_BUCKET = "unison-cloud-services";
+            CLOUD_CLOUD_SERVICE_BUCKET = cfg.s3.buckets.services;
 
             CLOUD_SELFHOST_OIDC_ISSUER = cfg.internal.oidcIssuer;
             CLOUD_SELFHOST_DEFAULT_TIER = cfg.auth.defaultTier;
@@ -285,24 +289,33 @@ in {
             CLOUD_ZENDESK_API_USER = "unused";
             CLOUD_ZENDESK_API_TOKEN = "unused";
           };
-        serviceConfig = {
-          User = user;
-          Group = user;
-          LoadCredential =
-            map (name: "${name}:${secrets}/${name}") [
-              "redis-password"
-              "s3-access-key-id"
-              "s3-secret-access-key"
-              "cloud-eddsa-key"
-              "share-eddsa-key"
-              "cloud-hmac-key"
-              "internal-auth-token"
-            ]
-            ++ pgCredentials
-            ++ lib.optional (cfg.sentry.dsnFile != null) "sentry-dsn:${cfg.sentry.dsnFile}";
-          ExecStart = start;
-          Restart = "on-failure";
-        };
+        serviceConfig = lib.mkMerge [
+          (cfg.internal.loadSecrets [
+            "redis-password"
+            "s3-access-key-id"
+            "s3-secret-access-key"
+            "cloud-eddsa-key"
+            "share-eddsa-key"
+            "cloud-hmac-key"
+            "internal-auth-token"
+          ])
+          # Signed-in users reach cloud-api directly, and it shares the namespace loopback
+          # with hosted code, so it sees only the host paths it uses.
+          cfg.internal.hostIsolation
+          cfg.internal.s3Hosts
+          {
+            User = user;
+            Group = user;
+            BindPaths = lib.optional (!pg.external) cfg.internal.postgresSocketDir;
+            RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
+            SystemCallFilter = ["@system-service"];
+            LoadCredential =
+              pgCredentials
+              ++ lib.optional (cfg.sentry.dsnFile != null) "sentry-dsn:${cfg.sentry.dsnFile}";
+            ExecStart = start;
+            Restart = "on-failure";
+          }
+        ];
       }
     ];
   };

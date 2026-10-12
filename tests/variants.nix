@@ -97,10 +97,7 @@
     imports = [self.nixosModules.default];
 
     networking.nftables.enable = true;
-    networking.hosts = {
-      ${dbAddress} = ["s3.test" "unison-cloud-services.s3.test" "unison-cloud-user-blobs.s3.test"];
-      "127.0.0.1" = ["cloud.localhost" "apps.localhost"];
-    };
+    networking.hosts."127.0.0.1" = ["cloud.localhost" "apps.localhost"];
 
     services.unison-cloud = {
       enable = true;
@@ -119,10 +116,11 @@
       caddy.enable = false;
       s3 = {
         bundled = false;
+        # Only the bridge knows where s3.test is; the host itself can't resolve it.
         external = {
           host = "s3.test";
-          port = 7070;
           https = false;
+          bridge.target = "${dbAddress}:7070";
         };
       };
       secrets.files = {
@@ -142,10 +140,6 @@
         {
           address = dbAddress;
           port = 5432;
-        }
-        {
-          address = dbAddress;
-          port = 7070;
         }
       ];
     };
@@ -212,9 +206,12 @@
         assert db.succeed("sudo -u postgres psql -XtA -c \"SELECT count(*) FROM pg_database WHERE datname LIKE 'extenddb%'\"").strip() == "2"
         external.fail("systemctl is-active unison-cloud-postgresql.service")
 
-    with subtest("a deploy stores its code in the external S3"):
+    with subtest("a deploy stores its code in the external S3, reached through the bridge"):
         db.wait_for_open_port(7070)
         external.fail("systemctl is-active unison-cloud-s3.service")
+        # Neither S3 client is an egress user, so the bridge is their only way there.
+        for user in ["unison-cloud-api", "unison-cloud-nimbus"]:
+            external.fail(f"ip netns exec unison-cloud sudo -u {user} curl -s -m 5 -o /dev/null http://db:7070/")
         for unit in external.succeed("systemctl list-units --plain --no-legend 'unison-cloud-nimbus-*-*.service' | cut -d' ' -f1").split():
             external.wait_for_unit(unit, timeout=600)
         external.wait_until_succeeds(

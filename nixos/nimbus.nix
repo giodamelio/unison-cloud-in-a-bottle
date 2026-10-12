@@ -81,11 +81,11 @@
         allocationIndex = node.index;
       };
       blobFetcher = {
-        bucket = "unison-cloud-services";
+        bucket = cfg.s3.buckets.services;
         inherit awsConfig;
       };
       userBlobFetcher = {
-        bucket = "unison-cloud-user-blobs";
+        bucket = cfg.s3.buckets.userBlobs;
         inherit awsConfig;
       };
       dynamo = {
@@ -164,39 +164,51 @@
           NIMBUS_CONFIG_FILE = "%t/unison-cloud-nimbus-${node.name}/config.json";
           GHCRTS = "-N -C0.003 -qb -qn1";
         };
-        serviceConfig = {
-          User = user;
-          Group = user;
-          RuntimeDirectory = "unison-cloud-nimbus-${node.name}";
-          LoadCredential = map (name: "${name}:${secrets}/${name}") [
+        # Hosted code runs in this process. The namespace keeps its TCP and UDP to what the
+        # firewall allows, but unix sockets and files are shared with the host, so the
+        # sandbox hides /run and /var and the process can't open a unix socket at all.
+        serviceConfig = lib.mkMerge [
+          cfg.internal.hostIsolation
+          cfg.internal.s3Hosts
+          (cfg.internal.loadSecrets [
             "s3-access-key-id"
             "s3-secret-access-key"
             "extenddb-access-key-id"
             "extenddb-secret-access-key"
             "cluster-token"
-          ];
-          # The Unison runtime only reads the system bundle, and ExtendDB's certificate is
-          # issued by the module's own CA.
-          BindReadOnlyPaths = ["${caBundleDir}/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt"];
-          ExecStartPre = renderConfig node;
-          ExecStart = lib.getExe cfg.nimbus.package;
-          # /ready answers 204 once the node has joined cloud-api.
-          ExecStartPost = pkgs.writeShellScript "unison-cloud-nimbus-${node.name}-ready" ''
-            until ${curl} -sf -o /dev/null ${gossip node "/ready"}; do sleep 1; done
-          '';
-          TimeoutStartSec = 300;
-          # Lets in-flight work drain, as upstream's nimbus.sh does on SIGTERM; systemd
-          # would otherwise kill ucm mid-request.
-          ExecStop = pkgs.writeShellScript "unison-cloud-nimbus-${node.name}-stop" ''
-            ${curl} -sS --fail-with-body -X POST ${gossip node "/internal/shutdown"}
-            ${lib.getExe' pkgs.coreutils "tail"} --pid="$MAINPID" -f /dev/null
-          '';
-          ExecReload = [
-            (renderConfig node)
-            "${curl} -sS --fail-with-body -X POST ${gossip node "/internal/reload-config"}"
-          ];
-          Restart = "on-failure";
-        };
+          ])
+          {
+            User = user;
+            Group = user;
+            RuntimeDirectory = "unison-cloud-nimbus-${node.name}";
+            BindPaths = ["%t/unison-cloud-nimbus-${node.name}"];
+            RestrictAddressFamilies = ["AF_INET" "AF_INET6"];
+            SystemCallFilter = ["@system-service"];
+            RemoveIPC = true;
+            KeyringMode = "private";
+            # The Unison runtime only reads the system bundle, and ExtendDB's certificate is
+            # issued by the module's own CA.
+            BindReadOnlyPaths = ["${caBundleDir}/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt"];
+            ExecStartPre = renderConfig node;
+            ExecStart = lib.getExe cfg.nimbus.package;
+            # /ready answers 204 once the node has joined cloud-api.
+            ExecStartPost = pkgs.writeShellScript "unison-cloud-nimbus-${node.name}-ready" ''
+              until ${curl} -sf -o /dev/null ${gossip node "/ready"}; do sleep 1; done
+            '';
+            TimeoutStartSec = 300;
+            # Lets in-flight work drain, as upstream's nimbus.sh does on SIGTERM; systemd
+            # would otherwise kill ucm mid-request.
+            ExecStop = pkgs.writeShellScript "unison-cloud-nimbus-${node.name}-stop" ''
+              ${curl} -sS --fail-with-body -X POST ${gossip node "/internal/shutdown"}
+              ${lib.getExe' pkgs.coreutils "tail"} --pid="$MAINPID" -f /dev/null
+            '';
+            ExecReload = [
+              (renderConfig node)
+              "${curl} -sS --fail-with-body -X POST ${gossip node "/internal/reload-config"}"
+            ];
+            Restart = "on-failure";
+          }
+        ];
       }
     ];
 in {
@@ -245,11 +257,9 @@ in {
     };
     users.groups.${user} = {};
 
-    # Hosted code runs as this user too, so it gets only what nimbus itself connects to.
+    # Hosted code runs as this user too, so it gets only what nimbus itself connects to,
+    # and never egress: an external S3 is behind a bridge on the S3 port.
     # nimbus never reads Consul: cloud-api registers the nodes.
-    # nimbus talks to an external S3 directly, and it has no fixed address to allowlist.
-    services.unison-cloud.internal.egressUsers = lib.mkIf (!cfg.s3.bundled) [user];
-
     services.unison-cloud.internal.loopbackRestrictedUsers.${user} =
       [
         cfg.internal.outboundProxyPort
@@ -257,8 +267,8 @@ in {
         cfg.internal.secretsPort
         cfg.internal.lokiPort
         cfg.extenddb.port
+        cfg.internal.s3Port
       ]
-      ++ lib.optional cfg.s3.bundled cfg.internal.s3Port
       ++ lib.concatMap (node: lib.attrValues node.ports) nodes;
 
     # cloud-api registers the nodes itself (`byoc-nimbus-http`) when they join; this is

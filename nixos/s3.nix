@@ -8,32 +8,43 @@
   user = "unison-cloud-s3";
   bucketsDir = "${cfg.stateDir}/s3/buckets";
   metadataDir = "${cfg.stateDir}/s3/metadata";
-  secrets = "${cfg.stateDir}/secrets";
   domain = cfg.internal.s3Domain;
   ext = cfg.s3.external;
+  buckets = lib.attrValues cfg.s3.buckets;
+  credentialsSupplied = name: cfg.secrets.files ? ${name} || cfg.secrets.credentials ? ${name};
 in {
   options.services.unison-cloud = {
     s3 = {
-      buckets = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        readOnly = true;
-        default = ["unison-cloud-services" "unison-cloud-user-blobs"];
-        description = "Buckets cloud-api and nimbus store deployed code and user blobs in. With an external S3, create them yourself.";
+      buckets = {
+        services = lib.mkOption {
+          type = lib.types.str;
+          default = "unison-cloud-services";
+          description = "Bucket cloud-api and nimbus store deployed code in.";
+        };
+
+        userBlobs = lib.mkOption {
+          type = lib.types.str;
+          default = "unison-cloud-user-blobs";
+          description = "Bucket nimbus stores user blobs in.";
+        };
       };
 
       bundled = lib.mkOption {
         type = lib.types.bool;
         default = true;
         description = ''
-          Run versitygw inside the namespace as the S3 store. With `false`, use
-          `s3.external` and supply the credentials as `secrets.files.s3-access-key-id` and
-          `s3-secret-access-key`.
+          Run versitygw inside the namespace as the S3 store. With `false`, use the store
+          described by `s3.external`, create both `s3.buckets` there yourself, and supply
+          the credentials as `s3-access-key-id` and `s3-secret-access-key` in
+          `secrets.files` or `secrets.credentials`.
 
-          nimbus reaches S3 directly, never through the outbound proxy, and an external S3
-          usually has no fixed address to allowlist. So with an external S3 the nimbus and
-          cloud-api users may send traffic out of the namespace, which lets hosted code reach
-          the public internet without the proxy. Private ranges and the host stay blocked
-          unless listed in `egress.allowedDestinations`.
+          An external store is reached through a host bridge (see `network.hostBridges`)
+          that only cloud-api and nimbus may use, so neither of them gets general egress
+          and hosted code still reaches the internet only through the outbound proxy.
+          Inside those two units only, `s3.external.host` and `<bucket>.<host>` resolve to
+          the bridge, through a private `/etc/hosts`; the host's own resolution of those
+          names is untouched. Requests carry the same `Host` header, with the bridge's
+          port, as a direct connection would, so the store must accept any port there.
         '';
       };
 
@@ -41,23 +52,36 @@ in {
         host = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
           default = null;
-          example = "s3.us-west-2.amazonaws.com";
-          description = "S3 endpoint host. nimbus addresses buckets as `<bucket>.<host>`, so the store must support virtual-host addressing.";
+          example = "s3.garage.example.com";
+          description = "S3 endpoint host. nimbus addresses buckets as `<bucket>.<host>`, so the store must support virtual-host addressing for this name.";
         };
 
         port = lib.mkOption {
           type = lib.types.port;
           default = 443;
+          description = "Port of the S3 endpoint; the bridge's default target uses it.";
         };
 
         https = lib.mkOption {
           type = lib.types.bool;
           default = true;
+          description = "Whether the store speaks HTTPS. The bridge forwards TCP, so TLS still runs end to end and the certificate must be valid for `host` and `*.host`.";
         };
 
         region = lib.mkOption {
           type = lib.types.str;
           default = "us-east-1";
+        };
+
+        bridge.target = lib.mkOption {
+          type = lib.types.str;
+          default = lib.optionalString (ext.host != null) "${ext.host}:${toString ext.port}";
+          defaultText = lib.literalExpression ''"''${s3.external.host}:''${toString s3.external.port}"'';
+          example = "10.100.0.3:3900";
+          description = ''
+            Where the bridge connects from the host: `host:port`, such as the store's
+            address on a private network, or a unix socket path.
+          '';
         };
       };
     };
@@ -77,10 +101,11 @@ in {
             unit = "unison-cloud-s3.service";
           }
           else {
-            inherit (ext) host port https region;
-            unit = null;
+            inherit (ext) host https region;
+            port = cfg.internal.s3Port;
+            unit = "unison-cloud-bridge-s3.socket";
           };
-        description = "Where cloud-api and nimbus reach S3.";
+        description = "Where cloud-api and nimbus reach S3, and the unit that serves it.";
       };
 
       s3Domain = lib.mkOption {
@@ -96,7 +121,24 @@ in {
         internal = true;
         readOnly = true;
         default = 7070;
-        description = "Port versitygw listens on, on the namespace loopback.";
+        description = "Port of the S3 store, or of the bridge to an external one, on the namespace loopback.";
+      };
+
+      s3Hosts = lib.mkOption {
+        type = lib.types.attrs;
+        internal = true;
+        readOnly = true;
+        default = lib.optionalAttrs (!cfg.s3.bundled) {
+          BindReadOnlyPaths = [
+            "${pkgs.concatText "unison-cloud-s3-hosts" (config.networking.hostFiles
+              ++ [
+                (pkgs.writeText "unison-cloud-s3-bridge-hosts" ''
+                  127.0.0.1 ${ext.host} ${lib.concatMapStringsSep " " (bucket: "${bucket}.${ext.host}") buckets}
+                '')
+              ])}:/etc/hosts"
+          ];
+        };
+        description = "Unit settings that resolve the external S3 names to the bridge, for that unit only.";
       };
     };
   };
@@ -105,11 +147,18 @@ in {
     {
       assertions = [
         {
-          assertion = cfg.s3.bundled || (ext.host != null && cfg.secrets.files ? s3-access-key-id && cfg.secrets.files ? s3-secret-access-key);
-          message = "services.unison-cloud: with s3.bundled = false, set s3.external.host and supply secrets.files.s3-access-key-id and s3-secret-access-key.";
+          assertion = cfg.s3.bundled || (ext.host != null && credentialsSupplied "s3-access-key-id" && credentialsSupplied "s3-secret-access-key");
+          message = "services.unison-cloud: with s3.bundled = false, set s3.external.host and supply s3-access-key-id and s3-secret-access-key through secrets.files or secrets.credentials.";
         }
       ];
     }
+    (lib.mkIf (!cfg.s3.bundled) {
+      services.unison-cloud.network.hostBridges.s3 = {
+        inherit (ext.bridge) target;
+        port = cfg.internal.s3Port;
+        users = ["unison-cloud-api" "unison-cloud-nimbus"];
+      };
+    })
     (lib.mkIf cfg.s3.bundled {
       users.users.${user} = {
         isSystemUser = true;
@@ -117,7 +166,7 @@ in {
       };
       users.groups.${user} = {};
 
-      networking.hosts."127.0.0.1" = [domain] ++ map (bucket: "${bucket}.${domain}") cfg.s3.buckets;
+      networking.hosts."127.0.0.1" = [domain] ++ map (bucket: "${bucket}.${domain}") buckets;
 
       # A bucket in the posix backend is just a top-level directory.
       systemd.tmpfiles.settings.unison-cloud-s3 =
@@ -138,7 +187,7 @@ in {
             mode = "0700";
           };
         }
-        // lib.genAttrs (map (bucket: "${bucketsDir}/${bucket}") cfg.s3.buckets) (_: {
+        // lib.genAttrs (map (bucket: "${bucketsDir}/${bucket}") buckets) (_: {
           d = {
             inherit user;
             group = user;
@@ -153,25 +202,24 @@ in {
           wantedBy = ["multi-user.target"];
           requires = ["unison-cloud-secrets.service"];
           after = ["unison-cloud-secrets.service"];
-          serviceConfig = {
-            User = user;
-            Group = user;
-            LoadCredential = [
-              "access-key-id:${secrets}/s3-access-key-id"
-              "secret-access-key:${secrets}/s3-secret-access-key"
-            ];
-            # The sidecar directory holds object metadata, so the data directory needs no
-            # extended-attribute support.
-            ExecStart = pkgs.writeShellScript "unison-cloud-s3" ''
-              ROOT_ACCESS_KEY=$(< "$CREDENTIALS_DIRECTORY/access-key-id") \
-              ROOT_SECRET_KEY=$(< "$CREDENTIALS_DIRECTORY/secret-access-key") \
-                exec ${lib.getExe pkgs.versitygw} \
-                  --port 127.0.0.1:${toString cfg.internal.s3Port} \
-                  --virtual-domain ${domain} \
-                  --quiet \
-                  posix --sidecar ${metadataDir} ${bucketsDir}
-            '';
-          };
+          serviceConfig = lib.mkMerge [
+            (cfg.internal.loadSecrets ["s3-access-key-id" "s3-secret-access-key"])
+            {
+              User = user;
+              Group = user;
+              # The sidecar directory holds object metadata, so the data directory needs no
+              # extended-attribute support.
+              ExecStart = pkgs.writeShellScript "unison-cloud-s3" ''
+                ROOT_ACCESS_KEY=$(< "$CREDENTIALS_DIRECTORY/s3-access-key-id") \
+                ROOT_SECRET_KEY=$(< "$CREDENTIALS_DIRECTORY/s3-secret-access-key") \
+                  exec ${lib.getExe pkgs.versitygw} \
+                    --port 127.0.0.1:${toString cfg.internal.s3Port} \
+                    --virtual-domain ${domain} \
+                    --quiet \
+                    posix --sidecar ${metadataDir} ${bucketsDir}
+              '';
+            }
+          ];
         }
       ];
     })

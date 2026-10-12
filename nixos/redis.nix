@@ -20,7 +20,8 @@ in {
       enable = true;
       bind = "127.0.0.1";
       port = cfg.internal.redisPort;
-      requirePassFile = "${cfg.stateDir}/secrets/redis-password";
+      # Read by the unit's own privileged ExecStartPre, after systemd has loaded it.
+      requirePassFile = "/run/credentials/redis-unison-cloud.service/redis-password";
     };
 
     systemd.services.redis-unison-cloud = lib.mkMerge [
@@ -28,6 +29,7 @@ in {
       {
         requires = ["unison-cloud-secrets.service"];
         after = ["unison-cloud-secrets.service"];
+        serviceConfig = cfg.internal.loadSecrets ["redis-password"];
       }
     ];
   };

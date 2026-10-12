@@ -100,6 +100,17 @@ in {
         description = "HTTPS port ExtendDB listens on, on the namespace loopback.";
       };
 
+      database = lib.mkOption {
+        type = lib.types.str;
+        default = "extenddb";
+        example = "unison_cloud_extenddb";
+        description = ''
+          Postgres database ExtendDB creates and keeps its data in. It also creates a second
+          one for its catalog, named after this with a `_catalog` suffix. Both are created
+          on ExtendDB's first start only; changing this later has no effect.
+        '';
+      };
+
       tableName = lib.mkOption {
         type = lib.types.str;
         default = "unison-cloud";

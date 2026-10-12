@@ -39,14 +39,14 @@
     text = ''
       creds=$CREDENTIALS_DIRECTORY
       manage() {
-        EXTENDDB_PASSWORD=$(< "$creds/admin-password") ${extenddb} manage --user admin --config extenddb.toml "$@"
+        EXTENDDB_PASSWORD=$(< "$creds/extenddb-admin-password") ${extenddb} manage --user admin --config extenddb.toml "$@"
       }
       contains() {
         jq -e --arg want "$1" 'any(.. | strings; . == $want)' > /dev/null
       }
       dynamo() {
         unison-cloud-dynamo-call --endpoint ${endpoint} --ca-file "$creds/ca" \
-          --access-key-id-file "$creds/access-key-id" --secret-access-key-file "$creds/secret-access-key" "$@"
+          --access-key-id-file "$creds/extenddb-access-key-id" --secret-access-key-file "$creds/extenddb-secret-access-key" "$@"
       }
 
       until ${extenddb} healthcheck --endpoint ${endpoint}; do sleep 1; done
@@ -59,10 +59,10 @@
       fi
       manage put-user-policy --account-id ${accountId} --user-name ${iamUser} --policy-name dynamodb \
         --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}'
-      access_key_id=$(< "$creds/access-key-id")
+      access_key_id=$(< "$creds/extenddb-access-key-id")
       if ! manage list-access-keys --account-id ${accountId} --user-name ${iamUser} | contains "$access_key_id"; then
         manage import-access-key --account-id ${accountId} --user-name ${iamUser} \
-          --access-key-id "$access_key_id" --secret-access-key "$(< "$creds/secret-access-key")" --yes
+          --access-key-id "$access_key_id" --secret-access-key "$(< "$creds/extenddb-secret-access-key")" --yes
       fi
 
       if ! dynamo ListTables '{}' | contains ${cfg.extenddb.tableName}; then
@@ -147,45 +147,48 @@ in {
             EXTENDDB__SERVER__TLS__CERT_PATH = "%d/tls-cert";
             EXTENDDB__SERVER__TLS__KEY_PATH = "%d/tls-key";
           };
-        serviceConfig = {
-          User = user;
-          Group = user;
-          WorkingDirectory = home;
-          LoadCredential =
-            [
-              "admin-password:${secrets}/extenddb-admin-password"
-              "tls-cert:${secrets}/extenddb.crt"
-              "tls-key:${secrets}/extenddb.key"
-            ]
-            ++ lib.optional pg.external "db-password:${ext.passwordFile}";
-          # `init` refuses to run once its databases exist, so it only runs while there's no
-          # config yet. It connects as ExtendDB's own role, which needs CREATEDB, both as the
-          # admin and as the application user.
-          ExecStartPre = pkgs.writeShellScript "unison-cloud-extenddb-init" ''
-            ${
-              if pg.external
-              then ''
-                EXTENDDB_PG_PASSWORD=$(< "$CREDENTIALS_DIRECTORY/db-password")
-                EXTENDDB_APP_PASSWORD=$EXTENDDB_PG_PASSWORD
-              ''
-              else ''
-                EXTENDDB_APP_PASSWORD=unused-with-peer-auth
-              ''
-            }
-            export EXTENDDB_PG_PASSWORD EXTENDDB_APP_PASSWORD
-            if [ ! -e extenddb.toml ]; then
-              EXTENDDB_ADMIN_USER=admin \
-              EXTENDDB_ADMIN_PASSWORD=$(< "$CREDENTIALS_DIRECTORY/admin-password") \
-                ${extenddb} init --config extenddb.toml \
-                  --pg-host ${pg.host} --pg-port ${pg.port} \
-                  --pg-user ${pgUser} --extenddb-user ${pgUser} \
-                  --data-db extenddb --bind-addr 127.0.0.1
-            else
-              ${extenddb} migrate --config extenddb.toml --yes --pg-user ${pgUser}
-            fi
-          '';
-          ExecStart = "${extenddb} serve --foreground --config extenddb.toml";
-        };
+        serviceConfig = lib.mkMerge [
+          (cfg.internal.loadSecrets ["extenddb-admin-password"])
+          {
+            User = user;
+            Group = user;
+            WorkingDirectory = home;
+            LoadCredential =
+              [
+                "tls-cert:${secrets}/extenddb.crt"
+                "tls-key:${secrets}/extenddb.key"
+              ]
+              ++ lib.optional pg.external "db-password:${ext.passwordFile}";
+            # `init` refuses to run once its databases exist, so it only runs while there's no
+            # config yet. It connects as ExtendDB's own role, which needs CREATEDB, both as the
+            # admin and as the application user.
+            ExecStartPre = pkgs.writeShellScript "unison-cloud-extenddb-init" ''
+              ${
+                if pg.external
+                then ''
+                  EXTENDDB_PG_PASSWORD=$(< "$CREDENTIALS_DIRECTORY/db-password")
+                  EXTENDDB_APP_PASSWORD=$EXTENDDB_PG_PASSWORD
+                ''
+                else ''
+                  EXTENDDB_APP_PASSWORD=unused-with-peer-auth
+                ''
+              }
+              export EXTENDDB_PG_PASSWORD EXTENDDB_APP_PASSWORD
+              if [ ! -e extenddb.toml ]; then
+                EXTENDDB_ADMIN_USER=admin \
+                EXTENDDB_ADMIN_PASSWORD=$(< "$CREDENTIALS_DIRECTORY/extenddb-admin-password") \
+                  ${extenddb} init --config extenddb.toml \
+                    --pg-host ${pg.host} --pg-port ${pg.port} \
+                    --pg-user ${pgUser} --extenddb-user ${pgUser} \
+                    --data-db ${cfg.extenddb.database} --catalog-db ${cfg.extenddb.database}_catalog \
+                    --bind-addr 127.0.0.1
+              else
+                ${extenddb} migrate --config extenddb.toml --yes --pg-user ${pgUser}
+              fi
+            '';
+            ExecStart = "${extenddb} serve --foreground --config extenddb.toml";
+          }
+        ];
       }
     ];
 
@@ -197,22 +200,24 @@ in {
         requires = ["unison-cloud-extenddb.service"];
         after = ["unison-cloud-extenddb.service"];
         inherit environment;
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = user;
-          Group = user;
-          WorkingDirectory = home;
-          TimeoutStartSec = 120;
-          LoadCredential = [
-            "admin-password:${secrets}/extenddb-admin-password"
-            "access-key-id:${secrets}/extenddb-access-key-id"
-            "secret-access-key:${secrets}/extenddb-secret-access-key"
-            "ca:${secrets}/ca.crt"
-          ];
-          Environment = ["EXTENDDB__SERVER__TLS__CERT_PATH=%d/ca"];
-          ExecStart = lib.getExe setup;
-        };
+        serviceConfig = lib.mkMerge [
+          (cfg.internal.loadSecrets [
+            "extenddb-admin-password"
+            "extenddb-access-key-id"
+            "extenddb-secret-access-key"
+          ])
+          {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            User = user;
+            Group = user;
+            WorkingDirectory = home;
+            TimeoutStartSec = 120;
+            LoadCredential = ["ca:${secrets}/ca.crt"];
+            Environment = ["EXTENDDB__SERVER__TLS__CERT_PATH=%d/ca"];
+            ExecStart = lib.getExe setup;
+          }
+        ];
       }
     ];
   };

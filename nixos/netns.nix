@@ -39,7 +39,25 @@ in {
           SystemCallArchitectures = "native";
         };
     };
-    description = "Unit settings that place a service inside the namespace.";
+    description = "Unit settings that place a service inside the namespace, with a baseline sandbox.";
+  };
+
+  options.services.unison-cloud.internal.hostIsolation = lib.mkOption {
+    type = lib.types.attrs;
+    internal = true;
+    readOnly = true;
+    default = {
+      ProtectSystem = "strict";
+      ProtectProc = "invisible";
+      CapabilityBoundingSet = [""];
+      UMask = "0077";
+      # An allowlist rather than a denylist: /run and /var start empty, so the host's
+      # sockets (Postgres, D-Bus, nscd, other services) and world-readable state don't
+      # exist here at all. A unit binds back the few paths it needs.
+      TemporaryFileSystem = ["/run" "/var"];
+      InaccessiblePaths = ["-/nix/var" "-/boot" "-/mnt" "-/media" "-/srv" "-/opt"];
+    };
+    description = "Unit settings that hide the host's sockets and state from services that face hosted code.";
   };
 
   config = lib.mkIf cfg.enable {

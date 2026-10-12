@@ -51,7 +51,7 @@
         users}
       jq \
         --argjson passwords "$passwords" \
-        --arg secret "$(< ${secrets}/dex-client-secret)" \
+        --arg secret "$(< /run/credentials/unison-cloud-dex.service/dex-client-secret)" \
         '. + {staticPasswords: $passwords, staticClients: [{
           id: "cloud-api",
           name: "Unison Cloud",
@@ -135,14 +135,17 @@ in {
         requires = ["unison-cloud-secrets.service"];
         after = ["unison-cloud-secrets.service"];
         restartTriggers = [baseConfig];
-        serviceConfig = {
-          User = user;
-          Group = user;
-          RuntimeDirectory = baseNameOf runtimeDir;
-          RuntimeDirectoryMode = "0700";
-          ExecStartPre = "+${lib.getExe render}";
-          ExecStart = "${lib.getExe' pkgs.dex-oidc "dex"} serve ${runtimeDir}/config.json";
-        };
+        serviceConfig = lib.mkMerge [
+          (cfg.internal.loadSecrets ["dex-client-secret"])
+          {
+            User = user;
+            Group = user;
+            RuntimeDirectory = baseNameOf runtimeDir;
+            RuntimeDirectoryMode = "0700";
+            ExecStartPre = "+${lib.getExe render}";
+            ExecStart = "${lib.getExe' pkgs.dex-oidc "dex"} serve ${runtimeDir}/config.json";
+          }
+        ];
       }
     ];
   };

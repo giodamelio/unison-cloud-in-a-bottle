@@ -22,7 +22,7 @@
 
   roleSql = name: role: ''
     SELECT format('CREATE ROLE %I', '${name}') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${name}') \gexec
-    ALTER ROLE "${name}" LOGIN ${lib.optionalString (!role.createdb) "NO"}CREATEDB;
+    ALTER ROLE "${name}" LOGIN NOSUPERUSER NOCREATEROLE NOREPLICATION NOBYPASSRLS ${lib.optionalString (!role.createdb) "NO"}CREATEDB;
   '';
   databaseSql = name: db: ''
     SELECT format('CREATE DATABASE %I OWNER %I', '${name}', '${db.owner}') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${name}') \gexec
@@ -45,6 +45,11 @@ in {
         `/run/postgresql` with peer authentication, which the network namespace doesn't
         affect. `external` connects over TCP with passwords to a server you prepare
         yourself (see `database.external`); add its address to `egress.allowedDestinations`.
+
+        In `host` mode the module never edits `pg_hba.conf`. It relies on NixOS's default
+        `local all all peer`, or any rule that lets each `unison-cloud-*` system user log in
+        as the role of the same name. Its roles are `NOSUPERUSER` and `NOCREATEROLE`; only
+        ExtendDB's has `CREATEDB`, because ExtendDB creates its own databases.
       '';
     };
 
@@ -88,7 +93,8 @@ in {
           default = "extenddb";
           description = ''
             Role ExtendDB connects as. It needs `CREATEDB`: on first start ExtendDB creates
-            and owns the `extenddb` and `extenddb_catalog` databases, which must not exist yet.
+            and owns the `extenddb.database` database and its `_catalog` companion, which
+            must not exist yet.
           '';
         };
 
