@@ -57,6 +57,8 @@ in {
     imports = [self.nixosModules.default];
 
     networking.nftables.enable = true;
+    # What egress.enable asks for: the module's own forward rule keeps egress working.
+    networking.firewall.filterForward = true;
     networking.interfaces.eth1.ipv4.addresses = extraAddresses "machine";
     networking.firewall.allowedTCPPorts = [9200];
 

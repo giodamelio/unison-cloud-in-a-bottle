@@ -139,10 +139,12 @@ in {
         default = true;
         description = ''
           Give the namespace outbound internet through a veth pair and masquerading on the
-          host. This turns on IPv4 forwarding (`net.ipv4.conf.all.forwarding`) for the
-          whole host, so the host routes between all its interfaces; set
-          `networking.firewall.filterForward` if it shouldn't. Needs
-          `networking.nftables.enable`.
+          host. Needs `networking.nftables.enable`.
+
+          This turns on IPv4 forwarding (`net.ipv4.conf.all.forwarding`) for the whole
+          host, so without a forward filter the host routes between all its interfaces.
+          Set `networking.firewall.filterForward = true`. The module adds its own
+          forward rule for the namespace's veth, so egress keeps working with it on.
         '';
       };
 
