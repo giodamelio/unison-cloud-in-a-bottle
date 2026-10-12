@@ -44,6 +44,8 @@
   testScript = {nodes, ...}: let
     cfg = nodes.machine.services.unison-cloud;
   in ''
+    import base64
+    import hashlib
     import json
     import re
     import shlex
@@ -84,8 +86,14 @@
             f"curl -sf '{consul}/nimbus-client?passing=true' | jq -e 'length == {len(nodes)}'"
         ), timeout=60)
 
-    headers = "-H 'Host: cloud.localhost' -H 'X-Auth-Request-User: sub-alice' -H 'X-Auth-Request-Preferred-Username: Alice' -H 'X-Auth-Request-Email: alice@example.com'"
-    token = machine.succeed(ns(f"curl -sf {headers} http://127.0.0.1:5424/selfhost/access-token")).strip()
+    verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    machine.wait_for_unit("unison-cloud-dex.service")
+    token = json.loads(machine.succeed(ns(
+        f"hurl --connect-to ${cfg.domains.api}:${toString cfg.ingress.port}:127.0.0.1:${toString cfg.internal.dexPort} --variable api=http://127.0.0.1:5424"
+        f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
+        f" --secret password=$(cat {secrets}/dex-admin-password) ${./hurl/login-loopback.hurl}"
+    )))["access_token"]
 
     def deploy(command):
         env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT=5424 UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"

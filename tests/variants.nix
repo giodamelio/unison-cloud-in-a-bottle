@@ -89,6 +89,7 @@
     config,
     lib,
     nodes,
+    pkgs,
     ...
   }: let
     interactive = lib.findFirst (node: node.type == "interactive") (throw "no interactive node") config.services.unison-cloud.internal.nimbusNodes;
@@ -152,13 +153,18 @@
       "f+ /etc/unison-cloud-secrets/s3-secret-access-key 0600 root root - external-s3-secret"
     ];
 
-    environment.systemPackages = [deployProgram];
+    environment.systemPackages = [deployProgram pkgs.hurl];
 
     virtualisation.memorySize = 4096;
     virtualisation.cores = 4;
   };
 
-  testScript = ''
+  testScript = {nodes, ...}: let
+    external = nodes.external.services.unison-cloud;
+  in ''
+    import base64
+    import hashlib
+    import json
     import re
     import shlex
 
@@ -193,8 +199,7 @@
         machine.fail("ss -Hltn | grep -E ':(80|443) '")
         for s in ["cloud-api", "dex"]:
             machine.succeed(f"test -S /run/unison-cloud/{s}.sock")
-        headers = "-H 'X-Auth-Request-User: sub-bob' -H 'X-Auth-Request-Preferred-Username: bob' -H 'X-Auth-Request-Email: bob@example.com'"
-        machine.succeed(f"curl -sf {sock} {headers} http://x/selfhost/access-token")
+        machine.succeed(f"curl -sf {sock} -o /dev/null http://x/.well-known/openid-configuration")
 
     with subtest("an external Postgres over TCP with passwords"):
         db.wait_for_unit("postgresql.service")
@@ -218,8 +223,14 @@
             "ip netns exec unison-cloud curl -sf 'http://127.0.0.1:8500/v1/health/service/byoc-nimbus-http?passing=true' | grep -q nimbus",
             timeout=180,
         )
-        headers = "-H 'Host: cloud.localhost' -H 'X-Auth-Request-User: sub-erin' -H 'X-Auth-Request-Preferred-Username: erin' -H 'X-Auth-Request-Email: erin@example.com'"
-        token = external.succeed(f"ip netns exec unison-cloud curl -sf {headers} http://127.0.0.1:5424/selfhost/access-token").strip()
+        verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        external.wait_for_unit("unison-cloud-dex.service")
+        token = json.loads(external.succeed(
+            "ip netns exec unison-cloud hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.internal.dexPort} --variable api=http://127.0.0.1:5424"
+            f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
+            " --secret password=$(cat /var/lib/unison-cloud/secrets/dex-admin-password) ${./hurl/login-loopback.hurl}"
+        ))["access_token"]
         env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT=5424 UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
         output = external.succeed(f"ip netns exec unison-cloud env {env} deploy-program hello")
         url = dict(re.findall(r"(\w+)=(\S+)", next(l for l in output.splitlines() if l.startswith("hello "))))["url"]
