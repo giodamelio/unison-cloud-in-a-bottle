@@ -5,6 +5,7 @@
   runCommand,
   stacklock2nix,
   src,
+  stdenv,
 }: let
   patches = [
     ../../patches/cloud-api/0001-remove-unused-api-types.patch
@@ -47,6 +48,12 @@
       pvar = haskell.lib.dontCheck hprev.pvar;
       # Its tests don't compile against the snapshot's QuickCheck.
       xmlgen = haskell.lib.dontCheck hprev.xmlgen;
+      # On aarch64 its native toHalf and the C one encode NaN with different bits, which its
+      # tests compare. Skipped only there so the x86_64 build keeps its cached hashes.
+      half =
+        if stdenv.hostPlatform.isAarch64
+        then haskell.lib.dontCheck hprev.half
+        else hprev.half;
       # Its cbits declare `void check_impl_specific();` and define it with arguments, which
       # C23 (GCC 15's default) rejects. Fixed upstream in 1.4, but the snapshot pins 1.3.1.
       hashtables = haskell.lib.appendConfigureFlag hprev.hashtables "--ghc-option=-optc-std=gnu17";
