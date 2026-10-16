@@ -27,15 +27,19 @@
     lib.optional dex.adminUser.enable {
       email = "admin@${cfg.domains.api}";
       username = "admin";
-      passwordHashFile = "${secrets}/dex-admin-password.bcrypt";
+      passwordHashFile = "${runtimeDir}/admin.bcrypt";
     }
     ++ dex.users;
 
   # Dex's config holds runtime-generated secrets, so it's assembled at start rather than in the store.
   render = pkgs.writeShellApplication {
     name = "unison-cloud-dex-render";
-    runtimeInputs = [pkgs.jq pkgs.util-linux pkgs.coreutils];
+    runtimeInputs = [pkgs.jq pkgs.util-linux pkgs.coreutils pkgs.mkpasswd];
     text = ''
+      umask 077
+      ${lib.optionalString dex.adminUser.enable ''
+        mkpasswd -m bcrypt -R 10 -s < ${secrets}/dex-admin-password > ${runtimeDir}/admin.bcrypt
+      ''}
       passwords='[]'
       ${lib.concatMapStrings (u: ''
           # The sub claim Dex issues comes from userID, so derive it from the email: the
@@ -51,7 +55,7 @@
         users}
       jq \
         --argjson passwords "$passwords" \
-        --arg secret "$(< /run/credentials/unison-cloud-dex.service/dex-client-secret)" \
+        --arg secret "$(< /run/credentials/unison-cloud-dex.service/oidc-client-secret)" \
         '. + {staticPasswords: $passwords, staticClients: [{
           id: "cloud-api",
           name: "Unison Cloud",
@@ -119,6 +123,10 @@ in {
     };
     users.groups.${user} = {};
 
+    services.unison-cloud.internal.secretGenerators =
+      {oidc-client-secret = "openssl rand -hex 32";}
+      // lib.optionalAttrs dex.adminUser.enable {dex-admin-password = "openssl rand -hex 16";};
+
     systemd.tmpfiles.settings.unison-cloud-dex.${dataDir}.d = {
       inherit user;
       group = user;
@@ -134,7 +142,7 @@ in {
         after = ["unison-cloud-secrets.service"];
         restartTriggers = [baseConfig];
         serviceConfig = lib.mkMerge [
-          (cfg.internal.loadSecrets ["dex-client-secret"])
+          (cfg.internal.loadSecrets ["oidc-client-secret"])
           {
             User = user;
             Group = user;

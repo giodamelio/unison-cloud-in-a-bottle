@@ -31,23 +31,10 @@ in {
         clientId = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
           default = null;
-          description = "Confidential client at the external provider, whose redirect URI is `<public API URL>/selfhost/oidc/callback`.";
-        };
-
-        clientSecretFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = "File holding the external provider's client secret. A string, so the secret never enters the Nix store.";
-        };
-
-        clientSecretCredential = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          example = "unison-cloud-oidc-client-secret";
           description = ''
-            The external provider's client secret as a systemd encrypted credential: a name
-            in `/etc/credstore.encrypted/` or an absolute path. systemd checks the name
-            embedded in it, so encrypt it with `systemd-creds encrypt --name=oidc-client-secret`.
+            Confidential client at the external provider, whose redirect URI is
+            `<public API URL>/selfhost/oidc/callback`. Supply its secret as
+            `oidc-client-secret` in `secrets.files` or `secrets.credentials`.
           '';
         };
 
@@ -112,17 +99,6 @@ in {
         defaultText = lib.literalMD "the bundled Dex's issuer, or `auth.oidc.issuer`";
         description = "Issuer users log in through; cloud-api records identities against it.";
       };
-
-      oidcSecretCredential = lib.mkOption {
-        type = lib.types.str;
-        internal = true;
-        readOnly = true;
-        default =
-          if dex.enable
-          then "dex-client-secret"
-          else "oidc-client-secret";
-        description = "Name of the credential cloud-api reads its OIDC client secret from.";
-      };
     };
   };
 
@@ -131,10 +107,6 @@ in {
       {
         assertion = dex.enable || (oidc.issuer != null && oidc.clientId != null);
         message = "services.unison-cloud: with auth.dex.enable = false, set auth.oidc.issuer and clientId.";
-      }
-      {
-        assertion = dex.enable || lib.count (s: s != null) [oidc.clientSecretFile oidc.clientSecretCredential] == 1;
-        message = "services.unison-cloud: with auth.dex.enable = false, set exactly one of auth.oidc.clientSecretFile and clientSecretCredential.";
       }
       {
         assertion = dex.enable || allowlisted;
@@ -180,12 +152,6 @@ in {
           CLOUD_OIDC_TOKEN_URL = oidc.endpoints.token;
           CLOUD_OIDC_JWKS_URL = oidc.endpoints.jwks;
         };
-      serviceConfig =
-        if dex.enable
-        then cfg.internal.loadSecrets ["dex-client-secret"]
-        else if oidc.clientSecretCredential != null
-        then {LoadCredentialEncrypted = ["oidc-client-secret:${oidc.clientSecretCredential}"];}
-        else {LoadCredential = lib.optional (oidc.clientSecretFile != null) "oidc-client-secret:${oidc.clientSecretFile}";};
     };
   };
 }

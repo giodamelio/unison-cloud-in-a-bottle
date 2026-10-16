@@ -106,6 +106,9 @@
     VALUES ('${clusterId}', '${systemUserId}', encode(sha512(convert_to(:'token', 'UTF8')), 'hex'));
   '';
 
+  # cloud-api sends error reports to Sentry only when you supply a DSN.
+  sentry = cfg.secrets.files ? sentry-dsn || cfg.secrets.credentials ? sentry-dsn;
+
   start = pkgs.writeShellScript "unison-cloud-api-start" ''
     creds=$CREDENTIALS_DIRECTORY
     export AWS_ACCESS_KEY_ID=$(< "$creds/s3-access-key-id")
@@ -115,7 +118,7 @@
     export CLOUD_HMAC_KEY=$(< "$creds/cloud-hmac-key")
     export CLOUD_INTERNAL_AUTH_TOKEN=$(< "$creds/internal-auth-token")
     export CONSUL_HTTP_TOKEN=$(< "$creds/consul-token")
-    export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/${cfg.internal.oidcSecretCredential}")
+    export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/oidc-client-secret")
     CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
     ${lib.optionalString pg.external ''
       # libpq keyword values are single-quoted, with backslash and quote escaped.
@@ -125,19 +128,13 @@
       CLOUD_POSTGRES="$CLOUD_POSTGRES password='$password'"
     ''}
     export CLOUD_POSTGRES
-    ${lib.optionalString (cfg.sentry.dsnFile != null) ''
+    ${lib.optionalString sentry ''
       CLOUD_SENTRY_DSN=$(< "$creds/sentry-dsn")
       export CLOUD_SENTRY_DSN
     ''}
     exec ${lib.getExe' cfg.cloudApi.package "cloud-exe"}
   '';
 in {
-  options.services.unison-cloud.sentry.dsnFile = lib.mkOption {
-    type = lib.types.nullOr lib.types.str;
-    default = null;
-    description = "File holding a Sentry DSN for cloud-api's error reports.";
-  };
-
   options.services.unison-cloud.cloudApi = {
     enable = lib.mkOption {
       type = lib.types.bool;
@@ -317,15 +314,17 @@ in {
             CLOUD_ZENDESK_API_TOKEN = "unused";
           };
         serviceConfig = lib.mkMerge [
-          (cfg.internal.loadSecrets [
-            "s3-access-key-id"
-            "s3-secret-access-key"
-            "cloud-eddsa-key"
-            "share-eddsa-key"
-            "cloud-hmac-key"
-            "internal-auth-token"
-            "consul-token"
-          ])
+          (cfg.internal.loadSecrets ([
+              "s3-access-key-id"
+              "s3-secret-access-key"
+              "cloud-eddsa-key"
+              "share-eddsa-key"
+              "cloud-hmac-key"
+              "internal-auth-token"
+              "consul-token"
+              "oidc-client-secret"
+            ]
+            ++ lib.optional sentry "sentry-dsn"))
           # Signed-in users reach cloud-api directly, and it shares the host's loopback
           # with hosted code, so it sees only the host paths it uses.
           cfg.internal.hostIsolation
@@ -335,9 +334,7 @@ in {
             BindPaths = lib.optional (!pg.external) cfg.internal.postgresSocketDir;
             RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
             SystemCallFilter = ["@system-service"];
-            LoadCredential =
-              pgCredentials
-              ++ lib.optional (cfg.sentry.dsnFile != null) "sentry-dsn:${cfg.sentry.dsnFile}";
+            LoadCredential = pgCredentials;
             ExecStart = start;
             Restart = "on-failure";
           }

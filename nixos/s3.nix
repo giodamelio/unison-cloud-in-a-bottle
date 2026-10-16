@@ -11,7 +11,6 @@
   domain = cfg.internal.s3Domain;
   ext = cfg.s3.external;
   buckets = lib.attrValues cfg.s3.buckets;
-  credentialsSupplied = name: cfg.secrets.files ? ${name} || cfg.secrets.credentials ? ${name};
 in {
   options.services.unison-cloud = {
     s3 = {
@@ -114,8 +113,8 @@ in {
     {
       assertions = [
         {
-          assertion = cfg.s3.bundled || (ext.host != null && credentialsSupplied "s3-access-key-id" && credentialsSupplied "s3-secret-access-key");
-          message = "services.unison-cloud: with s3.bundled = false, set s3.external.host and supply s3-access-key-id and s3-secret-access-key through secrets.files or secrets.credentials.";
+          assertion = cfg.s3.bundled || ext.host != null;
+          message = "services.unison-cloud: with s3.bundled = false, set s3.external.host.";
         }
       ];
     }
@@ -125,6 +124,12 @@ in {
         group = user;
       };
       users.groups.${user} = {};
+
+      # AWS-shaped, so SDKs accept it.
+      services.unison-cloud.internal.secretGenerators = {
+        s3-access-key-id = ''printf AKIA%s "$(openssl rand -hex 8 | tr a-f A-F)"'';
+        s3-secret-access-key = "openssl rand -hex 20";
+      };
 
       networking.hosts."127.0.0.1" = [domain] ++ map (bucket: "${bucket}.${domain}") buckets;
 

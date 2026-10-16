@@ -244,11 +244,7 @@ in {
         }
       ];
 
-      systemd.tmpfiles.settings.unison-cloud-state.${cfg.stateDir}.d = {
-        user = "root";
-        group = "root";
-        mode = "0755";
-      };
+      services.unison-cloud.internal.secretGenerators.nimbus-db-password = lib.mkIf (!external) "openssl rand -hex 24";
 
       systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [
         cfg.internal.sandbox

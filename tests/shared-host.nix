@@ -99,7 +99,6 @@ in {
         oidc = {
           issuer = "https://login.test";
           clientId = "unison-cloud";
-          clientSecretCredential = "unison-cloud-oidc-client-secret";
           endpoints = {
             authorization = "https://login.test/auth";
             token = "http://127.0.0.1:5557/token";
@@ -120,6 +119,7 @@ in {
         };
       };
       secrets.credentials = {
+        oidc-client-secret = "unison-cloud-oidc-client-secret";
         s3-access-key-id = "unison-cloud-s3-access-key-id";
         s3-secret-access-key = "unison-cloud-s3-secret-access-key";
       };
@@ -409,8 +409,7 @@ in {
 
     with subtest("with the bundled Dex off, none of it runs or exists"):
         machine.fail("systemctl cat unison-cloud-dex.service")
-        for name in ["dex-client-secret", "dex-admin-password", "dex-admin-password.bcrypt"]:
-            machine.fail(f"test -e {secrets}/{name}")
+        machine.fail(f"test -e {secrets}/dex-admin-password")
 
     with subtest("credential-supplied secrets are never written in plaintext"):
         for name in ["s3-access-key-id", "s3-secret-access-key", "oidc-client-secret"]:

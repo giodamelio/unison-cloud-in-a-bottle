@@ -16,15 +16,22 @@
     "s3-access-key-id"
     "s3-secret-access-key"
     "nimbus-db-password"
-    "dex-client-secret"
+    "oidc-client-secret"
     "consul-token"
+    "sentry-dsn"
   ];
+  # Secrets nothing here generates, so each needs a supplier: you, or a bundled service.
+  requiredNames =
+    ["s3-access-key-id" "s3-secret-access-key" "consul-token"]
+    ++ lib.optional cfg.cloudApi.enable "oidc-client-secret";
+  supplied = name: cfg.secrets.files ? ${name} || credentials ? ${name};
+  unsupplied = lib.filter (name: !(supplied name || cfg.internal.secretGenerators ? ${name})) requiredNames;
 
   gen = name: command: lib.optionalString (!(credentials ? ${name})) "generate ${name} ${command}";
 
   generate = pkgs.writeShellApplication {
     name = "unison-cloud-secrets";
-    runtimeInputs = [pkgs.coreutils pkgs.openssl pkgs.mkpasswd];
+    runtimeInputs = [pkgs.coreutils pkgs.openssl];
     text = ''
       umask 077
       mkdir -p ${dir}
@@ -46,15 +53,6 @@
         fi
       }
 
-      # AWS-shaped, so SDKs accept it.
-      access_key_id() {
-        printf AKIA
-        openssl rand -hex 8 | tr a-f A-F
-      }
-
-      ${gen "s3-access-key-id" "access_key_id"}
-      ${gen "s3-secret-access-key" "openssl rand -hex 20"}
-      ${lib.optionalString (!cfg.internal.postgres.external) (gen "nimbus-db-password" "openssl rand -hex 24")}
       # cloud-api reads its Ed25519 keys as the raw bytes of an environment variable and
       # needs exactly 32 of them, so they must be printable: 24 random bytes in base64.
       ${gen "cloud-eddsa-key" "openssl rand -base64 24"}
@@ -62,20 +60,10 @@
       ${gen "cloud-hmac-key" "openssl rand -hex 32"}
       ${gen "cluster-token" "openssl rand -hex 32"}
       ${gen "internal-auth-token" "openssl rand -hex 32"}
-      ${lib.optionalString cfg.auth.dex.enable (gen "dex-client-secret" "openssl rand -hex 32")}
-      ${lib.optionalString cfg.consul.bundled ''
-        # The bundled Consul creates its tokens with these as their secret IDs, which must be UUIDs.
-        ${gen "consul-token" "cat /proc/sys/kernel/random/uuid"}
-        generate consul-management-token cat /proc/sys/kernel/random/uuid
-        generate consul-agent-token cat /proc/sys/kernel/random/uuid
-      ''}
-      ${lib.optionalString (cfg.auth.dex.enable && cfg.auth.dex.adminUser.enable) ''
-        generate dex-admin-password openssl rand -hex 16
-        if [ ! -e dex-admin-password.bcrypt ] || [ dex-admin-password -nt dex-admin-password.bcrypt ]; then
-          mkpasswd -m bcrypt -R 10 -s < dex-admin-password | tr -d '\n' > dex-admin-password.bcrypt.tmp
-          mv dex-admin-password.bcrypt.tmp dex-admin-password.bcrypt
-        fi
-      ''}
+      ${lib.concatStrings (lib.mapAttrsToList (name: command: ''
+          ${gen name command}
+        '')
+        cfg.internal.secretGenerators)}
     '';
   };
 in {
@@ -84,15 +72,15 @@ in {
     default = {};
     example = {
       cloud-eddsa-key = "/run/agenix/unison-cloud-signing-key";
-      dex-client-secret = "/run/secrets/dex-client-secret";
+      oidc-client-secret = "/run/secrets/oidc-client-secret";
     };
     description = ''
       Secrets to supply instead of generating, by name in `<stateDir>/secrets/`. Every
       start copies each file over the generated one; the rest are generated once and kept.
-      Names: `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each), `cloud-hmac-key`,
-      `cluster-token`, `internal-auth-token`, `s3-access-key-id`,
-      `s3-secret-access-key`, `nimbus-db-password`, `dex-client-secret`,
-      `dex-admin-password`, `consul-token`.
+      The module generates `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each),
+      `cloud-hmac-key`, `cluster-token` and `internal-auth-token`. You supply
+      `s3-access-key-id`, `s3-secret-access-key`, `oidc-client-secret`, `consul-token`
+      and, optionally, `sentry-dsn`, unless a bundled service generates them.
       Paths are strings so the secrets never enter the Nix store.
     '';
   };
@@ -129,6 +117,18 @@ in {
     description = "Unit settings that load these secrets as credentials under their own names, from `secrets.credentials` or the secrets directory.";
   };
 
+  options.services.unison-cloud.internal.secretGenerators = lib.mkOption {
+    type = lib.types.attrsOf lib.types.str;
+    internal = true;
+    default = {};
+    example.oidc-client-secret = "openssl rand -hex 32";
+    description = ''
+      Shell commands that generate secrets the module otherwise needs you to supply, by
+      name. Each runs once, in the secrets unit, unless the secret is supplied; a bundled
+      service uses it for the secrets it creates itself.
+    '';
+  };
+
   config = lib.mkIf cfg.enable {
     assertions = [
       {
@@ -139,15 +139,33 @@ in {
         assertion = lib.all (name: !(cfg.secrets.files ? ${name})) (lib.attrNames credentials);
         message = "services.unison-cloud: supply each secret through secrets.files or secrets.credentials, not both.";
       }
+      {
+        assertion = unsupplied == [];
+        message = "services.unison-cloud: supply ${lib.concatStringsSep ", " unsupplied} through secrets.files or secrets.credentials.";
+      }
     ];
 
-    systemd.services.unison-cloud-secrets = {
-      description = "Generate Unison Cloud secrets";
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = lib.getExe generate;
-      };
+    systemd.tmpfiles.settings.unison-cloud-state.${cfg.stateDir}.d = {
+      user = "root";
+      group = "root";
+      mode = "0755";
     };
+
+    systemd.services.unison-cloud-secrets = lib.mkMerge [
+      cfg.internal.sandbox
+      {
+        description = "Generate Unison Cloud secrets";
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          # Supplied files may live under /root or /home.
+          ProtectHome = "read-only";
+          ProtectSystem = "strict";
+          ReadWritePaths = [cfg.stateDir];
+          PrivateNetwork = true;
+          ExecStart = lib.getExe generate;
+        };
+      }
+    ];
   };
 }

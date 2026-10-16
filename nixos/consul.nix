@@ -227,13 +227,6 @@ in {
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
-      assertions = [
-        {
-          assertion = cfg.consul.bundled || cfg.secrets.files ? consul-token || cfg.secrets.credentials ? consul-token;
-          message = "services.unison-cloud: with consul.bundled = false, supply consul-token in secrets.files or secrets.credentials.";
-        }
-      ];
-
       systemd.services.unison-cloud-consul-services = lib.mkMerge [
         cfg.internal.sandbox
         {
@@ -261,6 +254,9 @@ in {
         group = user;
       };
       users.groups.${user} = {};
+
+      # The server creates its tokens with these as their secret IDs, which must be UUIDs.
+      services.unison-cloud.internal.secretGenerators = lib.genAttrs ["consul-token" "consul-management-token" "consul-agent-token"] (_: "cat /proc/sys/kernel/random/uuid");
 
       systemd.tmpfiles.settings.unison-cloud-consul.${dataDir}.d = {
         inherit user;
