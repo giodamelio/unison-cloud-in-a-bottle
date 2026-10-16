@@ -91,7 +91,7 @@
     VALUES (
       '${clusterId}', 'default', '${cfg.domains.api}', 'local',
       '${cfg.internal.publicUrl.apps}', '${cfg.internal.publicUrl.apps}',
-      'http://127.0.0.1:3100', 'nimbus', '${systemUserId}', '${systemUserId}'
+      'http://127.0.0.1:${toString cfg.internal.lokiPort}', 'nimbus', '${systemUserId}', '${systemUserId}'
     )
     ON CONFLICT (id) DO UPDATE SET
       hostname = EXCLUDED.hostname,
@@ -141,20 +141,22 @@ in {
     '';
   };
 
-  options.services.unison-cloud.internal = {
-    cloudApiPort = lib.mkOption {
+  options.services.unison-cloud.cloudApi = {
+    port = lib.mkOption {
       type = lib.types.port;
-      internal = true;
-      readOnly = true;
-      default = 5424;
-      description = "cloud-api's HTTP port, on the namespace loopback.";
+      default = 24100;
+      description = "cloud-api's HTTP port. cloud-api listens on every address.";
+    };
+
+    clientPort = lib.mkOption {
+      type = lib.types.port;
+      default = 24101;
+      description = "Port of cloud-api's TCP listener for the cloud client. cloud-api listens on every address.";
     };
 
     secretsPort = lib.mkOption {
       type = lib.types.port;
-      internal = true;
-      readOnly = true;
-      default = 5426;
+      default = 24102;
       description = "Port of cloud-api's Vault-compatible secrets listener, which nimbus uses.";
     };
   };
@@ -168,7 +170,7 @@ in {
 
     services.unison-cloud.internal = {
       egressUsers = lib.mkIf (cfg.sentry.dsnFile != null) [user];
-      ingressSockets.cloud-api = cfg.internal.cloudApiPort;
+      ingressSockets.cloud-api = cfg.cloudApi.port;
       # cloud-api finds its peers under this name, to forward invalidations to the nodes
       # connected to them.
       consulServices = [
@@ -176,10 +178,10 @@ in {
           ID = "${cfg.consul.prefix}-cloud-api";
           Name = "${cfg.consul.prefix}-cloud-api";
           Address = "127.0.0.1";
-          Port = cfg.internal.cloudApiPort;
+          Port = cfg.cloudApi.port;
           Checks = [
             {
-              TCP = "127.0.0.1:${toString cfg.internal.cloudApiPort}";
+              TCP = "127.0.0.1:${toString cfg.cloudApi.port}";
               Interval = "10s";
             }
           ];
@@ -265,9 +267,9 @@ in {
             CLOUD_CLOUD_HOMEPAGE_ORIGIN = cfg.internal.publicUrl.ui;
             CLOUD_API_SUFFIX = cfg.domains.api;
 
-            NOMAD_ALLOC_PORT_cloud_http = toString cfg.internal.cloudApiPort;
+            NOMAD_ALLOC_PORT_cloud_http = toString cfg.cloudApi.port;
             NOMAD_HOST_IP_cloud_tcp = "127.0.0.1";
-            NOMAD_ALLOC_PORT_cloud_tcp = "5425";
+            NOMAD_ALLOC_PORT_cloud_tcp = toString cfg.cloudApi.clientPort;
 
             CLOUD_POSTGRES_CONN_MAX = "10";
             CONSUL_HOST = cfg.consul.address;
@@ -275,7 +277,7 @@ in {
 
             CLOUD_ENVIRONMENTS_MOUNT = "environments";
             CLOUD_SECRETS_HOST = "127.0.0.1";
-            CLOUD_SECRETS_PORT = toString cfg.internal.secretsPort;
+            CLOUD_SECRETS_PORT = toString cfg.cloudApi.secretsPort;
 
             AWS_REGION = s3.region;
             CLOUD_S3_ENDPOINT =

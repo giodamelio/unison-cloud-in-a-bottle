@@ -16,7 +16,7 @@
       http_listen_address = "127.0.0.1";
       http_listen_port = cfg.internal.lokiPort;
       grpc_listen_address = "127.0.0.1";
-      grpc_listen_port = 9096;
+      grpc_listen_port = cfg.internal.lokiGrpcPort;
       log_level = "warn";
     };
     common = {
@@ -97,8 +97,16 @@ in {
     type = lib.types.port;
     internal = true;
     readOnly = true;
-    default = 3100;
+    default = 24152;
     description = "HTTP port of the bundled Loki, on the namespace loopback.";
+  };
+
+  options.services.unison-cloud.internal.lokiGrpcPort = lib.mkOption {
+    type = lib.types.port;
+    internal = true;
+    readOnly = true;
+    default = 24153;
+    description = "gRPC port of the bundled Loki, on the namespace loopback.";
   };
 
   config = lib.mkIf cfg.enable {

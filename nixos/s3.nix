@@ -120,7 +120,7 @@ in {
         type = lib.types.port;
         internal = true;
         readOnly = true;
-        default = 7070;
+        default = 24151;
         description = "Port of the S3 store, or of the bridge to an external one, on the namespace loopback.";
       };
 

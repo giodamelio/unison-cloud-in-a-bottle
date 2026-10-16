@@ -356,9 +356,9 @@ in {
 
     with subtest("only cloud-api and nimbus may use the S3 bridge"):
         for user in ["unison-cloud-api", "unison-cloud-nimbus"]:
-            machine.succeed(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:7070/"))
+            machine.succeed(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:${toString cfg.internal.s3Port}/"))
         for user in ["unison-cloud-outbound-proxy", "root"]:
-            machine.fail(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:7070/"))
+            machine.fail(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:${toString cfg.internal.s3Port}/"))
 
     with subtest("only nimbus may use the PostgreSQL bridge"):
         machine.succeed(as_user("unison-cloud-nimbus", "bash -c ': </dev/tcp/127.0.0.1/5432'"))
@@ -366,7 +366,7 @@ in {
             machine.fail(as_user(user, "timeout 5 bash -c ': </dev/tcp/127.0.0.1/5432'"))
 
     with subtest("the bridges expose nothing on the host"):
-        machine.fail("ss -Hltn | grep -E ':(5427|7070) '")
+        machine.fail("ss -Hltn | grep -E ':(5427|${toString cfg.internal.s3Port}) '")
         assert machine.succeed("find /run -type s -path '*bridge*'").strip() == ""
 
     with subtest("the S3 names resolve to the bridge only inside cloud-api and nimbus"):
@@ -400,7 +400,7 @@ in {
 
     with subtest("nimbus reaches the internet only through the outbound proxy"):
         machine.fail(as_user("unison-cloud-nimbus", "curl -s -m 5 -o /dev/null http://${public.internet}/"))
-        out = machine.succeed(as_user("unison-cloud-nimbus", "curl -sf -m 10 -x http://127.0.0.1:3128 http://${public.internet}/"))
+        out = machine.succeed(as_user("unison-cloud-nimbus", "curl -sf -m 10 -x http://127.0.0.1:${toString cfg.internal.outboundProxyPort} http://${public.internet}/"))
         assert out == "hello from the internet\n", out
 
     with subtest("nimbus can't reach the host's sockets or state"):

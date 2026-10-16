@@ -100,7 +100,7 @@ in {
       type = lib.types.port;
       internal = true;
       readOnly = true;
-      default = 3128;
+      default = 24155;
       description = "Port of the outbound proxy hosted code's requests go through, on the namespace loopback.";
     };
   };

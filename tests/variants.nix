@@ -219,11 +219,11 @@
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         external.wait_for_unit("unison-cloud-dex.service")
         token = json.loads(external.succeed(
-            "ip netns exec unison-cloud hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.internal.dexPort} --variable api=http://127.0.0.1:5424"
+            "ip netns exec unison-cloud hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.internal.dexPort} --variable api=http://127.0.0.1:${toString external.cloudApi.port}"
             f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
             " --secret password=$(cat /var/lib/unison-cloud/secrets/dex-admin-password) ${./hurl/login-loopback.hurl}"
         ))["access_token"]
-        env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT=5424 UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
+        env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT=${toString external.cloudApi.port} UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
         output = external.succeed(f"ip netns exec unison-cloud env {env} deploy-program hello")
         url = dict(re.findall(r"(\w+)=(\S+)", next(l for l in output.splitlines() if l.startswith("hello "))))["url"]
         assert external.succeed(f"ip netns exec unison-cloud curl -sf {url}") == "hello from deploy-program"

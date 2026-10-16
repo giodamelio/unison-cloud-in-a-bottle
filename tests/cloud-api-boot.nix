@@ -35,11 +35,15 @@ self: {
   };
 
   testScript = {nodes, ...}: let
-    sql = nodes.machine.services.unison-cloud.cloudApi.package.sql;
+    cfg = nodes.machine.services.unison-cloud;
+    inherit (cfg.cloudApi.package) sql;
   in ''
     import shlex
 
     secrets = "/var/lib/unison-cloud/secrets"
+    api_port = ${toString cfg.cloudApi.port}
+    secrets_port = ${toString cfg.cloudApi.secretsPort}
+    s3_port = ${toString cfg.internal.s3Port}
 
     def ns(cmd):
         return f"ip netns exec unison-cloud {cmd}"
@@ -49,12 +53,12 @@ self: {
             "env AWS_CONFIG_FILE=/etc/aws-config"
             f" AWS_ACCESS_KEY_ID=$(cat {secrets}/s3-access-key-id)"
             f" AWS_SECRET_ACCESS_KEY=$(cat {secrets}/s3-secret-access-key)"
-            f" aws --endpoint-url http://s3.unison-cloud.internal:7070 s3api {args}"
+            f" aws --endpoint-url http://s3.unison-cloud.internal:{s3_port} s3api {args}"
         )
 
     machine.wait_for_unit("unison-cloud-s3.service")
     machine.wait_for_unit("unison-cloud-consul.service")
-    machine.wait_until_succeeds(ns("curl -s -o /dev/null http://127.0.0.1:7070/"), timeout=60)
+    machine.wait_until_succeeds(ns(f"curl -s -o /dev/null http://127.0.0.1:{s3_port}/"), timeout=60)
 
     with subtest("both buckets exist"):
         buckets = machine.succeed(s3("list-buckets --query 'Buckets[].Name' --output text")).split()
@@ -75,7 +79,7 @@ self: {
     with subtest("S3 rejects wrong credentials"):
         machine.fail(ns(
             "env AWS_CONFIG_FILE=/etc/aws-config AWS_ACCESS_KEY_ID=AKIAWRONGWRONGWRONG0 AWS_SECRET_ACCESS_KEY=wrong"
-            " aws --endpoint-url http://s3.unison-cloud.internal:7070 s3api list-buckets"
+            f" aws --endpoint-url http://s3.unison-cloud.internal:{s3_port} s3api list-buckets"
         ))
 
     with subtest("Consul has elected itself leader"):
@@ -90,7 +94,7 @@ self: {
         return ns(f"curl -s -H 'Host: cloud.test' {args}")
 
     machine.wait_for_unit("unison-cloud-api.service")
-    machine.wait_until_succeeds(api("-o /dev/null -w '%{http_code}' http://127.0.0.1:5424/v2/account | grep -q 401"), timeout=120)
+    machine.wait_until_succeeds(api(f"-o /dev/null -w '%{{http_code}}' http://127.0.0.1:{api_port}/v2/account | grep -q 401"), timeout=120)
 
     with subtest("every migration except the test seed data is applied and recorded"):
         applied = int(psql("SELECT count(*) FROM selfhost.applied_migrations"))
@@ -113,10 +117,10 @@ self: {
         machine.wait_for_unit("unison-cloud-migrate.service")
         # The failed migration took the seed and cloud-api down with it, through Requires=.
         machine.systemctl("start unison-cloud-api.service")
-        machine.wait_until_succeeds(api("-o /dev/null -w '%{http_code}' http://127.0.0.1:5424/v2/account | grep -q 401"), timeout=120)
+        machine.wait_until_succeeds(api(f"-o /dev/null -w '%{{http_code}}' http://127.0.0.1:{api_port}/v2/account | grep -q 401"), timeout=120)
 
     with subtest("the seed registers the cluster and the hash of nimbus's token"):
-        assert psql("SELECT hostname || ' ' || service_uri || ' ' || loki_uri FROM cloud_clusters WHERE id = 'd3ee426c-c252-4910-a861-08fccf85fb66'") == "cloud.test https://apps.test http://127.0.0.1:3100"
+        assert psql("SELECT hostname || ' ' || service_uri || ' ' || loki_uri FROM cloud_clusters WHERE id = 'd3ee426c-c252-4910-a861-08fccf85fb66'") == "cloud.test https://apps.test http://127.0.0.1:${toString cfg.internal.lokiPort}"
         token = machine.succeed(f"cat {secrets}/cluster-token").strip()
         expected = machine.succeed(f"printf %s {token} | sha512sum").split()[0]
         assert psql("SELECT token_hash FROM cloud_cluster_tokens") == expected
@@ -135,19 +139,19 @@ self: {
             f" ('{other_env}', '7f3c2a1e-0d4b-4c6a-9e2f-5b8d1c3a7e90', 'test', '33333333-3333-4333-8333-333333333333')"
         )
         machine.succeed(ns(
-            f"hurl --test --variable base=http://127.0.0.1:5426 --variable env={env} --variable other_env={other_env}"
+            f"hurl --test --variable base=http://127.0.0.1:{secrets_port} --variable env={env} --variable other_env={other_env}"
             f" --secret token=$(cat {secrets}/cluster-token) ${./hurl/secrets.hurl}"
         ))
         assert psql(f"SELECT count(*) FROM selfhost.environment_secrets WHERE environment_id = '{env}'") == "0"
 
     with subtest("on its loopback port, cloud-api has no way in but the OIDC login, forged headers or not"):
         machine.succeed(ns(
-            "hurl --test --variable api=http://127.0.0.1:5424 --variable cluster=d3ee426c-c252-4910-a861-08fccf85fb66"
+            f"hurl --test --variable api=http://127.0.0.1:{api_port} --variable cluster=d3ee426c-c252-4910-a861-08fccf85fb66"
             f" --secret internal_token=$(cat {secrets}/internal-auth-token) ${./hurl/removed-routes.hurl}"
         ))
         assert psql("SELECT count(*) FROM users WHERE handle = 'forged'") == "0"
 
     with subtest("nothing listens outside the namespace"):
-        machine.fail("ss -Hltn | grep -E ':(7070|8500|5432|5424|5426) '")
+        machine.fail(f"ss -Hltn | grep -E ':({s3_port}|8500|5432|{api_port}|{secrets_port}) '")
   '';
 }

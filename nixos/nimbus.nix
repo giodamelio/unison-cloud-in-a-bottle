@@ -60,7 +60,7 @@
     }
   ];
   nodes = lib.imap0 (slot: node: let
-    base = 17010 + 10 * slot;
+    base = cfg.nimbus.basePort + 10 * slot;
   in
     node
     // {
@@ -123,10 +123,10 @@
         // db;
       vault = {
         host = "127.0.0.1";
-        port = cfg.internal.secretsPort;
+        port = cfg.cloudApi.secretsPort;
         scheme = "http";
       };
-      cloudApiInstances = [{uri = "http://127.0.0.1:${toString cfg.internal.cloudApiPort}";}];
+      cloudApiInstances = [{uri = "http://127.0.0.1:${toString cfg.cloudApi.port}";}];
       # The client's `Cloud.logs` gets a token from cloud-api and then asks nimbus, which
       # queries Loki itself; the labels are the ones the log shipper sets.
       logs.provider = {
@@ -260,6 +260,15 @@ in {
         example = ["1f13c72e-b554-4622-9d8e-fc5a603700a2"];
         description = "IDs of users nimbus refuses to run code for.";
       };
+
+      basePort = lib.mkOption {
+        type = lib.types.port;
+        default = 24200;
+        description = ''
+          First port of the nodes' port blocks. nimbus listens on every address, so node
+          `k` (the public-daemon node is 0) takes the four ports from `basePort + 10 * k`.
+        '';
+      };
     };
 
     internal.nimbusNodes = lib.mkOption {
@@ -284,8 +293,8 @@ in {
     services.unison-cloud.internal.loopbackRestrictedUsers.${user} =
       [
         cfg.internal.outboundProxyPort
-        cfg.internal.cloudApiPort
-        cfg.internal.secretsPort
+        cfg.cloudApi.port
+        cfg.cloudApi.secretsPort
         cfg.internal.lokiPort
         cfg.internal.s3Port
       ]

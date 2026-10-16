@@ -107,7 +107,7 @@ in {
       type = lib.types.port;
       internal = true;
       readOnly = true;
-      default = 5556;
+      default = 24154;
       description = "Dex's plain HTTP port on the namespace loopback; TLS is the reverse proxy's job.";
     };
   };

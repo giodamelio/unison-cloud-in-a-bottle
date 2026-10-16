@@ -51,6 +51,8 @@
     import shlex
 
     secrets = "/var/lib/unison-cloud/secrets"
+    api_port = ${toString cfg.cloudApi.port}
+    proxy = "http://127.0.0.1:${toString cfg.internal.outboundProxyPort}"
     nodes = json.loads(${builtins.toJSON (builtins.toJSON cfg.internal.nimbusNodes)})
     daemon_unit = next(n["unit"] for n in nodes if n["type"] == "public-daemon")
     interactive_units = [n["unit"] for n in nodes if n["type"] == "interactive"]
@@ -99,13 +101,13 @@
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     machine.wait_for_unit("unison-cloud-dex.service")
     token = json.loads(machine.succeed(ns(
-        f"hurl --connect-to ${cfg.domains.api}:${toString cfg.ingress.port}:127.0.0.1:${toString cfg.internal.dexPort} --variable api=http://127.0.0.1:5424"
+        f"hurl --connect-to ${cfg.domains.api}:${toString cfg.ingress.port}:127.0.0.1:${toString cfg.internal.dexPort} --variable api=http://127.0.0.1:{api_port}"
         f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
         f" --secret password=$(cat {secrets}/dex-admin-password) ${./hurl/login-loopback.hurl}"
     )))["access_token"]
 
     def deploy(command):
-        env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT=5424 UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
+        env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT={api_port} UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
         output = machine.succeed(ns(f"env {env} deploy-program {command}"))
         line = next(l for l in output.splitlines() if l.startswith(command + " "))
         return dict(re.findall(r"(\w+)=(\S+)", line))
@@ -146,19 +148,19 @@
         assert json.loads(machine.succeed(consul("/v1/health/service/unison-cloud-nimbus-http", anonymous=True))) == []
 
     with subtest("hosted code's log lines reach cloud-api's log endpoint through Loki"):
-        hurl("${./hurl/logs.hurl}", api="http://127.0.0.1:5424", host="cloud.localhost", token=token, line="deploy-program hello served")
+        hurl("${./hurl/logs.hurl}", api=f"http://127.0.0.1:{api_port}", host="cloud.localhost", token=token, line="deploy-program hello served")
 
     with subtest("the outbound proxy refuses loopback and private destinations"):
         def through_proxy(url, *extra):
             return machine.succeed(ns(
-                f"curl -s -o /dev/null -w '%{{http_code}}' -x http://127.0.0.1:3128 {' '.join(extra)} {url}"
+                f"curl -s -o /dev/null -w '%{{http_code}}' -x {proxy} {' '.join(extra)} {url}"
             ))
         assert through_proxy("http://127.0.0.1:8500/v1/status/leader") == "403"
         assert through_proxy("http://10.0.2.2/") == "403"
         assert through_proxy("http://169.254.169.254/latest/meta-data/") == "403"
         # The namespace's /etc/hosts names don't resolve through the proxy at all.
         assert through_proxy("http://localhost:5432/") in ("403", "503"), "localhost"
-        machine.fail(ns("curl -sf -x http://127.0.0.1:3128 -p https://127.0.0.1:5432/"))
+        machine.fail(ns(f"curl -sf -x {proxy} -p https://127.0.0.1:5432/"))
 
     with subtest("the nimbus user can't reach Consul even without the proxy"):
         machine.fail(ns("sudo -u unison-cloud-nimbus curl -sf -m 5 http://127.0.0.1:8500/v1/status/leader"))
@@ -168,7 +170,7 @@
 
     with subtest("nothing nimbus listens on is reachable outside the namespace"):
         ports = "|".join(str(p) for n in nodes for p in n["ports"].values())
-        machine.fail(f"ss -Hltn | grep -E ':({ports}|3100|3128) '")
+        machine.fail(f"ss -Hltn | grep -E ':({ports}|${toString cfg.internal.lokiPort}|${toString cfg.internal.outboundProxyPort}) '")
 
     with subtest("a node stops gracefully through its shutdown endpoint"):
         unit = interactive_units[0]
