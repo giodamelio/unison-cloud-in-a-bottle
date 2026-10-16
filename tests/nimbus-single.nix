@@ -1,8 +1,34 @@
 {
   self,
   deployProgram,
-}: {
+}: let
+  # A second network in TEST-NET-3 stands in for the public internet, which Squid lets
+  # hosted code reach; the test VLAN is a private range, which it refuses.
+  public = {
+    internet = "203.0.113.2";
+    machine = "203.0.113.1";
+  };
+in {
   name = "unison-cloud-nimbus-single";
+
+  nodes.internet = {
+    lib,
+    pkgs,
+    ...
+  }: {
+    networking.interfaces.eth1.ipv4.addresses = [
+      {
+        address = public.internet;
+        prefixLength = 24;
+      }
+    ];
+    networking.firewall.allowedTCPPorts = [80];
+    systemd.services.http = {
+      wantedBy = ["multi-user.target"];
+      serviceConfig.ExecStart = "${lib.getExe pkgs.python3} -m http.server 80 --directory ${pkgs.writeTextDir "index.html" "hello from the internet\n"}";
+    };
+    virtualisation.memorySize = 512;
+  };
 
   nodes.machine = {
     config,
@@ -33,6 +59,12 @@
     };
 
     networking.hosts."127.0.0.1" = ["cloud.localhost" "apps.localhost"];
+    networking.interfaces.eth1.ipv4.addresses = [
+      {
+        address = public.machine;
+        prefixLength = 24;
+      }
+    ];
 
     environment.systemPackages = [deployProgram pkgs.hurl pkgs.jq cfg.batteries.postgresql.package];
 
@@ -70,6 +102,8 @@
             used = int(machine.succeed(f"systemctl show -P MemoryCurrent {n['unit']}"))
             print(f"memory {n['unit']}: {used // (1024 * 1024)} MiB")
 
+    start_all()
+    internet.wait_for_unit("http.service")
     machine.wait_for_unit("unison-cloud-api.service")
     for n in nodes:
         machine.wait_for_unit(n["unit"], timeout=600)
@@ -105,7 +139,7 @@
     def deploy(command):
         env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT={api_port} UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
         output = machine.succeed(f"env {env} deploy-program {command}")
-        line = next(l for l in output.splitlines() if l.startswith(command + " "))
+        line = next(l for l in output.splitlines() if l.startswith(command.split()[0] + " "))
         return dict(re.findall(r"(\w+)=(\S+)", line))
 
     with subtest("a hello-world service deploys and answers"):
@@ -157,6 +191,22 @@
         # The host's /etc/hosts names don't resolve through the proxy at all.
         assert through_proxy("http://localhost:5432/") in ("403", "503"), "localhost"
         machine.fail(f"curl -sf -x {proxy} -p https://127.0.0.1:5432/")
+
+    with subtest("hosted code reaches the internet through Squid, but not loopback or private addresses"):
+        def fetch(target):
+            service = deploy(f"fetch {target}")["url"]
+            return machine.succeed(f"curl -sf {service}")
+        body = fetch("http://${public.internet}/")
+        assert body == "status 200", body
+        for target in [
+            f"http://127.0.0.1:{api_port}/.well-known/openid-configuration",
+            "http://${nodes.internet.networking.primaryIPAddress}/",
+            "http://10.0.2.2/",
+        ]:
+            # nimbus's HTTP client reports a refusal from the proxy as a failed request.
+            body = fetch(target)
+            assert body == "failed", (target, body)
+            machine.succeed(f"journalctl -u unison-cloud-outbound-proxy.service | grep 'TCP_DENIED/403' | grep -qF ' {target} '")
 
     memory()
 

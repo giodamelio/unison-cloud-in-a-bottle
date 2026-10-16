@@ -1,4 +1,4 @@
-# Reads the user's logs through cloud-api, which queries the bundled Loki.
+# Reads the user's logs through cloud-api, which queries Loki.
 # Variables: api (cloud-api's base URL), host (the API domain, which picks the cluster),
 # token (the user's access token), line (a log message the user's code wrote).
 

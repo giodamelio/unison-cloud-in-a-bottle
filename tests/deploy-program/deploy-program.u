@@ -10,10 +10,12 @@ deployProgram.main = do
     ["env-set"]    -> Cloud.run deployProgram.envSet
     ["env-delete"] -> Cloud.run deployProgram.envDelete
     ["daemon"]     -> Cloud.run deployProgram.daemon
+    ["fetch", url] -> Cloud.run (deployProgram.fetch url)
     args ->
       Exception.raise
         (failure
-          "usage: deploy-program hello|storage|env-set|env-delete|daemon" args)
+          "usage: deploy-program hello|storage|env-set|env-delete|daemon|fetch <url>"
+          args)
 
 deployProgram.envName : Text
 deployProgram.envName = "deploy-program"
@@ -94,6 +96,23 @@ deployProgram.daemon = do
   hash = Daemon.deploy daemon Environment.default() deployProgram.daemonLoop
   printLine
     ("daemon name=" ++ deployProgram.daemonName ++ " hash=" ++ DaemonHash.toText hash)
+
+-- Answers with what the service saw when it fetched the target, so a test can tell
+-- which destinations hosted code reaches.
+deployProgram.fetchService : URI -> HttpRequest ->{Http} HttpResponse
+deployProgram.fetchService target _ =
+  result = match Http.tryGet target with
+    Right response ->
+      "status " ++ Nat.toText (Status.code (HttpResponse.status response))
+    Left _ -> "failed"
+  HttpResponse.ok (Body (Text.toUtf8 result))
+
+deployProgram.fetch : Text -> '{IO, Exception, Cloud} ()
+deployProgram.fetch url = do
+  target = unison_base_7_12_1.IO.net.URI.parse url
+  hash = deployHttp Environment.default() (deployProgram.fetchService target)
+  uri = exposeHttp hash
+  printLine ("fetch hash=" ++ ServiceHash.toText hash ++ " url=" ++ deployProgram.uriText uri)
 
 -- @unison/cloud pulls in two releases of base; URI here is the one the cloud client
 -- returns.

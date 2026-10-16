@@ -24,7 +24,7 @@ in
       ```
     '';
 
-    compiledHash = "sha256-xTPGXUNJOH5w2svVXEXg+FKgYnYbp3qtv7u3CMf+bAc=";
+    compiledHash = "sha256-t5btVAezsAx4xDIZcA+9Ep81YklUxjzEBi6Dl6DJX7Q=";
 
     meta.mainProgram = "deploy-program";
   }

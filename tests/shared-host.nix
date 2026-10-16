@@ -13,11 +13,14 @@
     psql = "${pkgs.postgresql_18}/bin/psql";
   };
 
-  # A second network in TEST-NET-3 stands in for the public internet, as in namespace.nix.
+  # A second network in TEST-NET-3 stands in for the public internet; the test VLAN, a
+  # private range, stands in for the LAN.
   public = {
     internet = "203.0.113.2";
     machine = "203.0.113.1";
   };
+  # Only the internet node's resolver knows this name.
+  internetName = "web.internet.test";
 
   s3Host = "s3.garage.example.com";
   buckets = {
@@ -30,6 +33,10 @@
   dbPasswords = {
     cloudApi = "host-cloud-api-db-password";
     nimbus = "host-nimbus-db-password";
+  };
+  consulTokens = {
+    management = "6f1a7b3e-2c4d-4e5f-8a9b-0c1d2e3f4a5b";
+    unisonCloud = "0d9c8b7a-6f5e-4d3c-9b2a-1f0e9d8c7b6a";
   };
   # bcrypt of "demo", as in the demo VM.
   passwordHash = "$2b$10$/Lfz.yT3xdZwUBTJwkK29ObMuNl5lrS2rHlKJkJk054huJV4Vb9gm";
@@ -47,15 +54,26 @@ in {
         prefixLength = 24;
       }
     ];
-    networking.firewall.allowedTCPPorts = [80];
+    networking.firewall = {
+      allowedTCPPorts = [53 80];
+      allowedUDPPorts = [53];
+    };
     systemd.services.http = {
       wantedBy = ["multi-user.target"];
       serviceConfig.ExecStart = "${lib.getExe pkgs.python3} -m http.server 80 --directory ${pkgs.writeTextDir "index.html" "hello from the internet\n"}";
     };
+    services.dnsmasq = {
+      enable = true;
+      resolveLocalQueries = false;
+      settings = {
+        no-resolv = true;
+        address = "/${internetName}/${public.internet}";
+      };
+    };
   };
 
-  # Modelled on a host that already runs its own Caddy, login provider, PostgreSQL and S3
-  # store.
+  # A host that already runs its own Caddy, login provider, PostgreSQL, S3 store, Consul
+  # and Loki, and resolves names with systemd-resolved. It imports core alone.
   nodes.machine = {
     config,
     lib,
@@ -70,7 +88,7 @@ in {
       '';
     };
   in {
-    imports = [self.nixosModules.core self.nixosModules.batteries];
+    imports = [self.nixosModules.core];
 
     networking.interfaces.eth1.ipv4.addresses = [
       {
@@ -87,6 +105,8 @@ in {
       "${buckets.services}.${s3Host}"
       "${buckets.userBlobs}.${s3Host}"
     ];
+    networking.nameservers = [public.internet];
+    services.resolved.enable = true;
 
     services.unison-cloud = {
       enable = true;
@@ -96,24 +116,16 @@ in {
         apps = "apps.test";
         ui = "ui.test";
       };
-      batteries = {
-        caddy.enable = false;
-        dex.enable = false;
-        s3.enable = false;
-        postgresql.enable = false;
-      };
 
-      auth = {
-        oidc = {
-          issuer = "https://login.test";
-          clientId = "unison-cloud";
-          endpoints = {
-            authorization = "https://login.test/auth";
-            token = "http://127.0.0.1:5557/token";
-            jwks = "http://127.0.0.1:5557/keys";
-          };
-          allowedEmails = ["alice@example.com"];
+      auth.oidc = {
+        issuer = "https://login.test";
+        clientId = "unison-cloud";
+        endpoints = {
+          authorization = "https://login.test/auth";
+          token = "http://127.0.0.1:5557/token";
+          jwks = "http://127.0.0.1:5557/keys";
         };
+        allowedEmails = ["alice@example.com"];
       };
 
       s3 = {
@@ -123,15 +135,17 @@ in {
         https = false;
         region = "garage";
       };
+      database.host = "127.0.0.1";
+      logs.lokiUrl = "http://127.0.0.1:3100";
+
       secrets.credentials = {
         oidc-client-secret = "unison-cloud-oidc-client-secret";
         s3-access-key-id = "unison-cloud-s3-access-key-id";
         s3-secret-access-key = "unison-cloud-s3-secret-access-key";
         cloud-api-db-password = "unison-cloud-cloud-api-db-password";
         nimbus-db-password = "unison-cloud-nimbus-db-password";
+        consul-token = "unison-cloud-consul-token";
       };
-
-      database.host = "127.0.0.1";
     };
 
     services.caddy = {
@@ -218,6 +232,82 @@ in {
       '';
     };
 
+    # The host's own Consul agent, a single server here, with every request denied unless
+    # a token allows it. Its agent token is the management token, which only a test does.
+    services.consul = {
+      enable = true;
+      extraConfig = {
+        server = true;
+        bootstrap_expect = 1;
+        bind_addr = "127.0.0.1";
+        client_addr = "127.0.0.1";
+        acl = {
+          enabled = true;
+          default_policy = "deny";
+          tokens = {
+            initial_management = consulTokens.management;
+            agent = consulTokens.management;
+          };
+        };
+      };
+    };
+
+    # Creates the policy and token the way the README tells you to.
+    systemd.services.consul-unison-cloud-token = {
+      requires = ["consul.service"];
+      after = ["consul.service"];
+      requiredBy = ["unison-cloud-consul-services.service" "unison-cloud-api.service"];
+      before = ["unison-cloud-consul-services.service" "unison-cloud-api.service"];
+      path = [config.services.consul.package];
+      environment.CONSUL_HTTP_TOKEN = consulTokens.management;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        until consul acl token read -self > /dev/null; do sleep 1; done
+        consul acl policy create -name unison-cloud -rules @${cfg.consul.aclPolicy}
+        consul acl token create -policy-name unison-cloud -secret ${consulTokens.unisonCloud}
+      '';
+    };
+
+    services.loki = {
+      enable = true;
+      configuration = {
+        auth_enabled = false;
+        server = {
+          http_listen_address = "127.0.0.1";
+          http_listen_port = 3100;
+          grpc_listen_address = "127.0.0.1";
+          log_level = "warn";
+        };
+        common = {
+          path_prefix = config.services.loki.dataDir;
+          replication_factor = 1;
+          instance_addr = "127.0.0.1";
+          ring.kvstore.store = "inmemory";
+          storage.filesystem = {
+            chunks_directory = "${config.services.loki.dataDir}/chunks";
+            rules_directory = "${config.services.loki.dataDir}/rules";
+          };
+        };
+        schema_config.configs = [
+          {
+            from = "2024-01-01";
+            store = "tsdb";
+            object_store = "filesystem";
+            schema = "v13";
+            index = {
+              prefix = "index_";
+              period = "24h";
+            };
+          }
+        ];
+        limits_config.allow_structured_metadata = true;
+        analytics.reporting_enabled = false;
+      };
+    };
+
     # Stands in for credentials encrypted ahead of time; the plaintext only exists here.
     systemd.services.unison-cloud-test-credentials = {
       requiredBy = ["unison-cloud-secrets.service"];
@@ -236,6 +326,7 @@ in {
         encrypt s3-secret-access-key unison-cloud-s3-secret-access-key ${s3Secret}
         encrypt cloud-api-db-password unison-cloud-cloud-api-db-password ${dbPasswords.cloudApi}
         encrypt nimbus-db-password unison-cloud-nimbus-db-password ${dbPasswords.nimbus}
+        encrypt consul-token unison-cloud-consul-token ${consulTokens.unisonCloud}
       '';
     };
 
@@ -285,7 +376,8 @@ in {
       };
     };
 
-    # Stands in for the listener ucm opens on a loopback port during `auth.login`.
+    # Stands in for the listener ucm opens on a loopback port during `auth.login`, and for
+    # a service on the host's loopback that hosted code reaches.
     systemd.services.redirect-catcher = {
       wantedBy = ["multi-user.target"];
       serviceConfig = {
@@ -314,7 +406,8 @@ in {
     api = "https://cloud.test"
     ca = "/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
     nimbus_nodes = json.loads(${builtins.toJSON (builtins.toJSON cfg.internal.nimbusNodes)})
-    interactive = next(n["unit"] for n in nimbus_nodes if n["type"] == "interactive")
+    interactive = next(n for n in nimbus_nodes if n["type"] == "interactive")
+    interactive_unit = interactive["unit"]
 
     def hurl(file, *args):
         return machine.succeed(f"hurl --cacert {ca} --variable api={api} " + " ".join(args) + f" {file}")
@@ -332,17 +425,23 @@ in {
         gid = machine.succeed(f"id -g {user}").strip()
         return f"nsenter -t {pid} -m -n -S {uid} -G {gid} -- {cmd}"
 
+    def consul(path, token="$(cat /etc/unison-cloud-consul-token)"):
+        header = f"-H \"X-Consul-Token: {token}\"" if token else ""
+        return f"curl -sf {header} 'http://127.0.0.1:8500{path}'"
+
     start_all()
     internet.wait_for_unit("http.service")
+    internet.wait_for_unit("dnsmasq.service")
     machine.wait_for_unit("caddy.service")
     machine.wait_for_unit("dex.service")
     machine.wait_for_unit("garage-setup.service")
     machine.wait_for_unit("redirect-catcher.service")
     machine.wait_for_unit("unison-cloud-api.service")
-    machine.wait_for_unit(interactive, timeout=600)
+    machine.wait_for_unit(interactive_unit, timeout=600)
     machine.wait_until_succeeds(f"test -f {ca}", timeout=60)
     machine.wait_until_succeeds(f"curl -sf --cacert {ca} -o /dev/null https://login.test/.well-known/openid-configuration", timeout=120)
     machine.wait_until_succeeds(f"curl -s --cacert {ca} -o /dev/null -w '%{{http_code}}' {api}/v2/account | grep -q 401", timeout=120)
+    machine.succeed("printf %s ${consulTokens.unisonCloud} > /etc/unison-cloud-consul-token")
 
     verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
@@ -367,40 +466,72 @@ in {
     with subtest("the health route answers without a login"):
         machine.succeed(f"curl -sf --cacert {ca} -o /dev/null {api}/.well-known/openid-configuration")
 
-    with subtest("a deploy stores its code in Garage, and nimbus serves it from there"):
-        machine.wait_until_succeeds(
-            f"curl -sf -H \"X-Consul-Token: $(cat {secrets}/consul-token)\""
-            " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true' | jq -e 'length == ${toString (builtins.length cfg.internal.nimbusNodes)}'",
-            timeout=180,
-        )
-        # The client talks to both public domains through the host's Caddy. The Unison
-        # runtime only reads the system bundle, so Caddy's local CA joins it privately.
+    # The client talks to both public domains through the host's Caddy. The Unison
+    # runtime only reads the system bundle, so Caddy's local CA joins it privately.
+    machine.succeed(f"cat /etc/ssl/certs/ca-certificates.crt {ca} > /root/ca-bundle.crt")
+
+    def deploy(command):
         env = f"UNISON_CLOUD_HOST=cloud.test UNISON_CLOUD_HTTP_PORT=443 UNISON_CLOUD_USE_TLS=true UNISON_CLOUD_ACCESS_TOKEN={token}"
-        machine.succeed(f"cat /etc/ssl/certs/ca-certificates.crt {ca} > /root/ca-bundle.crt")
         output = machine.succeed(
             "unshare -m --propagation private sh -c "
-            + shlex.quote(f"mount --bind /root/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt && env {env} deploy-program hello")
+            + shlex.quote(f"mount --bind /root/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt && env {env} deploy-program {command}")
         )
-        url = dict(re.findall(r"(\w+)=(\S+)", next(l for l in output.splitlines() if l.startswith("hello "))))["url"]
+        name = command.split()[0]
+        return dict(re.findall(r"(\w+)=(\S+)", next(l for l in output.splitlines() if l.startswith(name + " "))))
+
+    with subtest("the host's Consul agent holds the registrations under the prefix, behind the token"):
+        machine.wait_until_succeeds(
+            consul("/v1/health/service/unison-cloud-nimbus-http?passing=true") + " | jq -e 'length == ${toString (builtins.length cfg.internal.nimbusNodes)}'",
+            timeout=180,
+        )
+        machine.wait_until_succeeds(consul("/v1/health/service/unison-cloud-cloud-api?passing=true") + " | jq -e 'length == 1'", timeout=60)
+        assert json.loads(machine.succeed(consul("/v1/catalog/services", token=""))) == {}
+
+    with subtest("a deploy stores its code in Garage, and nimbus serves it from there"):
+        url = deploy("hello")["url"]
         info = machine.succeed("garage bucket info ${buckets.services}")
         print(info)
         assert re.search(r"objects\W+[1-9]", info, re.IGNORECASE), info
         # A restarted node has nothing cached, so it fetches the code from Garage again.
-        machine.systemctl(f"restart {interactive}")
-        machine.wait_for_unit(interactive, timeout=300)
+        machine.systemctl(f"restart {interactive_unit}")
+        machine.wait_for_unit(interactive_unit, timeout=300)
         machine.wait_until_succeeds(f"curl -sf --cacert {ca} {url} | grep -qx 'hello from deploy-program'", timeout=120)
+
+    with subtest("hosted code's log lines reach cloud-api's log endpoint through the host's Loki"):
+        machine.succeed(
+            f"hurl --test --cacert {ca} --variable api={api} --variable host=cloud.test"
+            f" --variable token={token} --variable 'line=deploy-program hello served' ${hurl "logs.hurl"}"
+        )
+
+    with subtest("cloud-api and nimbus resolve names through systemd-resolved inside their sandboxes"):
+        machine.succeed("test -L /etc/resolv.conf")
+        for unit in ["unison-cloud-api.service", interactive_unit]:
+            out = machine.succeed(in_sandbox(unit, "${bin.getent} hosts ${internetName}"))
+            assert out.startswith("${public.internet}"), (unit, out)
+
+    with subtest("without a proxy, hosted code reaches the host's loopback, the LAN and the internet"):
+        config = json.loads(machine.succeed(f"cat /run/unison-cloud-nimbus-{interactive['name']}/config.json"))
+        assert "outboundProxy" not in config, config
+        for target in [
+            "http://127.0.0.1:8099/",
+            "http://${nodes.internet.networking.primaryIPAddress}/",
+            "http://${internetName}/",
+        ]:
+            service = deploy(f"fetch {target}")["url"]
+            body = machine.succeed(f"curl -sf --cacert {ca} {service}")
+            assert body == "status 200", (target, body)
 
     with subtest("nimbus can't reach the host's sockets or state"):
         machine.succeed("sudo -u nobody socat - UNIX-CONNECT:/run/unrelated/sock | grep -q unrelated-socket")
         machine.succeed("sudo -u nobody cat /var/lib/unrelated/data")
-        machine.fail(in_sandbox(interactive, "${bin.socat} - UNIX-CONNECT:/run/unrelated/sock"))
-        machine.fail(in_sandbox(interactive, "${bin.cat} /var/lib/unrelated/data"))
-        machine.fail(in_sandbox(interactive, "${bin.test} -e /run/postgresql/.s.PGSQL.5432"))
-        machine.fail(in_sandbox(interactive, "${bin.test} -e /run/dbus/system_bus_socket"))
-        families = machine.succeed(f"systemctl show -P RestrictAddressFamilies {interactive}")
+        machine.fail(in_sandbox(interactive_unit, "${bin.socat} - UNIX-CONNECT:/run/unrelated/sock"))
+        machine.fail(in_sandbox(interactive_unit, "${bin.cat} /var/lib/unrelated/data"))
+        machine.fail(in_sandbox(interactive_unit, "${bin.test} -e /run/postgresql/.s.PGSQL.5432"))
+        machine.fail(in_sandbox(interactive_unit, "${bin.test} -e /run/dbus/system_bus_socket"))
+        families = machine.succeed(f"systemctl show -P RestrictAddressFamilies {interactive_unit}")
         assert "AF_UNIX" not in families and "AF_INET" in families, families
 
-    with subtest("cloud-api can't reach the host's other sockets"):
+    with subtest("cloud-api can't reach the host's sockets or state"):
         machine.fail(in_sandbox("unison-cloud-api.service", "${bin.socat} - UNIX-CONNECT:/run/unrelated/sock"))
         machine.fail(in_sandbox("unison-cloud-api.service", "${bin.cat} /var/lib/unrelated/data"))
         machine.fail(in_sandbox("unison-cloud-api.service", "${bin.test} -e /run/postgresql/.s.PGSQL.5432"))
@@ -415,20 +546,20 @@ in {
         assert machine.succeed("grep -c unison \"$(sudo -u postgres psql -XtA -c 'SHOW hba_file')\" || true").strip() == "0"
 
     with subtest("each role reaches only its own database, over TCP with its password"):
-        machine.fail(in_sandbox(interactive, "${bin.psql} -h /run/postgresql -d postgres -c 'SELECT 1'"))
-        machine.fail(in_sandbox(interactive, "${bin.psql} -h 127.0.0.1 -d unison_cloud_nimbus -U unison_cloud_nimbus -w -c 'SELECT 1'"))
+        machine.fail(in_sandbox(interactive_unit, "${bin.psql} -h /run/postgresql -d postgres -c 'SELECT 1'"))
+        machine.fail(in_sandbox(interactive_unit, "${bin.psql} -h 127.0.0.1 -d unison_cloud_nimbus -U unison_cloud_nimbus -w -c 'SELECT 1'"))
         connect = "${bin.env} PGPASSWORD=${dbPasswords.nimbus} ${bin.psql} -h 127.0.0.1 -U unison_cloud_nimbus -XtA -v ON_ERROR_STOP=1"
-        machine.succeed(in_sandbox(interactive, f"{connect} -d unison_cloud_nimbus -c 'SELECT count(*) FROM nimbus_kv'"))
-        machine.fail(in_sandbox(interactive, f"{connect} -d unison_cloud -c 'SELECT count(*) FROM selfhost.environment_secrets'"))
+        machine.succeed(in_sandbox(interactive_unit, f"{connect} -d unison_cloud_nimbus -c 'SELECT count(*) FROM nimbus_kv'"))
+        machine.fail(in_sandbox(interactive_unit, f"{connect} -d unison_cloud -c 'SELECT count(*) FROM selfhost.environment_secrets'"))
         machine.fail("PGPASSWORD=${dbPasswords.cloudApi} psql -h 127.0.0.1 -U unison_cloud -d unison_cloud_nimbus -XtA -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM nimbus_kv'")
 
-    with subtest("with the bundled Dex off, none of it runs or exists"):
-        machine.fail("systemctl cat unison-cloud-dex.service")
-        machine.fail(f"test -e {secrets}/dex-admin-password")
+    with subtest("core runs none of the batteries and generates only its own secrets"):
+        for unit in ["unison-cloud-postgresql", "unison-cloud-s3", "unison-cloud-loki", "unison-cloud-dex", "unison-cloud-outbound-proxy", "unison-cloud-consul"]:
+            machine.fail(f"systemctl cat {unit}.service")
+        generated = sorted(machine.succeed(f"ls {secrets}").split())
+        assert generated == ["cloud-eddsa-key", "cloud-hmac-key", "cluster-token", "internal-auth-token", "share-eddsa-key"], generated
 
     with subtest("credential-supplied secrets are never written in plaintext"):
-        for name in ["s3-access-key-id", "s3-secret-access-key", "oidc-client-secret", "cloud-api-db-password", "nimbus-db-password"]:
-            machine.fail(f"test -e {secrets}/{name}")
         machine.fail("grep -rqs ${s3Secret} /var/lib/unison-cloud /etc/credstore.encrypted")
   '';
 }
