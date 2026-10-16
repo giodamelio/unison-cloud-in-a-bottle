@@ -98,8 +98,6 @@
         };
       });
 
-      namespace = pkgs.testers.runNixOSTest (import ./tests/namespace.nix inputs.self);
-
       nimbus-storage = pkgs.testers.runNixOSTest (import ./tests/nimbus-storage {
         inherit (inputs) self;
         storageProbe = pkgs.callPackage ./tests/nimbus-storage/probe.nix {

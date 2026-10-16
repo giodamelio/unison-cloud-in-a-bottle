@@ -92,6 +92,5 @@ in {
     };
   };
 
-  networking.nftables.enable = true;
   networking.firewall.allowedTCPPorts = [cfg.ingress.port];
 }

@@ -5,11 +5,9 @@
   name = "unison-cloud-variants";
 
   # One combination of levers: the host's Postgres, secrets supplied as files, and no
-  # bundled Caddy, so the ingress sockets are the whole interface.
+  # bundled Caddy, so the upstream ports are the whole interface.
   nodes.machine = {pkgs, ...}: {
     imports = [self.nixosModules.default];
-
-    networking.nftables.enable = true;
 
     services.postgresql = {
       enable = true;
@@ -92,14 +90,16 @@
   in {
     imports = [self.nixosModules.default];
 
-    networking.nftables.enable = true;
-    networking.hosts."127.0.0.1" = ["cloud.localhost" "apps.localhost"];
+    networking.hosts = {
+      "127.0.0.1" = ["cloud.localhost" "apps.localhost"];
+      ${dbAddress} = ["s3.test" "unison-cloud-services.s3.test" "unison-cloud-user-blobs.s3.test"];
+    };
 
     services.unison-cloud = {
       enable = true;
       nimbus.nodes.interactive = 1;
       # No reverse proxy here: the apps URL cloud-api hands the client points straight at
-      # the interactive node's public port inside the namespace.
+      # the interactive node's public port.
       domains = {
         api = "cloud.localhost";
         apps = "apps.localhost";
@@ -112,11 +112,10 @@
       caddy.enable = false;
       s3 = {
         bundled = false;
-        # Only the bridge knows where s3.test is; the host itself can't resolve it.
         external = {
           host = "s3.test";
+          port = 7070;
           https = false;
-          bridge.target = "${dbAddress}:7070";
         };
       };
       secrets.files = {
@@ -131,13 +130,6 @@
           nimbus.passwordFile = "/etc/unison-cloud-secrets/nimbus-db";
         };
       };
-      # The test network is a private range, which egress otherwise refuses.
-      egress.allowedDestinations = [
-        {
-          address = dbAddress;
-          port = 5432;
-        }
-      ];
     };
 
     systemd.tmpfiles.rules = [
@@ -155,6 +147,7 @@
   };
 
   testScript = {nodes, ...}: let
+    inherit (nodes.machine.services.unison-cloud.ingress) upstreams;
     external = nodes.external.services.unison-cloud;
   in ''
     import base64
@@ -163,18 +156,15 @@
     import re
     import shlex
 
-    def ns(cmd):
-        return f"ip netns exec unison-cloud {cmd}"
-
     def psql(query):
         return machine.succeed(
             f"sudo -u unison-cloud-api psql -h /run/postgresql -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         ).strip()
 
-    sock = "--unix-socket /run/unison-cloud/cloud-api.sock -H 'Host: cloud.test'"
+    upstream = "-H 'Host: cloud.test' http://${upstreams.api}"
 
     machine.wait_for_unit("unison-cloud-api.service")
-    machine.wait_until_succeeds(f"curl -s {sock} -o /dev/null -w '%{{http_code}}' http://x/v2/account | grep -q 401", timeout=120)
+    machine.wait_until_succeeds(f"curl -s -o /dev/null -w '%{{http_code}}' {upstream}/v2/account | grep -q 401", timeout=120)
 
     with subtest("the module's databases live in the host's Postgres"):
         assert machine.succeed("sudo -u postgres psql -XtA -c \"SELECT string_agg(datname, ',') FROM pg_database WHERE datname LIKE 'unison_cloud%'\"").strip() == "unison_cloud"
@@ -185,33 +175,28 @@
         expected = machine.succeed("printf %s supplied-cluster-token | sha512sum").split()[0]
         assert psql("SELECT token_hash FROM cloud_cluster_tokens") == expected
 
-    with subtest("without the bundled Caddy, nothing listens publicly and the sockets are the interface"):
+    with subtest("without the bundled Caddy, nothing listens publicly and the upstream ports are the interface"):
         machine.fail("systemctl is-active caddy.service")
         machine.fail("ss -Hltn | grep -E ':(80|443) '")
-        for s in ["cloud-api", "dex"]:
-            machine.succeed(f"test -S /run/unison-cloud/{s}.sock")
-        machine.succeed(f"curl -sf {sock} -o /dev/null http://x/.well-known/openid-configuration")
+        machine.succeed(f"curl -sf -o /dev/null {upstream}/.well-known/openid-configuration")
 
     with subtest("an external Postgres over TCP with passwords"):
         db.wait_for_unit("postgresql.service")
         db.wait_for_open_port(5432)
         external.wait_for_unit("unison-cloud-api.service")
-        external.wait_until_succeeds("curl -s --unix-socket /run/unison-cloud/cloud-api.sock -H 'Host: cloud.localhost' -o /dev/null -w '%{http_code}' http://x/v2/account | grep -q 401", timeout=180)
+        external.wait_until_succeeds("curl -s -H 'Host: cloud.localhost' -o /dev/null -w '%{http_code}' http://${external.ingress.upstreams.api}/v2/account | grep -q 401", timeout=180)
         external.wait_for_unit("unison-cloud-nimbus-storage.service")
         assert int(db.succeed("sudo -u postgres psql -d unison_cloud -XtA -c 'SELECT count(*) FROM selfhost.applied_migrations'").strip()) > 0
         assert db.succeed("sudo -u postgres psql -d unison_cloud_nimbus -XtA -c \"SELECT tableowner FROM pg_tables WHERE tablename = 'nimbus_kv'\"").strip() == "unison_cloud_nimbus"
         external.fail("systemctl is-active unison-cloud-postgresql.service")
 
-    with subtest("a deploy stores its code in the external S3, reached through the bridge"):
+    with subtest("a deploy stores its code in the external S3"):
         db.wait_for_open_port(7070)
         external.fail("systemctl is-active unison-cloud-s3.service")
-        # Neither S3 client is an egress user, so the bridge is their only way there.
-        for user in ["unison-cloud-api", "unison-cloud-nimbus"]:
-            external.fail(f"ip netns exec unison-cloud sudo -u {user} curl -s -m 5 -o /dev/null http://db:7070/")
         for unit in external.succeed("systemctl list-units --plain --no-legend 'unison-cloud-nimbus-*-*.service' | cut -d' ' -f1").split():
             external.wait_for_unit(unit, timeout=600)
         external.wait_until_succeeds(
-            "ip netns exec unison-cloud curl -sf -H \"X-Consul-Token: $(cat /var/lib/unison-cloud/secrets/consul-token)\""
+            "curl -sf -H \"X-Consul-Token: $(cat /var/lib/unison-cloud/secrets/consul-token)\""
             " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true' | grep -q nimbus",
             timeout=180,
         )
@@ -219,14 +204,14 @@
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         external.wait_for_unit("unison-cloud-dex.service")
         token = json.loads(external.succeed(
-            "ip netns exec unison-cloud hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.internal.dexPort} --variable api=http://127.0.0.1:${toString external.cloudApi.port}"
+            "hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.internal.dexPort} --variable api=http://127.0.0.1:${toString external.cloudApi.port}"
             f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
             " --secret password=$(cat /var/lib/unison-cloud/secrets/dex-admin-password) ${./hurl/login-loopback.hurl}"
         ))["access_token"]
         env = f"UNISON_CLOUD_HOST=cloud.localhost UNISON_CLOUD_HTTP_PORT=${toString external.cloudApi.port} UNISON_CLOUD_USE_TLS=false UNISON_CLOUD_ACCESS_TOKEN={token}"
-        output = external.succeed(f"ip netns exec unison-cloud env {env} deploy-program hello")
+        output = external.succeed(f"env {env} deploy-program hello")
         url = dict(re.findall(r"(\w+)=(\S+)", next(l for l in output.splitlines() if l.startswith("hello "))))["url"]
-        assert external.succeed(f"ip netns exec unison-cloud curl -sf {url}") == "hello from deploy-program"
+        assert external.succeed(f"curl -sf {url}") == "hello from deploy-program"
         db.succeed("find /var/lib/s3/buckets/unison-cloud-services -type f | grep -q .")
   '';
 }

@@ -58,15 +58,13 @@ in {
       type = lib.types.enum ["bundled" "host" "external"];
       default = "bundled";
       description = ''
-        Where the databases live. `bundled` runs the module's own Postgres inside the
-        namespace. Services connect over its socket, except nimbus, which can't open a
-        unix socket and logs in with a password on the namespace loopback. `host` uses the
-        host's `services.postgresql`: the module creates its roles, databases and
-        extensions there, and every service connects over `/run/postgresql` with peer
-        authentication, which the network namespace doesn't affect. nimbus reaches the
-        host's `127.0.0.1` through a bridge instead, with a password. `external` connects
-        over TCP with passwords to a server you prepare yourself (see
-        `database.external`); add its address to `egress.allowedDestinations`.
+        Where the databases live. `bundled` runs the module's own Postgres. Services
+        connect over its socket, except nimbus, which can't open a unix socket and logs in
+        with a password on loopback. `host` uses the host's `services.postgresql`: the
+        module creates its roles, databases and extensions there, and every service
+        connects over `/run/postgresql` with peer authentication, except nimbus, which
+        logs in with a password on `127.0.0.1`. `external` connects over TCP with
+        passwords to a server you prepare yourself (see `database.external`).
 
         In `host` mode the module never edits `pg_hba.conf`. It relies on NixOS's defaults,
         `local all all peer` and `host all all 127.0.0.1/32 md5`, or any rules that let each
@@ -146,11 +144,8 @@ in {
           if external
           then ext.host
           else cfg.internal.postgresSocketDir;
-        port = toString (
-          if external
-          then ext.port
-          else 5432
-        );
+        # A socket's name carries the server's port too.
+        port = toString cfg.internal.postgresTcp.port;
       };
       description = "Where every service connects: a socket directory, or the external server.";
     };
@@ -164,12 +159,14 @@ in {
         then {inherit (ext) host port;}
         else {
           host = "127.0.0.1";
-          port = 5432;
+          port =
+            if bundled
+            then 24150
+            else config.services.postgresql.settings.port;
         };
       description = ''
         Where a service that can't use a socket connects over TCP: the external server, or
-        the namespace loopback, where the bundled server or the bridge to the host's
-        server listens.
+        the bundled or host server on loopback.
       '';
     };
 
@@ -254,7 +251,7 @@ in {
       };
 
       systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [
-        cfg.internal.inNamespace
+        cfg.internal.sandbox
         (lib.mkIf external {
           description = "Wait for the external Postgres server";
           serviceConfig = {
@@ -278,7 +275,7 @@ in {
               RemainAfterExit = true;
               User = superuser;
               Group = superuser;
-              ExecStart = "${pg}/bin/psql -h ${cfg.internal.postgresSocketDir} -d postgres -X -v ON_ERROR_STOP=1 -f ${setupSql}";
+              ExecStart = "${pg}/bin/psql -h ${cfg.internal.postgresSocketDir} -p ${toString cfg.internal.postgresTcp.port} -d postgres -X -v ON_ERROR_STOP=1 -f ${setupSql}";
             }
           ];
         })
@@ -299,7 +296,7 @@ in {
       };
 
       systemd.services.unison-cloud-postgresql = lib.mkMerge [
-        cfg.internal.inNamespace
+        cfg.internal.sandbox
         {
           description = "Unison Cloud bundled PostgreSQL";
           serviceConfig = {
@@ -315,8 +312,8 @@ in {
                   --encoding=UTF8 --locale=C --no-instructions
               fi
             '';
-            # The TCP listener is on the namespace loopback, and the namespace firewall limits
-            # who reaches it. The module's own hba file replaces initdb's on every start.
+            # The TCP listener is on loopback, and only roles with a password may log in
+            # over it. The module's own hba file replaces initdb's on every start.
             ExecStart = "${pg}/bin/postgres -D ${dataDir} -c listen_addresses=${cfg.internal.postgresTcp.host} -c port=${toString cfg.internal.postgresTcp.port} -c unix_socket_directories=${cfg.internal.postgresSocketDir} -c hba_file=${hbaFile}";
             ExecReload = "${lib.getExe' pkgs.coreutils "kill"} -HUP $MAINPID";
             KillMode = "mixed";

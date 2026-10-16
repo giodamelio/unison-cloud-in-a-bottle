@@ -6,9 +6,6 @@
 }: let
   cfg = config.services.unison-cloud;
   proxyUser = "unison-cloud-outbound-proxy";
-  resolverUser = "unison-cloud-resolver";
-  resolverDir = "${cfg.stateDir}/resolver";
-  bundledResolver = cfg.egress.nameservers == [];
   nimbusUnits = lib.optionals cfg.nimbus.enable (map (node: node.unit) cfg.internal.nimbusNodes);
 
   # Adapted from upstream's cloud-api/outbound-proxy/squid.conf, without its allowlist of
@@ -24,14 +21,9 @@
     access_log syslog:daemon.info squid
     shutdown_lifetime 1 seconds
 
-    # Names on the namespace's /etc/hosts, such as the S3 hostnames, must
-    # not resolve for hosted code.
+    # Names in the host's /etc/hosts, such as the S3 hostnames, must not resolve for
+    # hosted code. Everything else resolves through the host's resolver.
     hosts_file none
-    dns_nameservers ${
-      if bundledResolver
-      then "127.0.0.1"
-      else lib.concatStringsSep " " cfg.egress.nameservers
-    }
 
     acl localnet_dst dst 0.0.0.0/8
     acl localnet_dst dst 10.0.0.0/8
@@ -68,42 +60,13 @@
     http_upgrade_request_protocols websocket allow all
     http_upgrade_request_protocols WebSocket allow all
   '';
-
-  unboundConfig = pkgs.writeText "unison-cloud-unbound.conf" ''
-    server:
-      interface: 127.0.0.1
-      port: 53
-      access-control: 127.0.0.0/8 allow
-      do-daemonize: no
-      username: ""
-      chroot: ""
-      pidfile: ""
-      directory: "${resolverDir}"
-      use-syslog: no
-      logfile: ""
-      auto-trust-anchor-file: "${resolverDir}/root.key"
-  '';
 in {
-  options.services.unison-cloud = {
-    egress.nameservers = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [];
-      example = ["9.9.9.9" "149.112.112.112"];
-      description = ''
-        IP addresses of the resolvers the outbound proxy resolves hosted code's
-        destinations with. Empty runs a recursive Unbound inside the namespace, which asks
-        the root servers directly, so hosted code can't learn names that only exist on
-        your network.
-      '';
-    };
-
-    internal.outboundProxyPort = lib.mkOption {
-      type = lib.types.port;
-      internal = true;
-      readOnly = true;
-      default = 24155;
-      description = "Port of the outbound proxy hosted code's requests go through, on the namespace loopback.";
-    };
+  options.services.unison-cloud.internal.outboundProxyPort = lib.mkOption {
+    type = lib.types.port;
+    internal = true;
+    readOnly = true;
+    default = 24155;
+    description = "Port of the outbound proxy hosted code's requests go through, on loopback.";
   };
 
   config = lib.mkIf cfg.enable {
@@ -111,43 +74,20 @@ in {
       host = "127.0.0.1";
       port = cfg.internal.outboundProxyPort;
     };
-    # Only the proxy, and the resolver it asks, may send traffic out of the namespace.
-    services.unison-cloud.internal.egressUsers = [proxyUser] ++ lib.optional bundledResolver resolverUser;
 
-    users.users =
-      {
-        ${proxyUser} = {
-          isSystemUser = true;
-          group = proxyUser;
-        };
-      }
-      // lib.optionalAttrs bundledResolver {
-        ${resolverUser} = {
-          isSystemUser = true;
-          group = resolverUser;
-        };
-      };
-    users.groups =
-      {${proxyUser} = {};}
-      // lib.optionalAttrs bundledResolver {${resolverUser} = {};};
-
-    systemd.tmpfiles.settings.unison-cloud-resolver = lib.mkIf bundledResolver {
-      ${resolverDir}.d = {
-        user = resolverUser;
-        group = resolverUser;
-        mode = "0700";
-      };
+    users.users.${proxyUser} = {
+      isSystemUser = true;
+      group = proxyUser;
     };
+    users.groups.${proxyUser} = {};
 
     systemd.services.unison-cloud-outbound-proxy = lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Unison Cloud outbound proxy for hosted code (Squid)";
         wantedBy = ["multi-user.target"];
         requiredBy = nimbusUnits;
         before = nimbusUnits;
-        requires = lib.optional bundledResolver "unison-cloud-resolver.service";
-        after = lib.optional bundledResolver "unison-cloud-resolver.service";
         serviceConfig = {
           User = proxyUser;
           Group = proxyUser;
@@ -158,27 +98,5 @@ in {
         };
       }
     ];
-
-    systemd.services.unison-cloud-resolver = lib.mkIf bundledResolver (lib.mkMerge [
-      cfg.internal.inNamespace
-      {
-        description = "Unison Cloud recursive resolver for the outbound proxy (Unbound)";
-        serviceConfig = {
-          User = resolverUser;
-          Group = resolverUser;
-          AmbientCapabilities = ["CAP_NET_BIND_SERVICE"];
-          CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE"];
-          # Unbound keeps the root trust anchor up to date itself once it has a copy.
-          ExecStartPre = pkgs.writeShellScript "unison-cloud-resolver-anchor" ''
-            if [ ! -e ${resolverDir}/root.key ]; then
-              install -m 0600 ${pkgs.dns-root-data}/root.key ${resolverDir}/root.key
-            fi
-          '';
-          ExecStart = "${lib.getExe' pkgs.unbound "unbound"} -d -c ${unboundConfig}";
-          ExecReload = "${lib.getExe' pkgs.coreutils "kill"} -HUP $MAINPID";
-          Restart = "on-failure";
-        };
-      }
-    ]);
   };
 }

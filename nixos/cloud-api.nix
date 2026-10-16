@@ -135,10 +135,7 @@ in {
   options.services.unison-cloud.sentry.dsnFile = lib.mkOption {
     type = lib.types.nullOr lib.types.str;
     default = null;
-    description = ''
-      File holding a Sentry DSN for cloud-api's error reports. Sentry is on the internet,
-      so setting this lets cloud-api send traffic out of the namespace.
-    '';
+    description = "File holding a Sentry DSN for cloud-api's error reports.";
   };
 
   options.services.unison-cloud.cloudApi = {
@@ -187,8 +184,6 @@ in {
     users.groups.${user} = {};
 
     services.unison-cloud.internal = {
-      egressUsers = lib.mkIf (cfg.sentry.dsnFile != null) [user];
-      ingressSockets.cloud-api = cfg.cloudApi.port;
       # cloud-api finds its peers under this name, to forward invalidations to the nodes
       # connected to them.
       consulServices = [
@@ -214,7 +209,7 @@ in {
     };
 
     systemd.services.unison-cloud-migrate = lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Apply Unison Cloud database migrations";
         requires = ["unison-cloud-postgresql-setup.service"];
@@ -232,7 +227,7 @@ in {
     ];
 
     systemd.services.unison-cloud-seed = lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Register the Unison Cloud cluster and its nimbus token";
         requires = ["unison-cloud-migrate.service" "unison-cloud-secrets.service"];
@@ -257,7 +252,7 @@ in {
     ];
 
     systemd.services.unison-cloud-api = lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Unison Cloud API";
         wantedBy = ["multi-user.target"];
@@ -331,10 +326,9 @@ in {
             "internal-auth-token"
             "consul-token"
           ])
-          # Signed-in users reach cloud-api directly, and it shares the namespace loopback
+          # Signed-in users reach cloud-api directly, and it shares the host's loopback
           # with hosted code, so it sees only the host paths it uses.
           cfg.internal.hostIsolation
-          cfg.internal.s3Hosts
           {
             User = user;
             Group = user;

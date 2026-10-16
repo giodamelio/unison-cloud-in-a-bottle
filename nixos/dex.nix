@@ -108,7 +108,7 @@ in {
       internal = true;
       readOnly = true;
       default = 24154;
-      description = "Dex's plain HTTP port on the namespace loopback; TLS is the reverse proxy's job.";
+      description = "Dex's plain HTTP port on loopback; TLS is the reverse proxy's job.";
     };
   };
 
@@ -125,10 +125,8 @@ in {
       mode = "0700";
     };
 
-    services.unison-cloud.internal.ingressSockets.dex = cfg.internal.dexPort;
-
     systemd.services.unison-cloud-dex = lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Unison Cloud login provider (Dex)";
         wantedBy = ["multi-user.target"];

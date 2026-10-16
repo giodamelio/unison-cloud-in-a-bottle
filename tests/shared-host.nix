@@ -50,8 +50,8 @@ in {
     };
   };
 
-  # Modelled on a host that already runs its own Caddy, login provider and PostgreSQL, and
-  # reaches an S3 store the namespace may not reach directly.
+  # Modelled on a host that already runs its own Caddy, login provider, PostgreSQL and S3
+  # store.
   nodes.machine = {
     config,
     lib,
@@ -68,15 +68,21 @@ in {
   in {
     imports = [self.nixosModules.default];
 
-    networking.nftables.enable = true;
-    networking.firewall.filterForward = true;
     networking.interfaces.eth1.ipv4.addresses = [
       {
         address = public.machine;
         prefixLength = 24;
       }
     ];
-    networking.hosts."127.0.0.1" = ["cloud.test" "apps.test" "ui.test" "login.test"];
+    networking.hosts."127.0.0.1" = [
+      "cloud.test"
+      "apps.test"
+      "ui.test"
+      "login.test"
+      s3Host
+      "${buckets.services}.${s3Host}"
+      "${buckets.userBlobs}.${s3Host}"
+    ];
 
     services.unison-cloud = {
       enable = true;
@@ -94,11 +100,10 @@ in {
           issuer = "https://login.test";
           clientId = "unison-cloud";
           clientSecretCredential = "unison-cloud-oidc-client-secret";
-          endpoints.authorization = "https://login.test/auth";
-          bridge = {
-            target = "127.0.0.1:5557";
-            tokenPath = "/token";
-            jwksPath = "/keys";
+          endpoints = {
+            authorization = "https://login.test/auth";
+            token = "http://127.0.0.1:5557/token";
+            jwks = "http://127.0.0.1:5557/keys";
           };
           allowedEmails = ["alice@example.com"];
         };
@@ -112,7 +117,6 @@ in {
           port = 3900;
           https = false;
           region = "garage";
-          bridge.target = "127.0.0.1:3900";
         };
       };
       secrets.credentials = {
@@ -244,7 +248,7 @@ in {
     };
 
     # An unrelated host service with a socket any user may connect to and a file any user
-    # may read, which nothing in the namespace should be able to reach.
+    # may read, which neither nimbus nor cloud-api should be able to reach.
     systemd.tmpfiles.rules = [
       "d /var/lib/unrelated 0755 root root"
       "f+ /var/lib/unrelated/data 0644 root root - unrelated-data"
@@ -289,12 +293,6 @@ in {
     nimbus_nodes = json.loads(${builtins.toJSON (builtins.toJSON cfg.internal.nimbusNodes)})
     interactive = next(n["unit"] for n in nimbus_nodes if n["type"] == "interactive")
 
-    def ns(cmd):
-        return f"ip netns exec unison-cloud {cmd}"
-
-    def as_user(user, cmd):
-        return ns(f"sudo -u {user} {cmd}")
-
     def hurl(file, *args):
         return machine.succeed(f"hurl --cacert {ca} --variable api={api} " + " ".join(args) + f" {file}")
 
@@ -326,7 +324,7 @@ in {
     verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
 
-    with subtest("a user logs in through the host's provider, reached over the bridge"):
+    with subtest("a user logs in through the host's provider"):
         response = hurl(
             "${hurl "login-ucm.hurl"}", "--variable user=alice@example.com", "--variable handle=alice",
             "--variable redirect=http://127.0.0.1:8099/redirect", f"--variable verifier={verifier}",
@@ -346,41 +344,12 @@ in {
     with subtest("the health route answers without a login"):
         machine.succeed(f"curl -sf --cacert {ca} -o /dev/null {api}/.well-known/openid-configuration")
 
-    with subtest("only cloud-api may use the login provider's bridge"):
-        machine.succeed(as_user("unison-cloud-api", "curl -sf -m 5 -o /dev/null http://127.0.0.1:5427/keys"))
-        for user in ["unison-cloud-nimbus", "unison-cloud-outbound-proxy", "root"]:
-            machine.fail(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:5427/keys"))
-        # The public issuer itself is unreachable from the namespace, and cloud-api has no egress.
-        machine.fail(as_user("unison-cloud-api", f"curl -s -m 5 --cacert {ca} -o /dev/null https://login.test/"))
-        machine.fail(as_user("unison-cloud-api", "curl -s -m 5 -o /dev/null http://${public.internet}/"))
-
-    with subtest("only cloud-api and nimbus may use the S3 bridge"):
-        for user in ["unison-cloud-api", "unison-cloud-nimbus"]:
-            machine.succeed(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:${toString cfg.internal.s3Port}/"))
-        for user in ["unison-cloud-outbound-proxy", "root"]:
-            machine.fail(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:${toString cfg.internal.s3Port}/"))
-
-    with subtest("only nimbus may use the PostgreSQL bridge"):
-        machine.succeed(as_user("unison-cloud-nimbus", "bash -c ': </dev/tcp/127.0.0.1/5432'"))
-        for user in ["unison-cloud-api", "unison-cloud-outbound-proxy", "root"]:
-            machine.fail(as_user(user, "timeout 5 bash -c ': </dev/tcp/127.0.0.1/5432'"))
-
-    with subtest("the bridges expose nothing on the host"):
-        machine.fail("ss -Hltn | grep -E ':(5427|${toString cfg.internal.s3Port}) '")
-        assert machine.succeed("find /run -type s -path '*bridge*'").strip() == ""
-
-    with subtest("the S3 names resolve to the bridge only inside cloud-api and nimbus"):
-        machine.fail("getent hosts ${s3Host}")
-        for unit in ["unison-cloud-api.service", interactive]:
-            for name in ["${s3Host}", "${buckets.services}.${s3Host}", "${buckets.userBlobs}.${s3Host}"]:
-                out = machine.succeed(in_sandbox(unit, f"${bin.getent} hosts {name}"))
-                assert out.startswith("127.0.0.1"), out
-
     with subtest("a deploy stores its code in Garage, and nimbus serves it from there"):
-        machine.wait_until_succeeds(ns(
+        machine.wait_until_succeeds(
             f"curl -sf -H \"X-Consul-Token: $(cat {secrets}/consul-token)\""
-            " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true' | jq -e 'length == ${toString (builtins.length cfg.internal.nimbusNodes)}'"
-        ), timeout=180)
+            " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true' | jq -e 'length == ${toString (builtins.length cfg.internal.nimbusNodes)}'",
+            timeout=180,
+        )
         # The client talks to both public domains through the host's Caddy. The Unison
         # runtime only reads the system bundle, so Caddy's local CA joins it privately.
         env = f"UNISON_CLOUD_HOST=cloud.test UNISON_CLOUD_HTTP_PORT=443 UNISON_CLOUD_USE_TLS=true UNISON_CLOUD_ACCESS_TOKEN={token}"
@@ -397,11 +366,6 @@ in {
         machine.systemctl(f"restart {interactive}")
         machine.wait_for_unit(interactive, timeout=300)
         machine.wait_until_succeeds(f"curl -sf --cacert {ca} {url} | grep -qx 'hello from deploy-program'", timeout=120)
-
-    with subtest("nimbus reaches the internet only through the outbound proxy"):
-        machine.fail(as_user("unison-cloud-nimbus", "curl -s -m 5 -o /dev/null http://${public.internet}/"))
-        out = machine.succeed(as_user("unison-cloud-nimbus", "curl -sf -m 10 -x http://127.0.0.1:${toString cfg.internal.outboundProxyPort} http://${public.internet}/"))
-        assert out == "hello from the internet\n", out
 
     with subtest("nimbus can't reach the host's sockets or state"):
         machine.succeed("sudo -u nobody socat - UNIX-CONNECT:/run/unrelated/sock | grep -q unrelated-socket")
@@ -432,7 +396,7 @@ in {
         assert extensions == "citext\nmoddatetime\nuuid-ossp", extensions
         assert machine.succeed("grep -c unison \"$(sudo -u postgres psql -XtA -c 'SHOW hba_file')\" || true").strip() == "0"
 
-    with subtest("nimbus reaches the host's PostgreSQL only through the bridge, as its own role"):
+    with subtest("nimbus reaches the host's PostgreSQL over TCP, as its own role"):
         machine.fail(in_sandbox(interactive, "${bin.psql} -h /run/postgresql -d postgres -c 'SELECT 1'"))
         machine.fail(in_sandbox(interactive, "${bin.psql} -h 127.0.0.1 -d unison_cloud_nimbus -U unison-cloud-nimbus -w -c 'SELECT 1'"))
         password = machine.succeed(f"cat {secrets}/nimbus-db-password").strip()
@@ -445,7 +409,6 @@ in {
 
     with subtest("with the bundled Dex off, none of it runs or exists"):
         machine.fail("systemctl cat unison-cloud-dex.service")
-        machine.fail("test -e /run/unison-cloud/dex.sock")
         for name in ["dex-client-secret", "dex-admin-password", "dex-admin-password.bcrypt"]:
             machine.fail(f"test -e {secrets}/{name}")
 

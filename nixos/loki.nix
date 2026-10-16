@@ -98,7 +98,7 @@ in {
     internal = true;
     readOnly = true;
     default = 24152;
-    description = "HTTP port of the bundled Loki, on the namespace loopback.";
+    description = "HTTP port of the bundled Loki, on loopback.";
   };
 
   options.services.unison-cloud.internal.lokiGrpcPort = lib.mkOption {
@@ -106,7 +106,7 @@ in {
     internal = true;
     readOnly = true;
     default = 24153;
-    description = "gRPC port of the bundled Loki, on the namespace loopback.";
+    description = "gRPC port of the bundled Loki, on loopback.";
   };
 
   config = lib.mkIf cfg.enable {
@@ -138,7 +138,7 @@ in {
     };
 
     systemd.services.unison-cloud-loki = lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Unison Cloud log store (Loki)";
         wantedBy = ["multi-user.target"];
@@ -152,9 +152,8 @@ in {
       }
     ];
 
-    # Inside the namespace only to reach Loki on its loopback; the journal is read from disk.
     systemd.services.unison-cloud-log-shipper = lib.mkIf cfg.nimbus.enable (lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Ship nimbus's logs to the Unison Cloud Loki (Vector)";
         wantedBy = ["multi-user.target"];

@@ -4,8 +4,7 @@
   ...
 }: let
   cfg = config.services.unison-cloud;
-  sock = name: "unix//run/unison-cloud/${name}.sock";
-  appsSockets = lib.filter (lib.hasPrefix "nimbus-interactive-") (lib.attrNames cfg.internal.ingressSockets);
+  inherit (cfg.ingress) upstreams;
 in {
   options.services.unison-cloud = {
     caddy = {
@@ -27,13 +26,13 @@ in {
               api = ''
                 Body of the API domain's Caddy site block. It sends `/login` to cloud-api's
                 OIDC login, answers 404 for cloud-api's `/internal/*` routes, and proxies the
-                rest to cloud-api's ingress socket. cloud-api itself has no login other than
+                rest to `ingress.upstreams.api`. cloud-api itself has no login other than
                 OIDC, so these rules aren't what keeps it safe; it also drops client-sent
                 `X-Auth-Request-*` headers, which nothing reads any more.
 
                 For a monitor, `GET /.well-known/openid-configuration` needs no login and
-                cloud-api answers it from memory, so a 200 means Caddy, the socket and
-                cloud-api are up. It doesn't touch Postgres.
+                cloud-api answers it from memory, so a 200 means Caddy and cloud-api are
+                up. It doesn't touch Postgres.
               '';
               apps = "Body of the apps domain's Caddy site block, balancing across the interactive nimbus nodes. Empty when nimbus is off.";
               ui = "Body of the UI domain's Caddy site block, serving `ui.package` as a single-page app.";
@@ -64,13 +63,13 @@ in {
 
       ${lib.optionalString cfg.auth.dex.enable ''
         handle /dex/* {
-          reverse_proxy ${sock "dex"}
+          reverse_proxy 127.0.0.1:${toString cfg.internal.dexPort}
         }
       ''}
       # The UI links to cloud-api's /login, which upstream sends to Share.
       handle /login {
         rewrite * /selfhost/oidc/login
-        reverse_proxy ${sock "cloud-api"}
+        reverse_proxy ${upstreams.api}
       }
 
       # cloud-api's own health check and peer RPC; neither is for the public.
@@ -79,14 +78,14 @@ in {
       }
 
       handle {
-        reverse_proxy ${sock "cloud-api"}
+        reverse_proxy ${upstreams.api}
       }
     '';
 
     # Any interactive node can take any deploy and serve any service. The public port has
     # no health route, so failed nodes are skipped passively.
-    apps = lib.optionalString (appsSockets != []) ''
-      reverse_proxy ${lib.concatMapStringsSep " " sock appsSockets} {
+    apps = lib.optionalString (upstreams.apps != []) ''
+      reverse_proxy ${lib.concatStringsSep " " upstreams.apps} {
         lb_policy round_robin
         lb_retries 2
         fail_duration 30s

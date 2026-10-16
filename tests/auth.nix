@@ -13,8 +13,6 @@ self: {
   in {
     imports = [self.nixosModules.default];
 
-    networking.nftables.enable = true;
-
     services.unison-cloud = {
       enable = true;
       # This rung doesn't need nimbus, and its nodes would not fit in the VM's memory.
@@ -60,7 +58,8 @@ self: {
     virtualisation.memorySize = 3072;
   };
 
-  testScript = _: let
+  testScript = {nodes, ...}: let
+    cfg = nodes.machine.services.unison-cloud;
     hurl = file: "${./hurl}/${file}";
   in ''
     import base64
@@ -97,7 +96,7 @@ self: {
 
     def psql(query):
         return machine.succeed(
-            "ip netns exec unison-cloud sudo -u unison-cloud-api psql -h /run/unison-cloud-postgresql"
+            "sudo -u unison-cloud-api psql -h /run/unison-cloud-postgresql -p ${cfg.internal.postgres.port}"
             f" -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         ).strip()
 
@@ -148,15 +147,5 @@ self: {
         assert int(psql("SELECT count(*) FROM selfhost.ephemeral WHERE expires_at < now()")) > 0
         login_ucm("alice@example.com", "alice-password", "alice")
         assert psql("SELECT count(*) FROM selfhost.ephemeral WHERE expires_at < now()") == "0"
-
-    with subtest("only the ingress group can open the sockets"):
-        machine.fail("test -e /run/unison-cloud/oauth2-proxy.sock")
-        for sock in ["cloud-api", "dex"]:
-            machine.succeed(f"test -S /run/unison-cloud/{sock}.sock")
-            machine.fail(f"sudo -u nobody curl -s --unix-socket /run/unison-cloud/{sock}.sock http://x/")
-            machine.succeed(f"sudo -u caddy curl -s -o /dev/null --unix-socket /run/unison-cloud/{sock}.sock http://x/")
-
-    with subtest("the public URL is unreachable inside the namespace, so cloud-api's code exchange used Dex's loopback"):
-        machine.fail("ip netns exec unison-cloud curl -s -o /dev/null --max-time 5 https://cloud.test:8443/")
   '';
 }

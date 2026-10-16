@@ -33,18 +33,10 @@ in {
         type = lib.types.bool;
         default = true;
         description = ''
-          Run versitygw inside the namespace as the S3 store. With `false`, use the store
-          described by `s3.external`, create both `s3.buckets` there yourself, and supply
-          the credentials as `s3-access-key-id` and `s3-secret-access-key` in
-          `secrets.files` or `secrets.credentials`.
-
-          An external store is reached through a host bridge (see `network.hostBridges`)
-          that only cloud-api and nimbus may use, so neither of them gets general egress
-          and hosted code still reaches the internet only through the outbound proxy.
-          Inside those two units only, `s3.external.host` and `<bucket>.<host>` resolve to
-          the bridge, through a private `/etc/hosts`; the host's own resolution of those
-          names is untouched. Requests carry the same `Host` header, with the bridge's
-          port, as a direct connection would, so the store must accept any port there.
+          Run versitygw on loopback as the S3 store. With `false`, use the store described
+          by `s3.external`, create both `s3.buckets` there yourself, and supply the
+          credentials as `s3-access-key-id` and `s3-secret-access-key` in `secrets.files`
+          or `secrets.credentials`.
         '';
       };
 
@@ -53,35 +45,28 @@ in {
           type = lib.types.nullOr lib.types.str;
           default = null;
           example = "s3.garage.example.com";
-          description = "S3 endpoint host. nimbus addresses buckets as `<bucket>.<host>`, so the store must support virtual-host addressing for this name.";
+          description = ''
+            S3 endpoint host. nimbus addresses buckets as `<bucket>.<host>`, so the store
+            must support virtual-host addressing for this name, and every bucket's name
+            must resolve on this host.
+          '';
         };
 
         port = lib.mkOption {
           type = lib.types.port;
           default = 443;
-          description = "Port of the S3 endpoint; the bridge's default target uses it.";
+          description = "Port of the S3 endpoint.";
         };
 
         https = lib.mkOption {
           type = lib.types.bool;
           default = true;
-          description = "Whether the store speaks HTTPS. The bridge forwards TCP, so TLS still runs end to end and the certificate must be valid for `host` and `*.host`.";
+          description = "Whether the store speaks HTTPS. The certificate must be valid for `host` and `*.host`.";
         };
 
         region = lib.mkOption {
           type = lib.types.str;
           default = "us-east-1";
-        };
-
-        bridge.target = lib.mkOption {
-          type = lib.types.str;
-          default = lib.optionalString (ext.host != null) "${ext.host}:${toString ext.port}";
-          defaultText = lib.literalExpression ''"''${s3.external.host}:''${toString s3.external.port}"'';
-          example = "10.100.0.3:3900";
-          description = ''
-            Where the bridge connects from the host: `host:port`, such as the store's
-            address on a private network, or a unix socket path.
-          '';
         };
       };
     };
@@ -101,9 +86,8 @@ in {
             unit = "unison-cloud-s3.service";
           }
           else {
-            inherit (ext) host https region;
-            port = cfg.internal.s3Port;
-            unit = "unison-cloud-bridge-s3.socket";
+            inherit (ext) host port https region;
+            unit = null;
           };
         description = "Where cloud-api and nimbus reach S3, and the unit that serves it.";
       };
@@ -121,24 +105,7 @@ in {
         internal = true;
         readOnly = true;
         default = 24151;
-        description = "Port of the S3 store, or of the bridge to an external one, on the namespace loopback.";
-      };
-
-      s3Hosts = lib.mkOption {
-        type = lib.types.attrs;
-        internal = true;
-        readOnly = true;
-        default = lib.optionalAttrs (!cfg.s3.bundled) {
-          BindReadOnlyPaths = [
-            "${pkgs.concatText "unison-cloud-s3-hosts" (config.networking.hostFiles
-              ++ [
-                (pkgs.writeText "unison-cloud-s3-bridge-hosts" ''
-                  127.0.0.1 ${ext.host} ${lib.concatMapStringsSep " " (bucket: "${bucket}.${ext.host}") buckets}
-                '')
-              ])}:/etc/hosts"
-          ];
-        };
-        description = "Unit settings that resolve the external S3 names to the bridge, for that unit only.";
+        description = "Port of the bundled S3 store, on loopback.";
       };
     };
   };
@@ -152,13 +119,6 @@ in {
         }
       ];
     }
-    (lib.mkIf (!cfg.s3.bundled) {
-      services.unison-cloud.network.hostBridges.s3 = {
-        inherit (ext.bridge) target;
-        port = cfg.internal.s3Port;
-        users = ["unison-cloud-api" "unison-cloud-nimbus"];
-      };
-    })
     (lib.mkIf cfg.s3.bundled {
       users.users.${user} = {
         isSystemUser = true;
@@ -196,7 +156,7 @@ in {
         });
 
       systemd.services.unison-cloud-s3 = lib.mkMerge [
-        cfg.internal.inNamespace
+        cfg.internal.sandbox
         {
           description = "Unison Cloud S3 (versitygw)";
           wantedBy = ["multi-user.target"];

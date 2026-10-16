@@ -6,9 +6,7 @@ self: {
   packages = self.packages.${pkgs.stdenv.hostPlatform.system};
 in {
   imports = [
-    ./netns.nix
-    ./egress.nix
-    ./bridges.nix
+    ./sandbox.nix
     ./secrets.nix
     ./ingress.nix
     ./dex.nix
@@ -64,12 +62,6 @@ in {
         Base URL of the Loki that Vector ships nimbus's logs to, and that cloud-api and
         nimbus query for a user's logs.
       '';
-    };
-
-    network.namespace = lib.mkOption {
-      type = lib.types.str;
-      default = "unison-cloud";
-      description = "Name of the private network namespace the services run in.";
     };
 
     database.package = lib.mkOption {

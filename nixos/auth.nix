@@ -8,8 +8,6 @@
   dex = cfg.auth.dex;
   apiOrigin = cfg.internal.publicUrl.api;
   dexLoopback = "http://127.0.0.1:${toString cfg.internal.dexPort}/dex";
-  bridged = !dex.enable && oidc.bridge.target != null;
-  bridgeOrigin = "http://127.0.0.1:${toString cfg.internal.oidcBridgePort}";
   endpoints = lib.attrValues oidc.endpoints;
   fixedEndpoints = lib.all (e: e != null) endpoints;
 
@@ -56,54 +54,25 @@ in {
         endpoints = lib.genAttrs ["authorization" "token" "jwks"] (name:
           lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default =
-              if name != "authorization" && oidc.bridge.target != null && oidc.bridge."${name}Path" != null
-              then "${bridgeOrigin}${oidc.bridge."${name}Path"}"
-              else null;
-            defaultText = lib.literalMD (
-              if name == "authorization"
-              then "`null`"
-              else "`http://127.0.0.1:<bridge port><bridge.${name}Path>` with `bridge.target` set, otherwise `null`"
-            );
+            default = null;
+            example =
+              {
+                authorization = "https://login.example.com/authorize";
+                token = "http://127.0.0.1:1411/api/oidc/token";
+                jwks = "http://127.0.0.1:1411/.well-known/jwks.json";
+              }.${
+                name
+              };
             description =
               {
                 authorization = "The provider's authorization endpoint. The browser follows it, so it must be the public URL.";
-                token = "The token endpoint cloud-api exchanges codes at.";
-                jwks = "The JWKS URL cloud-api fetches the provider's signing keys from.";
+                token = "The token endpoint cloud-api exchanges codes at, such as the provider's own listener on this host.";
+                jwks = "The JWKS URL cloud-api fetches the provider's signing keys from, such as the provider's own listener on this host.";
               }.${
                 name
               }
               + " Set all three or none; with none, cloud-api reads them from the issuer's discovery document.";
           });
-
-        bridge = {
-          target = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            example = "127.0.0.1:1411";
-            description = ''
-              Reach the provider's token and JWKS endpoints through a host bridge (see
-              `network.hostBridges`) that only cloud-api may use, instead of letting cloud-api
-              send traffic out of the namespace. The target is the provider's plain-HTTP
-              listener on the host, `host:port` or a unix socket path. Set
-              `endpoints.authorization` to the public URL, and `tokenPath` and `jwksPath`.
-            '';
-          };
-
-          tokenPath = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            example = "/api/oidc/token";
-            description = "Path of the token endpoint on the bridge target.";
-          };
-
-          jwksPath = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            example = "/.well-known/jwks.json";
-            description = "Path of the JWKS document on the bridge target.";
-          };
-        };
 
         allowedEmails = lib.mkOption {
           type = lib.types.listOf lib.types.str;
@@ -144,14 +113,6 @@ in {
         description = "Issuer users log in through; cloud-api records identities against it.";
       };
 
-      oidcBridgePort = lib.mkOption {
-        type = lib.types.port;
-        internal = true;
-        readOnly = true;
-        default = 5427;
-        description = "Port of the login provider's bridge, on the namespace loopback.";
-      };
-
       oidcSecretCredential = lib.mkOption {
         type = lib.types.str;
         internal = true;
@@ -180,34 +141,20 @@ in {
         message = "services.unison-cloud: with an external OIDC provider, set at least one of auth.oidc.allowedEmails, allowedEmailDomains or allowedGroups.";
       }
       {
-        assertion = !dex.enable || (oidc.bridge.target == null && lib.all (e: e == null) endpoints);
-        message = "services.unison-cloud: auth.oidc.endpoints and auth.oidc.bridge are for an external provider; set auth.dex.enable = false to use them.";
+        assertion = !dex.enable || lib.all (e: e == null) endpoints;
+        message = "services.unison-cloud: auth.oidc.endpoints are for an external provider; set auth.dex.enable = false to use them.";
       }
       {
         assertion = fixedEndpoints || lib.all (e: e == null) endpoints;
         message = "services.unison-cloud: set all of auth.oidc.endpoints.authorization, token and jwks, or none.";
       }
-      {
-        assertion = oidc.bridge.target == null || (oidc.bridge.tokenPath != null && oidc.bridge.jwksPath != null && oidc.endpoints.authorization != null);
-        message = "services.unison-cloud: with auth.oidc.bridge.target set, also set bridge.tokenPath, bridge.jwksPath and endpoints.authorization.";
-      }
     ];
 
     # cloud-api is the OIDC client (cloud-api patch 0007): it runs the login against the
     # provider, provisions the user, and serves ucm's authorization endpoints itself.
-    # Without a bridge, an external provider is out on the network, which only egress
-    # users may reach.
-    services.unison-cloud.internal.egressUsers = lib.mkIf (!dex.enable && !bridged) ["unison-cloud-api"];
-
-    services.unison-cloud.network.hostBridges.oidc = lib.mkIf bridged {
-      inherit (oidc.bridge) target;
-      port = cfg.internal.oidcBridgePort;
-      users = ["unison-cloud-api"];
-    };
-
     systemd.services.unison-cloud-api = {
-      requires = lib.optional dex.enable "unison-cloud-dex.service" ++ lib.optional bridged "unison-cloud-bridge-oidc.socket";
-      after = lib.optional dex.enable "unison-cloud-dex.service" ++ lib.optional bridged "unison-cloud-bridge-oidc.socket";
+      requires = lib.optional dex.enable "unison-cloud-dex.service";
+      after = lib.optional dex.enable "unison-cloud-dex.service";
       environment =
         {
           CLOUD_OIDC_ISSUER = cfg.internal.oidcIssuer;
@@ -220,8 +167,8 @@ in {
         // lib.optionalAttrs (oidc.allowedEmails != []) {CLOUD_OIDC_ALLOWED_EMAILS = commaList oidc.allowedEmails;}
         // lib.optionalAttrs (oidc.allowedEmailDomains != []) {CLOUD_OIDC_ALLOWED_EMAIL_DOMAINS = commaList oidc.allowedEmailDomains;}
         // lib.optionalAttrs (oidc.allowedGroups != []) {CLOUD_OIDC_ALLOWED_GROUPS = commaList oidc.allowedGroups;}
-        # The issuer is a public URL that may not resolve, or may be firewalled, inside the
-        # namespace. cloud-api still validates tokens against that issuer, but makes its
+        # The issuer is a public URL that may not resolve, or may be firewalled, from this
+        # host. cloud-api still validates tokens against that issuer, but makes its
         # server-to-server calls to Dex's loopback listener, or to the configured endpoints.
         // lib.optionalAttrs dex.enable {
           CLOUD_OIDC_AUTHORIZATION_URL = "${cfg.internal.oidcIssuer}/auth";

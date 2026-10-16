@@ -46,8 +46,8 @@
     s = builtins.substring;
   in "${s 0 8 h}-${s 8 4 h}-4${s 13 3 h}-8${s 17 3 h}-${s 20 12 h}";
 
-  # nimbus binds every listener on all addresses and ignores `host`, so nodes sharing the
-  # namespace each get their own block of ports. The public-daemon node comes first, so
+  # nimbus binds every listener on all addresses and ignores `host`, so nodes sharing a
+  # host each get their own block of ports. The public-daemon node comes first, so
   # changing the number of interactive nodes never moves it.
   groups = [
     {
@@ -167,7 +167,7 @@
 
   nodeService = node:
     lib.mkMerge [
-      cfg.internal.inNamespace
+      cfg.internal.sandbox
       {
         description = "Unison Cloud nimbus node ${node.name}";
         wantedBy = ["multi-user.target"];
@@ -184,12 +184,11 @@
           NIMBUS_CONFIG_FILE = "%t/unison-cloud-nimbus-${node.name}/config.json";
           GHCRTS = "-N -C0.003 -qb -qn1";
         };
-        # Hosted code runs in this process. The namespace keeps its TCP and UDP to what the
-        # firewall allows, but unix sockets and files are shared with the host, so the
-        # sandbox hides /run and /var and the process can't open a unix socket at all.
+        # Hosted code runs in this process. It reaches the network like any other process
+        # on the host, but the sandbox hides /run and /var and the process can't open a
+        # unix socket at all, so the host's sockets and state stay out of its reach.
         serviceConfig = lib.mkMerge [
           cfg.internal.hostIsolation
-          cfg.internal.s3Hosts
           (cfg.internal.loadSecrets [
             "s3-access-key-id"
             "s3-secret-access-key"
@@ -317,28 +316,8 @@ in {
     };
     users.groups.${user} = {};
 
-    # Hosted code runs as this user too, so it gets only what nimbus itself connects to,
-    # and never egress: an external S3 is behind a bridge on the S3 port.
-    # nimbus never reads Consul: cloud-api registers the nodes.
-    services.unison-cloud.internal.loopbackRestrictedUsers.${user} =
-      [
-        cfg.internal.outboundProxyPort
-        cfg.cloudApi.port
-        cfg.cloudApi.secretsPort
-        cfg.internal.lokiPort
-        cfg.internal.s3Port
-      ]
-      ++ lib.optional (!pg.external) db.port
-      ++ lib.concatMap (node: lib.attrValues node.ports) nodes;
-
     services.unison-cloud.internal.postgresRoles.${user}.passwordCredential = "nimbus-db-password";
     services.unison-cloud.internal.postgresDatabases.${db.database}.owner = user;
-
-    services.unison-cloud.network.hostBridges.postgres = lib.mkIf (cfg.database.mode == "host") {
-      target = "127.0.0.1:${toString config.services.postgresql.settings.port}";
-      inherit (db) port;
-      users = [user];
-    };
 
     # cloud-api registers the nodes itself (`<prefix>-nimbus-http`) when they join; this
     # is only for its TCP client path, which looks nodes up as `<prefix>-nimbus-client`.
@@ -357,24 +336,16 @@ in {
       })
       nodes;
 
-    services.unison-cloud.internal.ingressSockets =
-      lib.listToAttrs (map (node: lib.nameValuePair "nimbus-${node.name}" node.ports.publicHttp)
-        (lib.filter (node: node.type == "interactive") nodes));
-
     systemd.services =
       {
         # Creates the table as nimbus's own role, over the same path nimbus uses, so the
         # role owns it in every database mode and a broken path fails here, not in a node.
         unison-cloud-nimbus-storage = lib.mkMerge [
-          cfg.internal.inNamespace
+          cfg.internal.sandbox
           {
             description = "Create the Unison Cloud nimbus storage table";
-            requires =
-              ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"]
-              ++ lib.optional (cfg.database.mode == "host") "unison-cloud-bridge-postgres.socket";
-            after =
-              ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"]
-              ++ lib.optional (cfg.database.mode == "host") "unison-cloud-bridge-postgres.socket";
+            requires = ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"];
+            after = ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"];
             environment = {
               PGHOST = db.host;
               PGPORT = toString db.port;

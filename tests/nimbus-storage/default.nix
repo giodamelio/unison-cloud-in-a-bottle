@@ -11,8 +11,6 @@
   }: {
     imports = [self.nixosModules.default];
 
-    networking.nftables.enable = true;
-
     services.unison-cloud = {
       enable = true;
       nimbus.nodes.interactive = 1;
@@ -38,16 +36,14 @@
     socket = "/run/unison-cloud-postgresql"
     nimbus_nodes = json.loads(${builtins.toJSON (builtins.toJSON cfg.internal.nimbusNodes)})
     interactive = next(n for n in nimbus_nodes if n["type"] == "interactive")
-
-    def ns(cmd):
-        return f"ip netns exec unison-cloud {cmd}"
+    pg_port = ${toString cfg.internal.postgresTcp.port}
 
     def peer(user, database, query):
-        return f"sudo -u {user} psql -h {socket} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
+        return f"sudo -u {user} psql -h {socket} -p {pg_port} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
 
     def tcp(user, database, password, query, as_user="unison-cloud-nimbus"):
-        return ns(
-            f"sudo -u {as_user} env PGPASSWORD={shlex.quote(password)} psql -h 127.0.0.1 -p 5432"
+        return (
+            f"sudo -u {as_user} env PGPASSWORD={shlex.quote(password)} psql -h 127.0.0.1 -p {pg_port}"
             f" -U {user} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         )
 
@@ -59,7 +55,7 @@
         assert config == {
             "type": "postgres",
             "host": "127.0.0.1",
-            "port": 5432,
+            "port": pg_port,
             "user": "unison-cloud-nimbus",
             "database": "unison_cloud_nimbus",
             "table": "nimbus_kv",
@@ -67,10 +63,9 @@
         }, config
 
     with subtest("nimbus's storage reads, writes and deletes, and a losing concurrent writer sees a conflict"):
-        # As nimbus's user in the namespace, so the namespace firewall applies as it does to nimbus.
         output = machine.succeed(
             "systemd-run --wait --pipe --quiet"
-            " -p NetworkNamespacePath=/run/netns/unison-cloud -p User=unison-cloud-nimbus"
+            " -p User=unison-cloud-nimbus"
             " -p RuntimeDirectory=unison-cloud-storage-probe --setenv=HOME=/run/unison-cloud-storage-probe"
             f" --setenv=STORAGE_CONFIG={shlex.quote(json.dumps(config))} storage-probe"
         )
@@ -110,9 +105,9 @@
         machine.fail(tcp("unison-cloud-api", "unison_cloud", "", "SELECT 1", as_user="root"))
         machine.fail(tcp("unison-cloud-postgres", "postgres", "", "SELECT 1", as_user="root"))
 
-    with subtest("PostgreSQL listens on the namespace loopback only"):
-        machine.fail("ss -Hltn | grep -q ':5432 '")
-        machine.succeed(ns("ss -Hltn | grep -q '127.0.0.1:5432 '"))
+    with subtest("PostgreSQL listens on loopback only"):
+        listeners = machine.succeed(f"ss -Hltn | awk '{{print $4}}' | grep ':{pg_port}$'").split()
+        assert listeners == [f"127.0.0.1:{pg_port}"], listeners
 
     with subtest("nothing of ExtendDB or the internal CA is left"):
         machine.fail("systemctl cat unison-cloud-extenddb.service")

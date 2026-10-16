@@ -165,22 +165,21 @@ in {
         type = lib.types.bool;
         default = true;
         description = ''
-          Run a single-node Consul server inside the namespace, with ACLs on and every
+          Run a single-node Consul server on loopback, with ACLs on and every
           request denied by default. It creates the `consul.aclPolicy` policy and the
           `consul-token` token itself at boot, so `consul-token` must be a UUID if you
           supply it.
 
-          With `false`, point `consul.address` at a Consul agent, reached through a host
-          bridge (see `network.hostBridges`), and supply a token holding
-          `consul.aclPolicy` as `consul-token` in `secrets.files` or
-          `secrets.credentials`.
+          With `false`, point `consul.address` at the host's local Consul agent, and
+          supply a token holding `consul.aclPolicy` as `consul-token` in `secrets.files`
+          or `secrets.credentials`.
         '';
       };
 
       address = lib.mkOption {
         type = lib.types.str;
         default = bundledAddress;
-        example = "http://127.0.0.1:18500";
+        example = "http://127.0.0.1:8500";
         description = "Base URL of the Consul agent cloud-api and the service registrations use.";
       };
 
@@ -214,7 +213,7 @@ in {
         internal = true;
         readOnly = true;
         default = 8500;
-        description = "HTTP port of the bundled Consul, on the namespace loopback.";
+        description = "HTTP port of the bundled Consul, on loopback.";
       };
 
       consulServices = lib.mkOption {
@@ -236,7 +235,7 @@ in {
       ];
 
       systemd.services.unison-cloud-consul-services = lib.mkMerge [
-        cfg.internal.inNamespace
+        cfg.internal.sandbox
         {
           description = "Register the Unison Cloud services with the local Consul agent";
           wantedBy = ["multi-user.target"];
@@ -247,10 +246,7 @@ in {
             {
               Type = "oneshot";
               RemainAfterExit = true;
-              # cloud-api's user, since it uses cloud-api's token, and a host bridge to an
-              # external agent then only needs to admit that one user.
-              User = "unison-cloud-api";
-              Group = "unison-cloud-api";
+              DynamicUser = true;
               ExecStart = lib.getExe register;
               ExecStop = lib.getExe deregister;
             }
@@ -274,7 +270,7 @@ in {
 
       systemd.services = {
         unison-cloud-consul = lib.mkMerge [
-          cfg.internal.inNamespace
+          cfg.internal.sandbox
           {
             description = "Unison Cloud Consul server";
             wantedBy = ["multi-user.target"];
@@ -298,7 +294,7 @@ in {
         ];
 
         unison-cloud-consul-acl = lib.mkMerge [
-          cfg.internal.inNamespace
+          cfg.internal.sandbox
           {
             description = "Create the Unison Cloud Consul ACL policies and tokens";
             requires = ["unison-cloud-consul.service"];
