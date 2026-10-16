@@ -87,7 +87,13 @@ self: {
             "--variable redirect=http://127.0.0.1:8099/redirect", f"--variable verifier={verifier}",
             f"--variable challenge={challenge}", f"--secret password={password}",
         )
-        return json.loads(response)["access_token"]
+        return json.loads(response)
+
+    def refresh(refresh_token):
+        return (
+            f"curl -s -o /dev/null -w '%{{http_code}}\\n' --cacert {ca} -d grant_type=refresh_token"
+            f" -d refresh_token={refresh_token} {api}/selfhost/oidc/token"
+        )
 
     def psql(query):
         return machine.succeed(
@@ -104,7 +110,7 @@ self: {
     machine.wait_until_succeeds(f"curl -s --cacert {ca} -o /dev/null -w '%{{http_code}}' {api}/v2/account | grep -q 401", timeout=120)
 
     with subtest("alice logs in the way ucm's auth.login does, through cloud-api and Dex"):
-        token = login_ucm("alice@example.com", "alice-password", "alice")
+        token = login_ucm("alice@example.com", "alice-password", "alice")["access_token"]
         assert psql("SELECT u.handle FROM selfhost.oidc_identities i JOIN users u ON u.id = i.user_id WHERE i.issuer = 'https://cloud.test:8443/dex'") == "alice"
         assert psql("SELECT count(*) FROM cloud_users cu JOIN users u ON u.id = cu.user_id WHERE u.handle = 'alice'") == "1"
 
@@ -127,6 +133,21 @@ self: {
         password = machine.succeed(f"cat {secrets}/dex-admin-password").strip()
         login_ucm("admin@cloud.test", password, "admin")
         assert psql("SELECT count(*) FROM users WHERE handle = 'admin'") == "1"
+
+    with subtest("of concurrent refreshes with one token, exactly one succeeds"):
+        refresh_token = login_ucm("alice@example.com", "alice-password", "alice")["refresh_token"]
+        codes = machine.succeed(" & ".join([refresh(refresh_token)] * 8) + " & wait").split()
+        assert sorted(codes) == ["200"] + ["400"] * 7, codes
+
+    with subtest("refresh tokens are stored only as hashes, refused once expired, and swept by the next write"):
+        refresh_token = login_ucm("alice@example.com", "alice-password", "alice")["refresh_token"]
+        assert int(psql("SELECT count(*) FROM selfhost.ephemeral WHERE key LIKE 'selfhost:oidc:refresh:%'")) > 0
+        assert psql(f"SELECT count(*) FROM selfhost.ephemeral WHERE strpos(key, '{refresh_token}') > 0") == "0"
+        psql("UPDATE selfhost.ephemeral SET expires_at = now() - interval '1 second'")
+        assert machine.succeed(refresh(refresh_token)).strip() == "400"
+        assert int(psql("SELECT count(*) FROM selfhost.ephemeral WHERE expires_at < now()")) > 0
+        login_ucm("alice@example.com", "alice-password", "alice")
+        assert psql("SELECT count(*) FROM selfhost.ephemeral WHERE expires_at < now()") == "0"
 
     with subtest("only the ingress group can open the sockets"):
         machine.fail("test -e /run/unison-cloud/oauth2-proxy.sock")

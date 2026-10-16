@@ -205,7 +205,6 @@ flowchart TB
                 direction LR
                 postgres[("PostgreSQL")]
                 s3[("versitygw")]
-                redis[("Redis")]
             end
 
             subgraph logs["Logs"]
@@ -240,9 +239,8 @@ flowchart TB
 - **cloud-api** is the control plane. It handles login, users, environments, secrets, and service names, and hands deploys to nimbus.
 - **nimbus** is the worker that actually runs your Unison code. There's one daemon node plus a configurable number of interactive nodes (two by default).
 - **Dex** is the bundled login provider. cloud-api acts as an OIDC client of Dex (or any external OIDC provider you point it at), and as a tiny authorization server for `ucm auth.login`.
-- **PostgreSQL** holds cloud-api's data and environment secrets, and nimbus's transactional storage in place of DynamoDB. Each has its own role, and neither can read the other's tables.
+- **PostgreSQL** holds cloud-api's data, environment secrets, login state and refresh tokens, and nimbus's transactional storage in place of DynamoDB. Each has its own role, and neither can read the other's tables.
 - **versitygw** stands in for S3, for deployed service code and blobs. You can point it at a real S3 instead, reached through a host bridge.
-- **Redis** holds login state and refresh tokens.
 - **Consul** is a single-node service registry that cloud-api uses to find the nimbus nodes.
 - **Loki and Vector** collect the logs. Vector ships nimbus's journal into Loki with the labels cloud-api expects when the UI asks for logs.
 - **Squid and Unbound** form the outbound proxy for hosted code. Your services can reach the internet, but never loopback or private addresses.
@@ -265,6 +263,7 @@ cloud-api (`patches/cloud-api/`):
 - `0006-cookie-secure-from-origin`: Sets the cookie `Secure` flag from the API's scheme, so login works over plain HTTP.
 - `0007-oidc-broker`: Makes cloud-api an OIDC client of Dex or any other provider, and the login server `ucm auth.login` talks to. It's the only way to log in.
 - `0008-remove-unauthenticated-routes`: Removes the routes that answer without a real login, so nothing on the host can reach cloud-api's port and become a user or change state. That covers the Share login (`/login`, `/oauth/redirect`, `/enroll`), the credential-free `/local/*` logins, the Stripe webhook (its secret is a public placeholder), and the `/internal` lookups nimbus replaced with `/v2/cluster`. `/internal/invalidate` now refuses every call when its token is unset.
+- `0009-redis-to-postgres`: Replaces Redis with a Postgres table for login state, authorization codes and refresh tokens, so there's one less service to run. Expired entries are skipped on read and deleted on write, without a timer. Codes and refresh tokens are now consumed in one statement, so two racing requests can't both redeem one.
 
 unison-cloud-ui (`patches/cloud-ui/`):
 
@@ -286,5 +285,5 @@ This only exists because of a bunch of other people's work on a bunch of project
 - [unison-nix](https://github.com/ceedubs/unison-nix), for packaging `ucm`.
 - [stacklock2nix](https://github.com/cdepillabout/stacklock2nix), for making the cloud-api Haskell build painless.
 - [@runarorama/postgres](https://share.unison-lang.org/@runarorama/postgres), for a PostgreSQL client nimbus can use.
-- [versitygw](https://github.com/versity/versitygw), [Dex](https://dexidp.io/), [Caddy](https://caddyserver.com/), [PostgreSQL](https://www.postgresql.org/), [Redis](https://redis.io/), [Consul](https://www.consul.io/), [Grafana Loki](https://grafana.com/oss/loki/), [Vector](https://vector.dev/), [Squid](https://www.squid-cache.org/), and [Unbound](https://nlnetlabs.nl/projects/unbound/).
+- [versitygw](https://github.com/versity/versitygw), [Dex](https://dexidp.io/), [Caddy](https://caddyserver.com/), [PostgreSQL](https://www.postgresql.org/), [Consul](https://www.consul.io/), [Grafana Loki](https://grafana.com/oss/loki/), [Vector](https://vector.dev/), [Squid](https://www.squid-cache.org/), and [Unbound](https://nlnetlabs.nl/projects/unbound/).
 - [NixOS](https://nixos.org/) and nixpkgs, for making it possible to wire all of this together in one place.

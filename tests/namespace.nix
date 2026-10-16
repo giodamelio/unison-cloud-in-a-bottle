@@ -118,7 +118,6 @@ in {
     internet.wait_for_unit("http-53.service")
     machine.wait_for_unit("unison-cloud-netns-firewall.service")
     machine.wait_for_unit("unison-cloud-consul.service")
-    machine.wait_for_unit("redis-unison-cloud.service")
 
     listen("ns-allowed", "127.0.0.1", 9001)
     listen("ns-any", "0.0.0.0", 9100)
@@ -158,13 +157,13 @@ in {
             "ip netns exec unison-cloud sudo -u fakenimbus "
             "curl -sf --max-time 5 http://127.0.0.1:9001/hostname"
         )
-        for port in [6379, 8500, 9100]:
+        for port in [8500, 9100]:
             machine.fail(connect("fakenimbus", "127.0.0.1", port))
         machine.fail(connect("fakenimbus", "10.88.0.2", 9100))
 
     with subtest("unrestricted users keep the whole loopback"):
         machine.wait_until_succeeds(connect("root", "127.0.0.1", 8500))
-        machine.succeed(connect("nobody", "127.0.0.1", 6379))
+        machine.succeed(connect("nobody", "127.0.0.1", 8500))
         machine.succeed(connect("nobody", "10.88.0.2", 9100))
 
     with subtest("nothing outside reaches a namespace port"):

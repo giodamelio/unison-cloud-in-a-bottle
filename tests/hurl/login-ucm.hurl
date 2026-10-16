@@ -1,6 +1,7 @@
 # ucm's `auth.login`, driven by hand: discovery, authorization code with PKCE through the
-# login provider, the token exchange, userinfo, and a refresh without client_id.
-# Prints the final token response, whose `access_token` the cloud client can use.
+# login provider, the token exchange, userinfo, and refreshes without client_id. Codes and
+# refresh tokens each work once. Prints the final token response, whose `access_token` the
+# cloud client can use and whose `refresh_token` is unused.
 # Variables: api (origin), user (the provider login, an email), handle, redirect (a
 # loopback URL with a listener on it, standing in for ucm's), verifier and challenge (a
 # PKCE S256 pair); secret: password.
@@ -63,6 +64,8 @@ redirect_uri: {{redirect}}
 client_id: ucm
 code_verifier: {{verifier}}
 HTTP 400
+[Asserts]
+jsonpath "$.error" == "invalid_grant"
 
 GET {{userinfo}}
 Authorization: Bearer {{access_token}}
@@ -82,6 +85,23 @@ POST {{token_endpoint}}
 [FormParams]
 grant_type: refresh_token
 refresh_token: {{refresh_token}}
+HTTP 200
+[Captures]
+next_refresh_token: jsonpath "$.refresh_token"
+
+# A refresh token is single-use too.
+POST {{token_endpoint}}
+[FormParams]
+grant_type: refresh_token
+refresh_token: {{refresh_token}}
+HTTP 400
+[Asserts]
+jsonpath "$.error" == "invalid_grant"
+
+POST {{token_endpoint}}
+[FormParams]
+grant_type: refresh_token
+refresh_token: {{next_refresh_token}}
 HTTP 200
 [Asserts]
 jsonpath "$.access_token" exists

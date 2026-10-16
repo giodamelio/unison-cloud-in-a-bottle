@@ -16,6 +16,7 @@
     ../../patches/cloud-api/0006-cookie-secure-from-origin.patch
     ../../patches/cloud-api/0007-oidc-broker.patch
     ../../patches/cloud-api/0008-remove-unauthenticated-routes.patch
+    ../../patches/cloud-api/0009-redis-to-postgres.patch
   ];
 
   stacklock = stacklock2nix {

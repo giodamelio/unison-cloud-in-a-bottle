@@ -1,0 +1,486 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -32,7 +32,6 @@
+ import Data.Text qualified as Text
+ import Data.Text.Encoding qualified as Text
+ import Data.Time qualified as Time
+-import Database.Redis qualified as Redis
+ import Hasql.Pool qualified as Pool
+ import Hasql.Pool.Config qualified as Pool
+ import Network.HTTP.Client
+@@ -65,7 +64,6 @@
+   envServerPort <- fromEnv "NOMAD_ALLOC_PORT_cloud_http" readPort
+   envServerHostname <- fromEnv "NOMAD_HOST_IP_cloud_tcp" readHostname
+   envClientPort <- fromEnv "NOMAD_ALLOC_PORT_cloud_tcp" readHostname
+-  --  redisCert <- fromEnv "CLOUD_REDIS_CERT" readCertStore
+   envPostgresConfig <- fromEnv "CLOUD_POSTGRES" (pure . Right . Text.pack)
+   postgresConnMax <- fromEnv "CLOUD_POSTGRES_CONN_MAX" (pure . maybeToEither "Invalid CLOUD_POSTGRES_CONN_MAX" . readMaybe)
+   shareOAuthClientID <- fromEnv "CLOUD_SHARE_OAUTH_CLIENT_ID" (pure . Right . Text.pack)
+@@ -144,18 +142,6 @@
+   --  certs <- fromEnv "CLOUD_CERT" readCerts
+   --  privKey <- fromEnv "CLOUD_PRIV_KEY" readPrivKey
+   -- privateKey <- fromEnv "CLOUD_PRIV_KEY" readPrivateKey
+-  envRedisConfig <-
+-    fromEnv "CLOUD_REDIS" (pure . Redis.parseConnectInfo) <&> \r ->
+-      let tlsParams
+-            | Deployment.onLocal = Nothing
+-            | otherwise = Nothing
+-       in --                Just
+-          --                  ( (TLS.defaultParamsClient (Redis.connectHost r) (BS.pack ""))
+-          --                      { TLS.clientSupported = def {TLS.supportedCiphers = ciphersuite_strong},
+-          --                        TLS.clientShared = def {TLS.sharedCAStore = redisCert}
+-          --                      }
+-          --                  )
+-          r {Redis.connectTLSParams = tlsParams}
+ 
+   let shareDeployment = case Cloud.Deployment.deployment of
+         Cloud.Deployment.Production -> Share.Deployment.Production
+@@ -212,7 +198,6 @@
+     Deployment.Staging -> pure (Nothing, Nothing)
+     Deployment.Local -> pure (Nothing, Nothing)
+ 
+-  envRedisConnection <- Redis.checkedConnect envRedisConfig
+   -- Set some very conservative defaults
+   let pgConnectionAcquisitionTimeout = Time.secondsToDiffTime 60 -- 1 minute
+   -- Helps prevent leaking connections if they somehow get forgotten about.
+--- a/cloud.cabal
++++ b/cloud.cabal
+@@ -87,9 +87,11 @@
+       Cloud.Postgres.Queries.User
+       Cloud.Prelude
+       Cloud.Prelude.Orphans
++      Cloud.SelfHost.Ephemeral
+       Cloud.SelfHost.Oidc
+       Cloud.SelfHost.Oidc.API
+       Cloud.SelfHost.Oidc.Config
++      Cloud.SelfHost.Oidc.OAuthState
+       Cloud.SelfHost.Oidc.RefreshToken
+       Cloud.SelfHost.Oidc.Upstream
+       Cloud.SelfHost.Provision
+@@ -203,7 +205,6 @@
+     , hasql
+     , hasql-interpolate
+     , hasql-pool
+-    , hedis
+     , here
+     , http-api-data
+     , http-client
+@@ -337,7 +338,6 @@
+     , hasql
+     , hasql-interpolate
+     , hasql-pool
+-    , hedis
+     , here
+     , http-api-data
+     , http-client
+@@ -473,7 +473,6 @@
+     , hasql
+     , hasql-interpolate
+     , hasql-pool
+-    , hedis
+     , here
+     , hspec
+     , hspec-discover
+--- a/docker/sql/2099-01-03-00_selfhost_ephemeral.sql
++++ b/docker/sql/2099-01-03-00_selfhost_ephemeral.sql
+@@ -0,0 +1,9 @@
++CREATE SCHEMA IF NOT EXISTS selfhost;
++
++-- Replaces Redis for login state, authorization codes and refresh tokens. Readers
++-- ignore expired rows and writers delete them, so nothing needs to run on a timer.
++CREATE TABLE selfhost.ephemeral (
++  key text PRIMARY KEY,
++  value bytea NOT NULL,
++  expires_at timestamptz NOT NULL
++);
+--- a/package.yaml
++++ b/package.yaml
+@@ -56,7 +56,6 @@
+ - fast-logger
+ - filepath
+ - fuzzyfind
+-- hedis
+ - here
+ - http-api-data
+ - http-client
+--- a/src/Cloud/App.hs
++++ b/src/Cloud/App.hs
+@@ -16,7 +16,6 @@
+   )
+ import Crypto.JWT qualified as JWT
+ import Crypto.Random.Types qualified as Cryptonite
+-import Database.Redis qualified as R
+ 
+ newtype AppM reqCtx a = AppM {unAppM :: ReaderT (Env reqCtx) IO a}
+   deriving newtype (Functor, Applicative, Monad, MonadReader (Env reqCtx), MonadRandom, MonadIO, MonadUnliftIO)
+@@ -38,12 +37,3 @@
+ runAppM :: Env reqCtx -> AppM reqCtx a -> IO a
+ runAppM env (AppM m) = runReaderT m env
+ 
+-instance R.MonadRedis (AppM reqCtx) where
+-  liftRedis m = do
+-    redis <- asks envRedisConnection
+-    liftIO $ R.runRedis redis m
+-
+-instance R.RedisCtx (AppM reqCtx) (Either R.Reply) where
+-  returnDecode r = do
+-    R.liftRedis $ R.returnDecode r
+-
+--- a/src/Cloud/Env.hs
++++ b/src/Cloud/Env.hs
+@@ -14,7 +14,6 @@
+ import Cloud.User.Env (AuthEnv)
+ import Cloud.User.Types (CloudTier)
+ import Cloud.Utils.Logging.Types qualified as Logging
+-import Database.Redis qualified as R
+ import Network.Socket (HostName, ServiceName)
+ import Network.URI (URI)
+ import Servant qualified as S
+@@ -46,7 +45,6 @@
+     envSecretsPort :: Int,
+     cloudServicesBucket :: S3.BucketName,
+     s3Env :: S3.Env,
+-    envRedisConnection :: R.Connection,
+     envRequestCtx :: reqCtx,
+     envSentryService :: SentryService,
+     envServerPort :: Int,
+--- a/src/Cloud/SelfHost/Ephemeral.hs
++++ b/src/Cloud/SelfHost/Ephemeral.hs
+@@ -0,0 +1,47 @@
++-- | Short-lived values with an expiry, kept in Postgres so the stack runs without Redis.
++--
++-- Nothing sweeps the table on a timer: reads ignore expired rows, and every 'put'
++-- deletes them, so it works the same against any Postgres server.
++module Cloud.SelfHost.Ephemeral
++  ( put,
++    get,
++    take,
++  )
++where
++
++import Cloud.Postgres qualified as PG
++import Cloud.Prelude
++import Data.Time (DiffTime, NominalDiffTime)
++import Prelude hiding (take)
++
++-- | Replaces any value already at the key, expired or not.
++put :: Text -> NominalDiffTime -> ByteString -> PG.Transaction e ()
++put key ttl value = do
++  let interval = realToFrac ttl :: DiffTime
++  PG.execute_
++    [PG.sql|
++        DELETE FROM selfhost.ephemeral WHERE expires_at < now()
++      |]
++  PG.execute_
++    [PG.sql|
++        INSERT INTO selfhost.ephemeral (key, value, expires_at)
++          VALUES (#{key}, #{value}, now() + #{interval})
++          ON CONFLICT (key) DO UPDATE
++            SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at
++      |]
++
++get :: Text -> PG.Transaction e (Maybe ByteString)
++get key =
++  PG.query1Col
++    [PG.sql|
++        SELECT value FROM selfhost.ephemeral WHERE key = #{key} AND expires_at > now()
++      |]
++
++-- | Reads and deletes in one statement, so of two concurrent takes only one gets the value.
++take :: Text -> PG.Transaction e (Maybe ByteString)
++take key =
++  PG.query1Col
++    [PG.sql|
++        DELETE FROM selfhost.ephemeral WHERE key = #{key} AND expires_at > now()
++          RETURNING value
++      |]
+--- a/src/Cloud/SelfHost/Oidc/OAuthState.hs
++++ b/src/Cloud/SelfHost/Oidc/OAuthState.hs
+@@ -0,0 +1,116 @@
++-- | The pending logins and authorization codes of share-auth's "Share.OAuth.Redis", kept
++-- in 'Ephemeral' instead. Values keep share-auth's 'Binary' encodings and key names.
++module Cloud.SelfHost.Oidc.OAuthState
++  ( newPendingSession,
++    getPendingSession,
++    failPendingSession,
++    createOAuth2Code,
++    exchangeOAuth2Code,
++  )
++where
++
++import Cloud.App (AppM)
++import Cloud.Postgres qualified as PG
++import Cloud.Postgres.App (postgresM)
++import Cloud.Prelude
++import Cloud.SelfHost.Ephemeral qualified as Ephemeral
++import Data.Aeson ((.:), (.=))
++import Data.Aeson qualified as Aeson
++import Data.Binary (Binary)
++import Data.Binary qualified as Binary
++import Data.ByteString.Lazy qualified as BL
++import Data.Set (Set)
++import Data.Time (NominalDiffTime)
++import Data.Typeable (Proxy (..), TypeRep, Typeable, typeRep)
++import Network.URI (URI)
++import Share.OAuth.Errors (OAuth2Error (..))
++import Share.OAuth.PKCE (verifyPkce)
++import Share.OAuth.Session (LoginRequest, PendingSession (..), Session (..))
++import Share.OAuth.Session qualified as Session
++import Share.OAuth.Types (AuthenticationRequest (..), Code (..), OAuthClientId, PKCEVerifier, PendingSessionId (..), SessionId, UserId)
++import Share.Utils.Binary (JSONBinary (..))
++import Share.Utils.IDs qualified as IDs
++import Share.Utils.SecureTokens (newSecureToken)
++import Share.Utils.URI (URIParam)
++
++-- | A stored value no longer decodes, likely because its encoding changed incompatibly.
++data DecodingError = DecodingError Text String TypeRep
++  deriving stock (Show)
++
++instance Exception DecodingError
++
++pendingSessionTTL :: NominalDiffTime
++pendingSessionTTL = 5 * 60
++
++codeTTL :: NominalDiffTime
++codeTTL = 5 * 60
++
++pendingSessionKey :: PendingSessionId -> Text
++pendingSessionKey sid = "sessions:pending:" <> IDs.toText sid
++
++codeKey :: Code -> Text
++codeKey code = "oauthcode:" <> codeText code
++
++newPendingSession :: LoginRequest -> PKCEVerifier -> Maybe URI -> Maybe Aeson.Value -> AppM ctx PendingSession
++newPendingSession loginRequest pkceVerifier returnToURI additionalData = do
++  pendingId <- PendingSessionId <$> newSecureToken
++  let pending = PendingSession {pendingId, loginRequest, pkceVerifier, returnToURI, additionalData}
++  postgresM . PG.runTransaction $ Ephemeral.put (pendingSessionKey pendingId) pendingSessionTTL (encode pending)
++  pure pending
++
++getPendingSession :: PendingSessionId -> AppM ctx (Maybe PendingSession)
++getPendingSession sid = do
++  let key = pendingSessionKey sid
++  postgresM (PG.runTransaction (Ephemeral.get key)) >>= traverse (decode key)
++
++failPendingSession :: PendingSessionId -> AppM ctx ()
++failPendingSession sid = void . postgresM . PG.runTransaction $ Ephemeral.take (pendingSessionKey sid)
++
++data CodeExchange = CodeExchange
++  { code :: Code,
++    authRequest :: AuthenticationRequest,
++    userId :: UserId,
++    sessionId :: SessionId
++  }
++  deriving (Binary) via JSONBinary CodeExchange
++
++instance Aeson.ToJSON CodeExchange where
++  toJSON CodeExchange {code, authRequest, userId, sessionId} =
++    Aeson.object
++      [ "code" .= code,
++        "auth_request" .= authRequest,
++        "user_id" .= userId,
++        "session_id" .= sessionId
++      ]
++
++instance Aeson.FromJSON CodeExchange where
++  parseJSON = Aeson.withObject "CodeExchange" \o ->
++    CodeExchange <$> o .: "code" <*> o .: "auth_request" <*> o .: "user_id" <*> o .: "session_id"
++
++createOAuth2Code :: URI -> Set URI -> UserId -> AuthenticationRequest -> AppM ctx (Session, Code)
++createOAuth2Code issuer aud userId authRequest = do
++  code <- Code <$> newSecureToken
++  session@Session {sessionId} <- Session.createSession issuer aud userId
++  postgresM . PG.runTransaction $ Ephemeral.put (codeKey code) codeTTL (encode CodeExchange {code, authRequest, userId, sessionId})
++  pure (session, code)
++
++-- | Consumes the code before checking it, so it's redeemed at most once even when two
++-- exchanges race, and a failed attempt burns it.
++exchangeOAuth2Code :: Code -> OAuthClientId -> URIParam -> PKCEVerifier -> AppM ctx (SessionId, UserId, AuthenticationRequest)
++exchangeOAuth2Code code callerClientId callerRedirectURI verifier = do
++  let key = codeKey code
++  postgresM (PG.runTransaction (Ephemeral.take key)) >>= traverse (decode key) >>= \case
++    Nothing -> throwIO (CodeMissingOrExpired code)
++    Just CodeExchange {userId, sessionId, authRequest = authRequest@AuthenticationRequest {clientId, redirectURI, pkceChallenge, pkceChallengeMethod}}
++      | clientId /= callerClientId -> throwIO (MismatchedClientId callerClientId clientId)
++      | redirectURI /= callerRedirectURI -> throwIO (MismatchedRedirectURI callerRedirectURI redirectURI)
++      | not (verifyPkce verifier pkceChallenge pkceChallengeMethod) -> throwIO PKCEChallengeFailure
++      | otherwise -> pure (sessionId, userId, authRequest)
++
++encode :: (Binary a) => a -> ByteString
++encode = BL.toStrict . Binary.encode
++
++decode :: forall a ctx. (Typeable a, Binary a) => Text -> ByteString -> AppM ctx a
++decode key bytes = case Binary.decodeOrFail (BL.fromStrict bytes) of
++  Left (_, _, err) -> throwIO (DecodingError key err (typeRep (Proxy @a)))
++  Right (_, _, a) -> pure a
+--- a/src/Cloud/SelfHost/Oidc/RefreshToken.hs
++++ b/src/Cloud/SelfHost/Oidc/RefreshToken.hs
+@@ -1,6 +1,6 @@
+--- | Opaque, single-use refresh tokens for ucm, kept in Redis.
++-- | Opaque, single-use refresh tokens for ucm, kept in 'Ephemeral'.
+ --
+--- Unlike the access tokens these can be revoked: deleting the keys under
++-- Unlike the access tokens these can be revoked: deleting the keys starting with
+ -- @selfhost:oidc:refresh:@ stops every refresh.
+ module Cloud.SelfHost.Oidc.RefreshToken
+   ( issueRefreshToken,
+@@ -9,15 +9,16 @@
+ where
+ 
+ import Cloud.App (AppM)
++import Cloud.Postgres qualified as PG
++import Cloud.Postgres.App (postgresM)
+ import Cloud.Prelude
++import Cloud.SelfHost.Ephemeral qualified as Ephemeral
+ import Cloud.SelfHost.Tokens (accessTokenTTL)
+ import Crypto.Hash (SHA256 (..), hashWith)
+ import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.=))
+ import Data.Aeson qualified as Aeson
+-import Data.ByteString.Char8 qualified as BSC
+ import Data.ByteString.Lazy qualified as BL
+ import Data.Text.Encoding qualified as Text
+-import Database.Redis qualified as R
+ import Share.OAuth.Scopes (Scopes)
+ import Share.OAuth.Types (UserId)
+ import Share.Utils.SecureTokens (newSecureToken)
+@@ -33,33 +34,21 @@
+ instance FromJSON Grant where
+   parseJSON = Aeson.withObject "Grant" \o -> Grant <$> o .: "user_id" <*> o .: "scope"
+ 
+-newtype RedisFailure = RedisFailure R.Reply
+-  deriving stock (Show)
+-
+-instance Exception RedisFailure
+-
+--- | Only a hash is stored, so reading Redis doesn't hand out working tokens.
+-redisKey :: Text -> ByteString
+-redisKey token = "selfhost:oidc:refresh:" <> BSC.pack (show (hashWith SHA256 (Text.encodeUtf8 token)))
++-- | Only a hash is stored, so reading the table doesn't hand out working tokens.
++storageKey :: Text -> Text
++storageKey token = "selfhost:oidc:refresh:" <> tshow (hashWith SHA256 (Text.encodeUtf8 token))
+ 
+ -- | Lives as long as an access token; each refresh replaces it with a new one.
+ issueRefreshToken :: UserId -> Scopes -> AppM ctx Text
+ issueRefreshToken userId scope = do
+   token <- newSecureToken
+-  _ <- orThrow =<< R.setex (redisKey token) (floor accessTokenTTL) (BL.toStrict (Aeson.encode Grant {userId, scope}))
++  postgresM . PG.runTransaction $ Ephemeral.put (storageKey token) accessTokenTTL (BL.toStrict (Aeson.encode Grant {userId, scope}))
+   pure token
+ 
+ -- | Consumes the token, so a stolen copy stops working once its owner refreshes.
+ redeemRefreshToken :: Text -> AppM ctx (Maybe (UserId, Scopes))
+ redeemRefreshToken token = do
+-  let key = redisKey token
+-  stored <- orThrow =<< R.get key
+-  deleted <- orThrow =<< R.del [key]
++  stored <- postgresM . PG.runTransaction $ Ephemeral.take (storageKey token)
+   pure do
+-    -- Of two concurrent redemptions, only the one that deleted the key wins.
+-    guard (deleted == 1)
+     Grant {userId, scope} <- stored >>= Aeson.decodeStrict
+     pure (userId, scope)
+-
+-orThrow :: Either R.Reply a -> AppM ctx a
+-orThrow = either (throwIO . RedisFailure) pure
+--- a/src/Cloud/SelfHost/Oidc.hs
++++ b/src/Cloud/SelfHost/Oidc.hs
+@@ -17,6 +17,7 @@
+ import Cloud.Prelude
+ import Cloud.SelfHost.Oidc.API
+ import Cloud.SelfHost.Oidc.Config (Allowlist (..), OidcConfig (..))
++import Cloud.SelfHost.Oidc.OAuthState qualified as OAuthState
+ import Cloud.SelfHost.Oidc.RefreshToken (issueRefreshToken, redeemRefreshToken)
+ import Cloud.SelfHost.Oidc.Upstream (UpstreamError (..), VerifiedClaims (..))
+ import Cloud.SelfHost.Oidc.Upstream qualified as Upstream
+@@ -46,7 +47,6 @@
+ import Share.JWT qualified as ShareJWT
+ import Share.OAuth.Errors (OAuth2Error)
+ import Share.OAuth.PKCE qualified as PKCE
+-import Share.OAuth.Redis qualified as Redis
+ import Share.OAuth.Scopes (Scopes, UnisonScope (OpenId), containsScope)
+ import Share.OAuth.Session (LoginRequest (..), PendingSession (..), Session (..))
+ import Share.OAuth.Types (AuthenticationRequest (..), OAuthClientId (..), PKCEChallenge, PKCEChallengeMethod (..), PendingSessionId, ResponseType (..), UserId)
+@@ -170,14 +170,14 @@
+ loginEndpoint :: Maybe URIParam -> WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
+ loginEndpoint returnTo = beginUpstreamLogin LoginPage (unpackURI <$> returnTo)
+ 
+--- | Sends the browser to the upstream provider, remembering the login in Redis for the callback.
++-- | Sends the browser to the upstream provider, remembering the login for the callback.
+ beginUpstreamLogin :: LoginRequest -> Maybe URI -> WebApp (Headers '[Header "Set-Cookie" Cookies.SetCookie, Header "Location" String] NoContent)
+ beginUpstreamLogin loginRequest returnTo = do
+   config <- brokerConfig
+   endpoints <- liftIO (Upstream.resolveEndpoints config) >>= either (respondError . UpstreamFailed) pure
+   (verifier, challenge, _) <- PKCE.generatePkce
+   nonce <- newSecureToken
+-  PendingSession {pendingId} <- Redis.liftRedis $ Redis.newPendingSession loginRequest verifier returnTo (Just (Aeson.object ["nonce" .= nonce]))
++  PendingSession {pendingId} <- OAuthState.newPendingSession loginRequest verifier returnTo (Just (Aeson.object ["nonce" .= nonce]))
+   callback <- apiURL ["selfhost", "oidc", "callback"]
+   let target = Upstream.authorizationURI config endpoints callback (IDs.toText pendingId) nonce challenge
+   cookie <- pendingCookie (IDs.toText pendingId)
+@@ -210,8 +210,8 @@
+   pendingId <- maybe (respondError MissingPendingSession) pure cookiePendingId
+   when (state /= Just pendingId) $ respondError MismatchedState
+   PendingSession {loginRequest, pkceVerifier, returnToURI, additionalData} <-
+-    Redis.liftRedis (Redis.getPendingSession pendingId) >>= maybe (respondError MissingPendingSession) pure
+-  Redis.liftRedis (Redis.failPendingSession pendingId)
++    OAuthState.getPendingSession pendingId >>= maybe (respondError MissingPendingSession) pure
++  OAuthState.failPendingSession pendingId
+   nonce <- case additionalData of
+     Just (Aeson.Object o) | Just (Aeson.String n) <- KeyMap.lookup "nonce" o -> pure n
+     _ -> respondError MissingPendingSession
+@@ -262,7 +262,7 @@
+ codeRedirect userId authRequest@AuthenticationRequest {redirectURI = URIParam redirectURI, state} = do
+   iss <- enlilIssuer
+   aud <- enlilAud
+-  (_, code) <- Redis.liftRedis $ Redis.createOAuth2Code iss (Set.singleton aud) userId authRequest
++  (_, code) <- OAuthState.createOAuth2Code iss (Set.singleton aud) userId authRequest
+   pure (redirectURI & addQueryParam "state" state & addQueryParam "code" code)
+ 
+ authorizeEndpoint ::
+@@ -305,7 +305,7 @@
+   (userId, sessionId, scope) <- case request of
+     AuthorizationCodeGrant code redirectURI clientId verifier -> do
+       when (clientId /= ucmClientId) $ respondError InvalidClient
+-      try (Redis.liftRedis (Redis.exchangeOAuth2Code code clientId redirectURI verifier)) >>= \case
++      try (OAuthState.exchangeOAuth2Code code clientId redirectURI verifier) >>= \case
+         Left (_ :: OAuth2Error) -> respondError InvalidGrant
+         Right (sessionId, userId, AuthenticationRequest {scopes}) -> pure (userId, sessionId, scopes)
+     RefreshTokenGrant token ->
+--- a/src/Cloud/Web/Impl.hs
++++ b/src/Cloud/Web/Impl.hs
+@@ -53,9 +53,10 @@
+ import Data.Text qualified as Text
+ import Network.URI qualified as URI
+ import Servant
++import Share.OAuth.API (LogoutEndpoint)
+ import Share.OAuth.ServiceProvider (ServiceProviderConfig (..))
+-import Share.OAuth.ServiceProvider qualified as Auth
+ import Share.OAuth.Types hiding (AuthenticationRequest (..), OAuthClientConfig (..))
++import Share.Utils.Servant.Cookies qualified as Cookies
+ import Share.Utils.Show (tShow)
+ import UnliftIO (throwIO)
+ 
+@@ -65,7 +66,7 @@
+ 
+ server :: Env () -> ServerT Cloud.API WebApp
+ server Env {authEnv = AuthEnv {envSpConfig = ServiceProviderConfig {redirectAfterLogout, cookieSettings, sessionCookieKey}}} =
+-  Auth.logoutEndpoint redirectAfterLogout cookieSettings sessionCookieKey
++  logoutEndpoint redirectAfterLogout cookieSettings sessionCookieKey
+     :<|> ( accountEndpoints
+              :<|> servicesV1Endpoint
+              :<|> deploymentsV1Endpoint
+@@ -121,6 +122,14 @@
+ 
+     logs = logsByUserEndpoint :<|> logsByDeployementEndpoint :<|> logsByServiceEndpoint
+ 
++-- | share-auth's logout, which only clears cookies, but is typed to need Redis.
++logoutEndpoint :: URI.URI -> Cookies.CookieSettings -> Text -> ServerT LogoutEndpoint WebApp
++logoutEndpoint afterLogout cookieSettings sessionCookieKey =
++  pure
++    . addHeader (Cookies.clearCookie cookieSettings sessionCookieKey)
++    . addHeader (Cookies.clearCookie cookieSettings pendingSessionCookieKey)
++    $ addHeader (show afterLogout) NoContent
++
+ sbtbEndpoint :: UserId -> WebApp NoContent
+ sbtbEndpoint userId = do
+   PGO.addToFreeTier userId

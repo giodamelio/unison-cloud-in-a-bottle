@@ -33,7 +33,7 @@ in {
 
                 For a monitor, `GET /.well-known/openid-configuration` needs no login and
                 cloud-api answers it from memory, so a 200 means Caddy, the socket and
-                cloud-api are up. It doesn't touch Postgres or Redis.
+                cloud-api are up. It doesn't touch Postgres.
               '';
               apps = "Body of the apps domain's Caddy site block, balancing across the interactive nimbus nodes. Empty when nimbus is off.";
               ui = "Body of the UI domain's Caddy site block, serving `ui.package` as a single-page app.";

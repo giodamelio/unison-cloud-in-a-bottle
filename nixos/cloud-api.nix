@@ -108,7 +108,6 @@
 
   start = pkgs.writeShellScript "unison-cloud-api-start" ''
     creds=$CREDENTIALS_DIRECTORY
-    export CLOUD_REDIS="redis://:$(< "$creds/redis-password")@127.0.0.1:${toString cfg.internal.redisPort}"
     export AWS_ACCESS_KEY_ID=$(< "$creds/s3-access-key-id")
     export AWS_SECRET_ACCESS_KEY=$(< "$creds/s3-secret-access-key")
     export CLOUD_EDDSA_KEY=$(< "$creds/cloud-eddsa-key")
@@ -228,14 +227,12 @@ in {
         requires =
           [
             "unison-cloud-seed.service"
-            "redis-unison-cloud.service"
             "unison-cloud-consul.service"
           ]
           ++ lib.optional (s3.unit != null) s3.unit;
         after =
           [
             "unison-cloud-seed.service"
-            "redis-unison-cloud.service"
             "unison-cloud-consul.service"
           ]
           ++ lib.optional (s3.unit != null) s3.unit;
@@ -290,7 +287,6 @@ in {
           };
         serviceConfig = lib.mkMerge [
           (cfg.internal.loadSecrets [
-            "redis-password"
             "s3-access-key-id"
             "s3-secret-access-key"
             "cloud-eddsa-key"

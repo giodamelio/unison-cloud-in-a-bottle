@@ -16,7 +16,6 @@ in {
     ./caddy.nix
     ./postgresql.nix
     ./s3.nix
-    ./redis.nix
     ./consul.nix
     ./cloud-api.nix
     ./outbound-proxy.nix

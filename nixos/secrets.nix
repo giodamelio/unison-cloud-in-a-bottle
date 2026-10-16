@@ -13,7 +13,6 @@
     "cloud-hmac-key"
     "cluster-token"
     "internal-auth-token"
-    "redis-password"
     "s3-access-key-id"
     "s3-secret-access-key"
     "nimbus-db-password"
@@ -54,7 +53,6 @@
 
       ${gen "s3-access-key-id" "access_key_id"}
       ${gen "s3-secret-access-key" "openssl rand -hex 20"}
-      ${gen "redis-password" "openssl rand -hex 24"}
       ${lib.optionalString (!cfg.internal.postgres.external) (gen "nimbus-db-password" "openssl rand -hex 24")}
       # cloud-api reads its Ed25519 keys as the raw bytes of an environment variable and
       # needs exactly 32 of them, so they must be printable: 24 random bytes in base64.
@@ -85,7 +83,7 @@ in {
       Secrets to supply instead of generating, by name in `<stateDir>/secrets/`. Every
       start copies each file over the generated one; the rest are generated once and kept.
       Names: `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each), `cloud-hmac-key`,
-      `cluster-token`, `internal-auth-token`, `redis-password`, `s3-access-key-id`,
+      `cluster-token`, `internal-auth-token`, `s3-access-key-id`,
       `s3-secret-access-key`, `nimbus-db-password`, `dex-client-secret`,
       `dex-admin-password`.
       Paths are strings so the secrets never enter the Nix store.

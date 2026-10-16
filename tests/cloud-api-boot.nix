@@ -21,7 +21,7 @@ self: {
       };
     };
 
-    environment.systemPackages = [pkgs.awscli2 pkgs.redis pkgs.hurl config.services.unison-cloud.database.package];
+    environment.systemPackages = [pkgs.awscli2 pkgs.hurl config.services.unison-cloud.database.package];
 
     # nimbus only speaks virtual-host bucket addressing, so the S3 checks use it too.
     environment.etc."aws-config".text = ''
@@ -53,7 +53,6 @@ self: {
         )
 
     machine.wait_for_unit("unison-cloud-s3.service")
-    machine.wait_for_unit("redis-unison-cloud.service")
     machine.wait_for_unit("unison-cloud-consul.service")
     machine.wait_until_succeeds(ns("curl -s -o /dev/null http://127.0.0.1:7070/"), timeout=60)
 
@@ -78,10 +77,6 @@ self: {
             "env AWS_CONFIG_FILE=/etc/aws-config AWS_ACCESS_KEY_ID=AKIAWRONGWRONGWRONG0 AWS_SECRET_ACCESS_KEY=wrong"
             " aws --endpoint-url http://s3.unison-cloud.internal:7070 s3api list-buckets"
         ))
-
-    with subtest("Redis requires its password"):
-        assert "NOAUTH" in machine.succeed(ns("redis-cli -h 127.0.0.1 ping"))
-        assert machine.succeed(ns(f"redis-cli -h 127.0.0.1 -a $(cat {secrets}/redis-password) --no-auth-warning ping")).strip() == "PONG"
 
     with subtest("Consul has elected itself leader"):
         machine.wait_until_succeeds(ns("curl -sf http://127.0.0.1:8500/v1/status/leader | grep -q 127.0.0.1"))
@@ -153,6 +148,6 @@ self: {
         assert psql("SELECT count(*) FROM users WHERE handle = 'forged'") == "0"
 
     with subtest("nothing listens outside the namespace"):
-        machine.fail("ss -Hltn | grep -E ':(7070|6379|8500|18443|5424|5426) '")
+        machine.fail("ss -Hltn | grep -E ':(7070|8500|5432|5424|5426) '")
   '';
 }

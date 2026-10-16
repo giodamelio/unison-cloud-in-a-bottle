@@ -27,20 +27,14 @@
       };
       database.mode = "host";
       caddy.enable = false;
-      secrets.files = {
-        cluster-token = "/etc/unison-cloud-secrets/cluster-token";
-        redis-password = "/etc/unison-cloud-secrets/redis-password";
-      };
+      secrets.files.cluster-token = "/etc/unison-cloud-secrets/cluster-token";
     };
 
     # Stands in for agenix or sops-nix: plain files outside the store, root-only.
     systemd.tmpfiles.rules = [
       "d /etc/unison-cloud-secrets 0700 root root"
       "f+ /etc/unison-cloud-secrets/cluster-token 0600 root root - supplied-cluster-token"
-      "f+ /etc/unison-cloud-secrets/redis-password 0600 root root - supplied-redis-password"
     ];
-
-    environment.systemPackages = [pkgs.redis];
 
     virtualisation.memorySize = 3072;
   };
@@ -190,7 +184,6 @@
     with subtest("supplied secrets are used verbatim"):
         expected = machine.succeed("printf %s supplied-cluster-token | sha512sum").split()[0]
         assert psql("SELECT token_hash FROM cloud_cluster_tokens") == expected
-        assert machine.succeed(ns("redis-cli -h 127.0.0.1 -a supplied-redis-password --no-auth-warning ping")).strip() == "PONG"
 
     with subtest("without the bundled Caddy, nothing listens publicly and the sockets are the interface"):
         machine.fail("systemctl is-active caddy.service")
