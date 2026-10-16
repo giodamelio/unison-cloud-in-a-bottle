@@ -64,17 +64,6 @@ in {
       '';
     };
 
-    database.package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.postgresql_17;
-      defaultText = lib.literalExpression "pkgs.postgresql_17";
-      description = ''
-        PostgreSQL server for the bundled database. Pin it: a major-version change starts
-        an empty data directory, and moving data across needs a manual `pg_upgrade` or
-        dump and restore.
-      '';
-    };
-
     internal.uiPackage = lib.mkOption {
       type = lib.types.package;
       internal = true;

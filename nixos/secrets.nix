@@ -15,6 +15,7 @@
     "internal-auth-token"
     "s3-access-key-id"
     "s3-secret-access-key"
+    "cloud-api-db-password"
     "nimbus-db-password"
     "oidc-client-secret"
     "consul-token"
@@ -23,7 +24,8 @@
   # Secrets nothing here generates, so each needs a supplier: you, or a bundled service.
   requiredNames =
     ["s3-access-key-id" "s3-secret-access-key" "consul-token"]
-    ++ lib.optional cfg.cloudApi.enable "oidc-client-secret";
+    ++ lib.optionals cfg.cloudApi.enable ["cloud-api-db-password" "oidc-client-secret"]
+    ++ lib.optional cfg.nimbus.enable "nimbus-db-password";
   supplied = name: cfg.secrets.files ? ${name} || credentials ? ${name};
   unsupplied = lib.filter (name: !(supplied name || cfg.internal.secretGenerators ? ${name})) requiredNames;
 
@@ -79,8 +81,9 @@ in {
       start copies each file over the generated one; the rest are generated once and kept.
       The module generates `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each),
       `cloud-hmac-key`, `cluster-token` and `internal-auth-token`. You supply
-      `s3-access-key-id`, `s3-secret-access-key`, `oidc-client-secret`, `consul-token`
-      and, optionally, `sentry-dsn`, unless a bundled service generates them.
+      `cloud-api-db-password`, `nimbus-db-password`, `s3-access-key-id`,
+      `s3-secret-access-key`, `oidc-client-secret`, `consul-token` and, optionally,
+      `sentry-dsn`, unless a bundled service generates them.
       Paths are strings so the secrets never enter the Nix store.
     '';
   };

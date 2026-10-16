@@ -36,19 +36,20 @@
     socket = "/run/unison-cloud-postgresql"
     nimbus_nodes = json.loads(${builtins.toJSON (builtins.toJSON cfg.internal.nimbusNodes)})
     interactive = next(n for n in nimbus_nodes if n["type"] == "interactive")
-    pg_port = ${toString cfg.internal.postgresTcp.port}
+    pg_port = ${toString cfg.database.port}
 
-    def peer(user, database, query):
-        return f"sudo -u {user} psql -h {socket} -p {pg_port} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
+    def superuser(database, query):
+        return f"sudo -u unison-cloud-postgres psql -h {socket} -p {pg_port} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
 
-    def tcp(user, database, password, query, as_user="unison-cloud-nimbus"):
+    def tcp(user, database, password, query):
         return (
-            f"sudo -u {as_user} env PGPASSWORD={shlex.quote(password)} psql -h 127.0.0.1 -p {pg_port}"
+            f"env PGPASSWORD={shlex.quote(password)} psql -h 127.0.0.1 -p {pg_port}"
             f" -U {user} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         )
 
     machine.wait_for_unit(interactive["unit"], timeout=600)
     password = machine.succeed(f"cat {secrets}/nimbus-db-password").strip()
+    api_password = machine.succeed(f"cat {secrets}/cloud-api-db-password").strip()
 
     with subtest("nimbus's node config points its storage at its own role, database and table"):
         config = json.loads(machine.succeed(f"jq -c .dynamo /run/unison-cloud-nimbus-{interactive['name']}/config.json"))
@@ -56,7 +57,7 @@
             "type": "postgres",
             "host": "127.0.0.1",
             "port": pg_port,
-            "user": "unison-cloud-nimbus",
+            "user": "unison_cloud_nimbus",
             "database": "unison_cloud_nimbus",
             "table": "nimbus_kv",
             "password": password,
@@ -86,24 +87,20 @@
         assert results["counter"] == "40", results
 
     with subtest("the table belongs to nimbus's role and holds the probe's rows"):
-        owner = machine.succeed(peer("unison-cloud-postgres", "unison_cloud_nimbus", "SELECT tableowner FROM pg_tables WHERE tablename = 'nimbus_kv'")).strip()
-        assert owner == "unison-cloud-nimbus", owner
-        rows = int(machine.succeed(peer("unison-cloud-postgres", "unison_cloud_nimbus", "SELECT count(*) FROM nimbus_kv WHERE ns LIKE '%:probe'")).strip())
+        owner = machine.succeed(superuser("unison_cloud_nimbus", "SELECT tableowner FROM pg_tables WHERE tablename = 'nimbus_kv'")).strip()
+        assert owner == "unison_cloud_nimbus", owner
+        rows = int(machine.succeed(superuser("unison_cloud_nimbus", "SELECT count(*) FROM nimbus_kv WHERE ns LIKE '%:probe'")).strip())
         assert rows > 0, rows
-        attrs = machine.succeed(peer("unison-cloud-postgres", "postgres", "SELECT rolsuper OR rolcreaterole OR rolcreatedb FROM pg_roles WHERE rolname = 'unison-cloud-nimbus'")).strip()
+        attrs = machine.succeed(superuser("postgres", "SELECT bool_or(rolsuper OR rolcreaterole OR rolcreatedb) FROM pg_roles WHERE rolname IN ('unison_cloud', 'unison_cloud_nimbus')")).strip()
         assert attrs == "f", attrs
 
-    with subtest("cloud-api's and nimbus's roles can't read each other's tables"):
-        machine.fail(peer("unison-cloud-api", "unison_cloud_nimbus", "SELECT count(*) FROM nimbus_kv"))
-        machine.fail(peer("unison-cloud-nimbus", "unison_cloud", "SELECT count(*) FROM selfhost.environment_secrets"))
-        machine.succeed(peer("unison-cloud-api", "unison_cloud", "SELECT count(*) FROM selfhost.environment_secrets"))
-
-    with subtest("only nimbus's role logs in over TCP, only to its own database, and only with its password"):
-        machine.succeed(tcp("unison-cloud-nimbus", "unison_cloud_nimbus", password, "SELECT 1"))
-        machine.fail(tcp("unison-cloud-nimbus", "unison_cloud_nimbus", "wrong", "SELECT 1"))
-        machine.fail(tcp("unison-cloud-nimbus", "unison_cloud", password, "SELECT 1"))
-        machine.fail(tcp("unison-cloud-api", "unison_cloud", "", "SELECT 1", as_user="root"))
-        machine.fail(tcp("unison-cloud-postgres", "postgres", "", "SELECT 1", as_user="root"))
+    with subtest("each role logs in over TCP only to its own database, only with its password"):
+        machine.succeed(tcp("unison_cloud_nimbus", "unison_cloud_nimbus", password, "SELECT count(*) FROM nimbus_kv"))
+        machine.succeed(tcp("unison_cloud", "unison_cloud", api_password, "SELECT count(*) FROM selfhost.environment_secrets"))
+        machine.fail(tcp("unison_cloud_nimbus", "unison_cloud_nimbus", "wrong", "SELECT 1"))
+        machine.fail(tcp("unison_cloud_nimbus", "unison_cloud", password, "SELECT 1"))
+        machine.fail(tcp("unison_cloud", "unison_cloud_nimbus", api_password, "SELECT 1"))
+        machine.fail(tcp("unison-cloud-postgres", "postgres", "", "SELECT 1"))
 
     with subtest("PostgreSQL listens on loopback only"):
         listeners = machine.succeed(f"ss -Hltn | awk '{{print $4}}' | grep ':{pg_port}$'").split()

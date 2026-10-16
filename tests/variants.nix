@@ -4,14 +4,27 @@
 }: {
   name = "unison-cloud-variants";
 
-  # One combination of levers: the host's Postgres, secrets supplied as files, and no
-  # bundled Caddy, so the upstream ports are the whole interface.
+  # One combination of levers: the host's Postgres over loopback TCP, secrets supplied as
+  # files, and no bundled Caddy, so the upstream ports are the whole interface.
   nodes.machine = {pkgs, ...}: {
     imports = [self.nixosModules.default];
 
     services.postgresql = {
       enable = true;
       package = pkgs.postgresql_17;
+      initialScript = pkgs.writeText "init.sql" ''
+        CREATE ROLE unison_cloud LOGIN PASSWORD 'host-cloud-api-password';
+        CREATE DATABASE unison_cloud OWNER unison_cloud;
+        \c unison_cloud
+        CREATE EXTENSION "uuid-ossp";
+        CREATE EXTENSION citext;
+        CREATE EXTENSION moddatetime;
+      '';
+    };
+    # The role exists only once the initial script has run.
+    systemd.services.unison-cloud-database = {
+      requires = ["postgresql-setup.service"];
+      after = ["postgresql-setup.service"];
     };
 
     services.unison-cloud = {
@@ -23,21 +36,28 @@
         apps = "apps.test";
         ui = "ui.test";
       };
-      database.mode = "host";
+      database = {
+        bundled = false;
+        host = "127.0.0.1";
+      };
       caddy.enable = false;
-      secrets.files.cluster-token = "/etc/unison-cloud-secrets/cluster-token";
+      secrets.files = {
+        cluster-token = "/etc/unison-cloud-secrets/cluster-token";
+        cloud-api-db-password = "/etc/unison-cloud-secrets/cloud-api-db";
+      };
     };
 
     # Stands in for agenix or sops-nix: plain files outside the store, root-only.
     systemd.tmpfiles.rules = [
       "d /etc/unison-cloud-secrets 0700 root root"
       "f+ /etc/unison-cloud-secrets/cluster-token 0600 root root - supplied-cluster-token"
+      "f+ /etc/unison-cloud-secrets/cloud-api-db 0600 root root - host-cloud-api-password"
     ];
 
     virtualisation.memorySize = 3072;
   };
 
-  # A Postgres prepared the way `database.external` asks, and an S3 store with
+  # A Postgres prepared the way `database` asks, and an S3 store with
   # virtual-host addressing, as `s3.external` needs.
   nodes.db = {
     lib,
@@ -121,14 +141,12 @@
       secrets.files = {
         s3-access-key-id = "/etc/unison-cloud-secrets/s3-access-key-id";
         s3-secret-access-key = "/etc/unison-cloud-secrets/s3-secret-access-key";
+        cloud-api-db-password = "/etc/unison-cloud-secrets/cloud-api-db";
+        nimbus-db-password = "/etc/unison-cloud-secrets/nimbus-db";
       };
       database = {
-        mode = "external";
-        external = {
-          host = nodes.db.networking.primaryIPAddress;
-          cloudApi.passwordFile = "/etc/unison-cloud-secrets/cloud-api-db";
-          nimbus.passwordFile = "/etc/unison-cloud-secrets/nimbus-db";
-        };
+        bundled = false;
+        host = dbAddress;
       };
     };
 
@@ -158,7 +176,7 @@
 
     def psql(query):
         return machine.succeed(
-            f"sudo -u unison-cloud-api psql -h /run/postgresql -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
+            f"sudo -u postgres psql -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         ).strip()
 
     upstream = "-H 'Host: cloud.test' http://${upstreams.api}"
@@ -166,7 +184,7 @@
     machine.wait_for_unit("unison-cloud-api.service")
     machine.wait_until_succeeds(f"curl -s -o /dev/null -w '%{{http_code}}' {upstream}/v2/account | grep -q 401", timeout=120)
 
-    with subtest("the module's databases live in the host's Postgres"):
+    with subtest("the module's database lives in the host's Postgres, reached over loopback TCP"):
         assert machine.succeed("sudo -u postgres psql -XtA -c \"SELECT string_agg(datname, ',') FROM pg_database WHERE datname LIKE 'unison_cloud%'\"").strip() == "unison_cloud"
         assert int(psql("SELECT count(*) FROM selfhost.applied_migrations")) > 0
         machine.fail("systemctl is-active unison-cloud-postgresql.service")

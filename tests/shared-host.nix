@@ -27,6 +27,10 @@
   s3KeyId = "GK0123456789abcdef01234567";
   s3Secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   oidcClientSecret = "host-dex-client-secret";
+  dbPasswords = {
+    cloudApi = "host-cloud-api-db-password";
+    nimbus = "host-nimbus-db-password";
+  };
   # bcrypt of "demo", as in the demo VM.
   passwordHash = "$2b$10$/Lfz.yT3xdZwUBTJwkK29ObMuNl5lrS2rHlKJkJk054huJV4Vb9gm";
 in {
@@ -122,10 +126,13 @@ in {
         oidc-client-secret = "unison-cloud-oidc-client-secret";
         s3-access-key-id = "unison-cloud-s3-access-key-id";
         s3-secret-access-key = "unison-cloud-s3-secret-access-key";
+        cloud-api-db-password = "unison-cloud-cloud-api-db-password";
+        nimbus-db-password = "unison-cloud-nimbus-db-password";
       };
 
       database = {
-        mode = "host";
+        bundled = false;
+        host = "127.0.0.1";
         package = config.services.postgresql.package;
       };
     };
@@ -230,21 +237,40 @@ in {
         encrypt oidc-client-secret unison-cloud-oidc-client-secret ${oidcClientSecret}
         encrypt s3-access-key-id unison-cloud-s3-access-key-id ${s3KeyId}
         encrypt s3-secret-access-key unison-cloud-s3-secret-access-key ${s3Secret}
+        encrypt cloud-api-db-password unison-cloud-cloud-api-db-password ${dbPasswords.cloudApi}
+        encrypt nimbus-db-password unison-cloud-nimbus-db-password ${dbPasswords.nimbus}
       '';
     };
 
-    # The host's PostgreSQL already serves another application.
+    # The host's PostgreSQL already serves another application. Its roles and databases
+    # for the module are prepared by hand, as the module expects.
     services.postgresql = {
       enable = true;
       package = pkgs.postgresql_18;
-      initialScript = pkgs.writeText "unrelated.sql" ''
+      initialScript = pkgs.writeText "init.sql" ''
         CREATE ROLE unrelated LOGIN;
         CREATE DATABASE unrelated OWNER unrelated;
         \c unrelated
         CREATE TABLE notes (body text);
         INSERT INTO notes VALUES ('untouched');
         ALTER TABLE notes OWNER TO unrelated;
+
+        CREATE ROLE unison_cloud LOGIN PASSWORD '${dbPasswords.cloudApi}';
+        CREATE DATABASE unison_cloud OWNER unison_cloud;
+        REVOKE ALL ON DATABASE unison_cloud FROM PUBLIC;
+        \c unison_cloud
+        CREATE EXTENSION "uuid-ossp";
+        CREATE EXTENSION citext;
+        CREATE EXTENSION moddatetime;
+        CREATE ROLE unison_cloud_nimbus LOGIN PASSWORD '${dbPasswords.nimbus}';
+        CREATE DATABASE unison_cloud_nimbus OWNER unison_cloud_nimbus;
+        REVOKE ALL ON DATABASE unison_cloud_nimbus FROM PUBLIC;
       '';
+    };
+    # The roles exist only once the initial script has run.
+    systemd.services.unison-cloud-database = {
+      requires = ["postgresql-setup.service"];
+      after = ["postgresql-setup.service"];
     };
 
     # An unrelated host service with a socket any user may connect to and a file any user
@@ -380,39 +406,31 @@ in {
     with subtest("cloud-api can't reach the host's other sockets"):
         machine.fail(in_sandbox("unison-cloud-api.service", "${bin.socat} - UNIX-CONNECT:/run/unrelated/sock"))
         machine.fail(in_sandbox("unison-cloud-api.service", "${bin.cat} /var/lib/unrelated/data"))
-        machine.succeed(in_sandbox("unison-cloud-api.service", "${bin.test} -S /run/postgresql/.s.PGSQL.5432"))
+        machine.fail(in_sandbox("unison-cloud-api.service", "${bin.test} -e /run/postgresql/.s.PGSQL.5432"))
 
-    with subtest("the host's PostgreSQL 18 serves the module beside an unrelated database"):
+    with subtest("the host's PostgreSQL 18 serves the module beside an unrelated database, which the module never touches"):
         assert psql("unrelated", "SELECT body FROM notes") == "untouched"
         assert psql("postgres", "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'unrelated'") == "unrelated"
-        assert psql("postgres", "SELECT rolsuper OR rolcreaterole OR rolcreatedb FROM pg_roles WHERE rolname = 'unrelated'") == "f"
-        roles = psql("postgres", "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname LIKE 'unison-cloud-%' ORDER BY rolname")
-        assert roles == "unison-cloud-api|f|f|f\nunison-cloud-nimbus|f|f|f", roles
-        dbs = psql("postgres", "SELECT datname FROM pg_database WHERE datname LIKE 'unison_cloud%' ORDER BY datname")
-        assert dbs == "unison_cloud\nunison_cloud_nimbus", dbs
+        roles = psql("postgres", "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname LIKE 'unison%' ORDER BY rolname")
+        assert roles == "unison_cloud|f|f|f\nunison_cloud_nimbus|f|f|f", roles
         owner = psql("unison_cloud_nimbus", "SELECT tableowner FROM pg_tables WHERE tablename = 'nimbus_kv'")
-        assert owner == "unison-cloud-nimbus", owner
-        extensions = psql("unison_cloud", "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname")
-        assert extensions == "citext\nmoddatetime\nuuid-ossp", extensions
+        assert owner == "unison_cloud_nimbus", owner
         assert machine.succeed("grep -c unison \"$(sudo -u postgres psql -XtA -c 'SHOW hba_file')\" || true").strip() == "0"
 
-    with subtest("nimbus reaches the host's PostgreSQL over TCP, as its own role"):
+    with subtest("each role reaches only its own database, over TCP with its password"):
         machine.fail(in_sandbox(interactive, "${bin.psql} -h /run/postgresql -d postgres -c 'SELECT 1'"))
-        machine.fail(in_sandbox(interactive, "${bin.psql} -h 127.0.0.1 -d unison_cloud_nimbus -U unison-cloud-nimbus -w -c 'SELECT 1'"))
-        password = machine.succeed(f"cat {secrets}/nimbus-db-password").strip()
-        connect = f"${bin.env} PGPASSWORD={password} ${bin.psql} -h 127.0.0.1 -U unison-cloud-nimbus -XtA -v ON_ERROR_STOP=1"
+        machine.fail(in_sandbox(interactive, "${bin.psql} -h 127.0.0.1 -d unison_cloud_nimbus -U unison_cloud_nimbus -w -c 'SELECT 1'"))
+        connect = "${bin.env} PGPASSWORD=${dbPasswords.nimbus} ${bin.psql} -h 127.0.0.1 -U unison_cloud_nimbus -XtA -v ON_ERROR_STOP=1"
         machine.succeed(in_sandbox(interactive, f"{connect} -d unison_cloud_nimbus -c 'SELECT count(*) FROM nimbus_kv'"))
         machine.fail(in_sandbox(interactive, f"{connect} -d unison_cloud -c 'SELECT count(*) FROM selfhost.environment_secrets'"))
-
-    with subtest("cloud-api's role can't read nimbus's table"):
-        machine.fail("sudo -u unison-cloud-api psql -h /run/postgresql -d unison_cloud_nimbus -XtA -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM nimbus_kv'")
+        machine.fail("PGPASSWORD=${dbPasswords.cloudApi} psql -h 127.0.0.1 -U unison_cloud -d unison_cloud_nimbus -XtA -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM nimbus_kv'")
 
     with subtest("with the bundled Dex off, none of it runs or exists"):
         machine.fail("systemctl cat unison-cloud-dex.service")
         machine.fail(f"test -e {secrets}/dex-admin-password")
 
     with subtest("credential-supplied secrets are never written in plaintext"):
-        for name in ["s3-access-key-id", "s3-secret-access-key", "oidc-client-secret"]:
+        for name in ["s3-access-key-id", "s3-secret-access-key", "oidc-client-secret", "cloud-api-db-password", "nimbus-db-password"]:
             machine.fail(f"test -e {secrets}/{name}")
         machine.fail("grep -rqs ${s3Secret} /var/lib/unison-cloud /etc/credstore.encrypted")
   '';

@@ -5,229 +5,126 @@
   ...
 }: let
   cfg = config.services.unison-cloud;
-  bundled = cfg.database.mode == "bundled";
-  external = cfg.database.mode == "external";
-  ext = cfg.database.external;
-  pg =
-    if bundled
-    then cfg.database.package
-    else config.services.postgresql.package;
+  db = cfg.database;
+  pg = db.package;
   user = "unison-cloud-postgres";
-  # The role that owns the server: our own user for the bundled one, `postgres` on the host.
-  superuser =
-    if bundled
-    then user
-    else "postgres";
+  socketDir = "/run/unison-cloud-postgresql";
   dataDir = "${cfg.stateDir}/postgresql/${lib.versions.major pg.version}";
 
-  roleSql = name: role:
-    ''
-      SELECT format('CREATE ROLE %I', '${name}') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${name}') \gexec
-      ALTER ROLE "${name}" LOGIN NOSUPERUSER NOCREATEROLE NOREPLICATION NOBYPASSRLS ${lib.optionalString (!role.createdb) "NO"}CREATEDB;
-    ''
-    + lib.optionalString (role.passwordCredential != null) ''
-      \set password `${pkgs.coreutils}/bin/cat "$CREDENTIALS_DIRECTORY/${role.passwordCredential}"`
-      ALTER ROLE "${name}" PASSWORD :'password';
-    '';
-  passwordCredentials = lib.filter (name: name != null) (lib.mapAttrsToList (_: role: role.passwordCredential) cfg.internal.postgresRoles);
-
-  # Peer authentication over the socket for every service, and a password over TCP only
-  # for the roles that can't use a socket, each into its own database.
-  hbaFile = pkgs.writeText "unison-cloud-pg_hba.conf" (
-    ''
-      local all all peer
-    ''
-    + lib.concatStrings (lib.mapAttrsToList (name: db:
-      lib.optionalString (cfg.internal.postgresRoles.${db.owner}.passwordCredential or null != null) ''
-        host "${name}" "${db.owner}" 127.0.0.1/32 scram-sha-256
-      '')
-    cfg.internal.postgresDatabases)
-  );
-  databaseSql = name: db: ''
-    SELECT format('CREATE DATABASE %I OWNER %I', '${name}', '${db.owner}') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${name}') \gexec
-    \c "${name}"
-    ${lib.concatMapStrings (ext: "CREATE EXTENSION IF NOT EXISTS \"${ext}\";\n") db.extensions}
-  '';
-  setupSql = pkgs.writeText "unison-cloud-postgresql-setup.sql" (
-    lib.concatStrings (lib.mapAttrsToList roleSql cfg.internal.postgresRoles)
-    + lib.concatStrings (lib.mapAttrsToList databaseSql cfg.internal.postgresDatabases)
-  );
-in {
-  options.services.unison-cloud.database = {
-    mode = lib.mkOption {
-      type = lib.types.enum ["bundled" "host" "external"];
-      default = "bundled";
-      description = ''
-        Where the databases live. `bundled` runs the module's own Postgres. Services
-        connect over its socket, except nimbus, which can't open a unix socket and logs in
-        with a password on loopback. `host` uses the host's `services.postgresql`: the
-        module creates its roles, databases and extensions there, and every service
-        connects over `/run/postgresql` with peer authentication, except nimbus, which
-        logs in with a password on `127.0.0.1`. `external` connects over TCP with
-        passwords to a server you prepare yourself (see `database.external`).
-
-        In `host` mode the module never edits `pg_hba.conf`. It relies on NixOS's defaults,
-        `local all all peer` and `host all all 127.0.0.1/32 md5`, or any rules that let each
-        `unison-cloud-*` system user log in as the role of the same name, and
-        `unison-cloud-nimbus` log in with its password from `127.0.0.1`. Its roles are
-        `NOSUPERUSER`, `NOCREATEROLE` and `NOCREATEDB`.
-      '';
+  # Each role logs in with its password over loopback TCP, into its own database only.
+  roles = {
+    ${db.cloudApi.user} = "cloud-api-db-password";
+    ${db.nimbus.user} = "nimbus-db-password";
+  };
+  databases = {
+    # Untrusted extensions a database owner can't create; the migrations skip them once they exist.
+    ${db.cloudApi.database} = {
+      owner = db.cloudApi.user;
+      extensions = ["uuid-ossp" "citext" "moddatetime"];
     };
-
-    external = {
-      host = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Address of the external Postgres server.";
-      };
-
-      port = lib.mkOption {
-        type = lib.types.port;
-        default = 5432;
-      };
-
-      cloudApi = {
-        user = lib.mkOption {
-          type = lib.types.str;
-          default = "unison_cloud";
-          description = ''
-            Role cloud-api connects as. It must own `cloudApi.database`, and the
-            `uuid-ossp`, `citext` and `moddatetime` extensions must already exist in that
-            database, because creating `moddatetime` needs a superuser.
-          '';
-        };
-
-        database = lib.mkOption {
-          type = lib.types.str;
-          default = "unison_cloud";
-        };
-
-        passwordFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-        };
-      };
-
-      nimbus = {
-        user = lib.mkOption {
-          type = lib.types.str;
-          default = "unison_cloud_nimbus";
-          description = ''
-            Role nimbus connects as. It must own `nimbus.database`, or at least be able to
-            create a table in its `public` schema, because the module creates nimbus's
-            storage table as this role. Don't let cloud-api's role read that database, or
-            this role read cloud-api's: nimbus runs hosted code.
-          '';
-        };
-
-        database = lib.mkOption {
-          type = lib.types.str;
-          default = "unison_cloud_nimbus";
-        };
-
-        passwordFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-        };
-      };
+    ${db.nimbus.database} = {
+      owner = db.nimbus.user;
+      extensions = [];
     };
   };
 
-  options.services.unison-cloud.internal = {
-    postgres = lib.mkOption {
-      type = lib.types.attrs;
-      internal = true;
-      readOnly = true;
-      default = {
-        inherit external;
-        host =
-          if external
-          then ext.host
-          else cfg.internal.postgresSocketDir;
-        # A socket's name carries the server's port too.
-        port = toString cfg.internal.postgresTcp.port;
-      };
-      description = "Where every service connects: a socket directory, or the external server.";
-    };
-
-    postgresTcp = lib.mkOption {
-      type = lib.types.attrs;
-      internal = true;
-      readOnly = true;
-      default =
-        if external
-        then {inherit (ext) host port;}
-        else {
-          host = "127.0.0.1";
-          port =
-            if bundled
-            then 24150
-            else config.services.postgresql.settings.port;
-        };
+  # Peer authentication over the socket for the server's own user only, which runs setup.
+  hbaFile = pkgs.writeText "unison-cloud-pg_hba.conf" (
+    ''
+      local all ${user} peer
+    ''
+    + lib.concatStrings (lib.mapAttrsToList (name: database: ''
+        host "${name}" "${database.owner}" 127.0.0.1/32 scram-sha-256
+      '')
+      databases)
+  );
+  roleSql = name: credential: ''
+    SELECT format('CREATE ROLE %I', '${name}') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${name}') \gexec
+    ALTER ROLE "${name}" LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS;
+    \set password `${pkgs.coreutils}/bin/cat "$CREDENTIALS_DIRECTORY/${credential}"`
+    ALTER ROLE "${name}" PASSWORD :'password';
+  '';
+  databaseSql = name: database: ''
+    SELECT format('CREATE DATABASE %I OWNER %I', '${name}', '${database.owner}') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${name}') \gexec
+    REVOKE ALL ON DATABASE "${name}" FROM PUBLIC;
+    \c "${name}"
+    ${lib.concatMapStrings (ext: "CREATE EXTENSION IF NOT EXISTS \"${ext}\";\n") database.extensions}
+  '';
+  setupSql = pkgs.writeText "unison-cloud-postgresql-setup.sql" (
+    lib.concatStrings (lib.mapAttrsToList roleSql roles)
+    + lib.concatStrings (lib.mapAttrsToList databaseSql databases)
+  );
+in {
+  options.services.unison-cloud.database = {
+    host = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "127.0.0.1";
       description = ''
-        Where a service that can't use a socket connects over TCP: the external server, or
-        the bundled or host server on loopback.
+        Address of the PostgreSQL server. cloud-api and nimbus connect over TCP, each as
+        its own role with a password, supplied as `cloud-api-db-password` and
+        `nimbus-db-password` in `secrets.files` or `secrets.credentials`.
       '';
     };
 
-    postgresSocketDir = lib.mkOption {
-      type = lib.types.str;
-      internal = true;
-      readOnly = true;
-      default =
-        if bundled
-        then "/run/unison-cloud-postgresql"
-        else "/run/postgresql";
-      description = "Directory holding the Postgres Unix socket every service connects through.";
+    port = lib.mkOption {
+      type = lib.types.port;
+      default = 5432;
     };
 
-    postgresUnit = lib.mkOption {
-      type = lib.types.str;
-      internal = true;
-      readOnly = true;
-      default =
-        if bundled
-        then "unison-cloud-postgresql.service"
-        else "postgresql.service";
-      description = "The unit running the Postgres server.";
+    cloudApi = {
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "unison_cloud";
+        description = ''
+          Role cloud-api connects as. It must own `cloudApi.database`, and the
+          `uuid-ossp`, `citext` and `moddatetime` extensions must already exist in that
+          database, because creating `moddatetime` needs a superuser.
+        '';
+      };
+
+      database = lib.mkOption {
+        type = lib.types.str;
+        default = "unison_cloud";
+      };
     };
 
-    postgresRoles = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule {
-        options = {
-          createdb = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-          };
-          passwordCredential = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Secret to set as the role's password on every start, which also lets it log in
-              to the databases it owns over TCP on the bundled server's loopback.
-            '';
-          };
-        };
-      });
-      internal = true;
-      default = {};
-      description = "Login roles to create, named after the system user that connects with peer authentication.";
+    nimbus = {
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "unison_cloud_nimbus";
+        description = ''
+          Role nimbus connects as. It must own `nimbus.database`, or at least be able to
+          create a table in its `public` schema, because the module creates nimbus's
+          storage table as this role. Don't let cloud-api's role read that database, or
+          this role read cloud-api's: nimbus runs hosted code.
+        '';
+      };
+
+      database = lib.mkOption {
+        type = lib.types.str;
+        default = "unison_cloud_nimbus";
+      };
     };
 
-    postgresDatabases = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule {
-        options = {
-          owner = lib.mkOption {type = lib.types.str;};
-          extensions = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [];
-            description = "Extensions to create as superuser, for migrations that can't create untrusted ones as the owner.";
-          };
-        };
-      });
-      internal = true;
-      default = {};
-      description = "Databases to create, each owned by one of the roles above.";
+    bundled = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run a PostgreSQL server on loopback, with both roles and their databases, and
+        generate their passwords.
+      '';
+    };
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.postgresql_17;
+      defaultText = lib.literalExpression "pkgs.postgresql_17";
+      description = ''
+        PostgreSQL for the bundled server and the clients. Pin it: a major-version change
+        starts an empty data directory, and moving data across needs a manual
+        `pg_upgrade` or dump and restore.
+      '';
     };
   };
 
@@ -235,50 +132,36 @@ in {
     {
       assertions = [
         {
-          assertion = cfg.database.mode != "host" || config.services.postgresql.enable;
-          message = "services.unison-cloud: database.mode = \"host\" needs services.postgresql.enable = true.";
-        }
-        {
-          assertion = !external || (ext.host != null && ext.cloudApi.passwordFile != null && ext.nimbus.passwordFile != null);
-          message = "services.unison-cloud: database.mode = \"external\" needs database.external.host and both passwordFile options.";
+          assertion = db.host != null;
+          message = "services.unison-cloud: set database.host to the PostgreSQL server's address.";
         }
       ];
 
-      services.unison-cloud.internal.secretGenerators.nimbus-db-password = lib.mkIf (!external) "openssl rand -hex 24";
-
-      systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [
+      systemd.services.unison-cloud-database = lib.mkMerge [
         cfg.internal.sandbox
-        (lib.mkIf external {
-          description = "Wait for the external Postgres server";
+        {
+          description = "Wait for the Unison Cloud PostgreSQL server";
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
             DynamicUser = true;
-            ExecStart = pkgs.writeShellScript "unison-cloud-postgresql-wait" ''
-              until ${cfg.database.package}/bin/pg_isready -h ${ext.host} -p ${toString ext.port}; do sleep 1; done
+            ExecStart = pkgs.writeShellScript "unison-cloud-database-wait" ''
+              until ${pg}/bin/pg_isready -h ${lib.escapeShellArg db.host} -p ${toString db.port}; do sleep 1; done
             '';
             TimeoutStartSec = 300;
           };
-        })
-        (lib.mkIf (!external) {
-          description = "Create Unison Cloud database roles, databases and extensions";
-          requires = [cfg.internal.postgresUnit "unison-cloud-secrets.service"];
-          after = [cfg.internal.postgresUnit "unison-cloud-secrets.service"];
-          serviceConfig = lib.mkMerge [
-            (cfg.internal.loadSecrets passwordCredentials)
-            {
-              Type = "oneshot";
-              RemainAfterExit = true;
-              User = superuser;
-              Group = superuser;
-              ExecStart = "${pg}/bin/psql -h ${cfg.internal.postgresSocketDir} -p ${toString cfg.internal.postgresTcp.port} -d postgres -X -v ON_ERROR_STOP=1 -f ${setupSql}";
-            }
-          ];
-        })
+        }
       ];
     }
 
-    (lib.mkIf bundled {
+    (lib.mkIf db.bundled {
+      services.unison-cloud.database = {
+        host = lib.mkDefault "127.0.0.1";
+        port = lib.mkDefault 24150;
+      };
+
+      services.unison-cloud.internal.secretGenerators = lib.genAttrs (lib.attrValues roles) (_: "openssl rand -hex 24");
+
       users.users.${user} = {
         isSystemUser = true;
         group = user;
@@ -299,7 +182,7 @@ in {
             Type = "notify";
             User = user;
             Group = user;
-            RuntimeDirectory = baseNameOf cfg.internal.postgresSocketDir;
+            RuntimeDirectory = baseNameOf socketDir;
             RuntimeDirectoryMode = "0755";
             ExecStartPre = pkgs.writeShellScript "unison-cloud-postgresql-init" ''
               if [ ! -e ${dataDir}/PG_VERSION ]; then
@@ -308,9 +191,8 @@ in {
                   --encoding=UTF8 --locale=C --no-instructions
               fi
             '';
-            # The TCP listener is on loopback, and only roles with a password may log in
-            # over it. The module's own hba file replaces initdb's on every start.
-            ExecStart = "${pg}/bin/postgres -D ${dataDir} -c listen_addresses=${cfg.internal.postgresTcp.host} -c port=${toString cfg.internal.postgresTcp.port} -c unix_socket_directories=${cfg.internal.postgresSocketDir} -c hba_file=${hbaFile}";
+            # The module's own hba file replaces initdb's on every start.
+            ExecStart = "${pg}/bin/postgres -D ${dataDir} -c listen_addresses=127.0.0.1 -c port=${toString db.port} -c unix_socket_directories=${socketDir} -c hba_file=${hbaFile}";
             ExecReload = "${lib.getExe' pkgs.coreutils "kill"} -HUP $MAINPID";
             KillMode = "mixed";
             KillSignal = "SIGINT";
@@ -318,6 +200,31 @@ in {
           };
         }
       ];
+
+      systemd.services.unison-cloud-postgresql-setup = lib.mkMerge [
+        cfg.internal.sandbox
+        {
+          description = "Create Unison Cloud database roles, databases and extensions";
+          requires = ["unison-cloud-postgresql.service" "unison-cloud-secrets.service"];
+          after = ["unison-cloud-postgresql.service" "unison-cloud-secrets.service"];
+          serviceConfig = lib.mkMerge [
+            (cfg.internal.loadSecrets (lib.attrValues roles))
+            {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              User = user;
+              Group = user;
+              PrivateNetwork = true;
+              ExecStart = "${pg}/bin/psql -h ${socketDir} -p ${toString db.port} -d postgres -X -v ON_ERROR_STOP=1 -f ${setupSql}";
+            }
+          ];
+        }
+      ];
+
+      systemd.services.unison-cloud-database = {
+        requires = ["unison-cloud-postgresql-setup.service"];
+        after = ["unison-cloud-postgresql-setup.service"];
+      };
     })
   ]);
 }

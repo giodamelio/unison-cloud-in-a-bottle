@@ -56,9 +56,9 @@
     daemon_unit = next(n["unit"] for n in nodes if n["type"] == "public-daemon")
     interactive_units = [n["unit"] for n in nodes if n["type"] == "interactive"]
 
-    def psql(user, database, query):
+    def psql(database, query):
         return machine.succeed(
-            f"sudo -u {user} psql -h /run/unison-cloud-postgresql -p ${cfg.internal.postgres.port} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
+            f"sudo -u unison-cloud-postgres psql -h /run/unison-cloud-postgresql -p ${toString cfg.database.port} -d {database} -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         ).strip()
 
     def hurl(file, **variables):
@@ -114,19 +114,19 @@
 
     with subtest("transactional storage goes through nimbus's PostgreSQL table"):
         deploy("storage")
-        rows = psql("unison-cloud-postgres", "unison_cloud_nimbus", "SELECT count(*) FROM nimbus_kv WHERE ns LIKE '%:deploy-program'")
+        rows = psql("unison_cloud_nimbus", "SELECT count(*) FROM nimbus_kv WHERE ns LIKE '%:deploy-program'")
         assert int(rows) >= 1, rows
 
     with subtest("environment variables go through cloud-api's secrets listener"):
         env_set = deploy("env-set")
         hurl("${./hurl/service.hurl}", url=env_set["url"], expected="hello from the environment")
-        stored = psql("unison-cloud-api", "unison_cloud", f"SELECT data->>'DEPLOY_PROGRAM_GREETING' FROM selfhost.environment_secrets WHERE environment_id = '{env_set['env']}'")
+        stored = psql("unison_cloud", f"SELECT data->>'DEPLOY_PROGRAM_GREETING' FROM selfhost.environment_secrets WHERE environment_id = '{env_set['env']}'")
         assert stored == "hello from the environment", stored
 
     with subtest("deleting the environment deletes its secrets"):
         env_delete = deploy("env-delete")
         assert env_delete["env"] == env_set["env"], (env_delete, env_set)
-        assert psql("unison-cloud-api", "unison_cloud", f"SELECT count(*) FROM selfhost.environment_secrets WHERE environment_id = '{env_set['env']}'") == "0"
+        assert psql("unison_cloud", f"SELECT count(*) FROM selfhost.environment_secrets WHERE environment_id = '{env_set['env']}'") == "0"
 
     with subtest("a daemon runs on the public-daemon node"):
         deploy("daemon")

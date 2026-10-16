@@ -96,7 +96,7 @@ self: {
 
     def psql(query):
         return machine.succeed(
-            "sudo -u unison-cloud-api psql -h /run/unison-cloud-postgresql -p ${cfg.internal.postgres.port}"
+            "sudo -u unison-cloud-postgres psql -h /run/unison-cloud-postgresql -p ${toString cfg.database.port}"
             f" -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         ).strip()
 

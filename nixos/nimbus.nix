@@ -8,26 +8,12 @@
   user = "unison-cloud-nimbus";
   curl = lib.getExe pkgs.curl;
 
-  pg = cfg.internal.postgres;
-  ext = cfg.database.external.nimbus;
-  # nimbus's sandbox forbids unix sockets, so it logs in over TCP with a password even
-  # where every other service uses peer authentication.
   db = {
-    inherit (cfg.internal.postgresTcp) host port;
-    user =
-      if pg.external
-      then ext.user
-      else user;
-    database =
-      if pg.external
-      then ext.database
-      else "unison_cloud_nimbus";
+    inherit (cfg.database) host port;
+    inherit (cfg.database.nimbus) user database;
     table = "nimbus_kv";
   };
-  dbPassword =
-    if pg.external
-    then {LoadCredential = ["nimbus-db-password:${ext.passwordFile}"];}
-    else cfg.internal.loadSecrets ["nimbus-db-password"];
+  dbPassword = cfg.internal.loadSecrets ["nimbus-db-password"];
 
   createTable = pkgs.writeText "unison-cloud-nimbus-storage.sql" ''
     CREATE TABLE IF NOT EXISTS ${db.table} (
@@ -316,9 +302,6 @@ in {
     };
     users.groups.${user} = {};
 
-    services.unison-cloud.internal.postgresRoles.${user}.passwordCredential = "nimbus-db-password";
-    services.unison-cloud.internal.postgresDatabases.${db.database}.owner = user;
-
     # cloud-api registers the nodes itself (`<prefix>-nimbus-http`) when they join; this
     # is only for its TCP client path, which looks nodes up as `<prefix>-nimbus-client`.
     services.unison-cloud.internal.consulServices =
@@ -339,13 +322,13 @@ in {
     systemd.services =
       {
         # Creates the table as nimbus's own role, over the same path nimbus uses, so the
-        # role owns it in every database mode and a broken path fails here, not in a node.
+        # role owns it and a broken path fails here, not in a node.
         unison-cloud-nimbus-storage = lib.mkMerge [
           cfg.internal.sandbox
           {
             description = "Create the Unison Cloud nimbus storage table";
-            requires = ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"];
-            after = ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"];
+            requires = ["unison-cloud-database.service" "unison-cloud-secrets.service"];
+            after = ["unison-cloud-database.service" "unison-cloud-secrets.service"];
             environment = {
               PGHOST = db.host;
               PGPORT = toString db.port;

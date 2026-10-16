@@ -7,28 +7,18 @@
   cfg = config.services.unison-cloud;
   user = "unison-cloud-api";
   psql = "${cfg.database.package}/bin/psql";
-  pg = cfg.internal.postgres;
   s3 = cfg.internal.s3;
-  ext = cfg.database.external.cloudApi;
-  database =
-    if pg.external
-    then ext.database
-    else "unison_cloud";
 
   # libpq's environment variables configure every client here: psql in the migrate and
   # seed units, and cloud-api's connection string, assembled at start.
   pgEnvironment = {
-    PGHOST = pg.host;
-    PGPORT = pg.port;
-    PGDATABASE = database;
-    PGUSER =
-      if pg.external
-      then ext.user
-      else user;
+    PGHOST = cfg.database.host;
+    PGPORT = toString cfg.database.port;
+    PGDATABASE = cfg.database.cloudApi.database;
+    PGUSER = cfg.database.cloudApi.user;
   };
-  pgCredentials = lib.optional pg.external "db-password:${ext.passwordFile}";
-  exportPassword = lib.optionalString pg.external ''
-    PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/db-password")
+  exportPassword = ''
+    PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/cloud-api-db-password")
     export PGPASSWORD
   '';
 
@@ -120,13 +110,11 @@
     export CONSUL_HTTP_TOKEN=$(< "$creds/consul-token")
     export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/oidc-client-secret")
     CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
-    ${lib.optionalString pg.external ''
-      # libpq keyword values are single-quoted, with backslash and quote escaped.
-      password=$(< "$creds/db-password")
-      password=''${password//\\/\\\\}
-      password=''${password//\'/\\\'}
-      CLOUD_POSTGRES="$CLOUD_POSTGRES password='$password'"
-    ''}
+    # libpq keyword values are single-quoted, with backslash and quote escaped.
+    password=$(< "$creds/cloud-api-db-password")
+    password=''${password//\\/\\\\}
+    password=''${password//\'/\\\'}
+    CLOUD_POSTGRES="$CLOUD_POSTGRES password='$password'"
     export CLOUD_POSTGRES
     ${lib.optionalString sentry ''
       CLOUD_SENTRY_DSN=$(< "$creds/sentry-dsn")
@@ -197,29 +185,26 @@ in {
           ];
         }
       ];
-      postgresRoles.${user} = {};
-      # Untrusted extensions a database owner can't create; the migrations skip them once they exist.
-      postgresDatabases.${database} = {
-        owner = user;
-        extensions = ["uuid-ossp" "citext" "moddatetime"];
-      };
     };
 
     systemd.services.unison-cloud-migrate = lib.mkMerge [
       cfg.internal.sandbox
       {
         description = "Apply Unison Cloud database migrations";
-        requires = ["unison-cloud-postgresql-setup.service"];
-        after = ["unison-cloud-postgresql-setup.service"];
+        requires = ["unison-cloud-database.service" "unison-cloud-secrets.service"];
+        after = ["unison-cloud-database.service" "unison-cloud-secrets.service"];
         environment = pgEnvironment;
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = user;
-          Group = user;
-          LoadCredential = pgCredentials;
-          ExecStart = lib.getExe migrate;
-        };
+        serviceConfig = lib.mkMerge [
+          (cfg.internal.loadSecrets ["cloud-api-db-password"])
+          {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            User = user;
+            Group = user;
+            ProtectSystem = "strict";
+            ExecStart = lib.getExe migrate;
+          }
+        ];
       }
     ];
 
@@ -231,13 +216,13 @@ in {
         after = ["unison-cloud-migrate.service" "unison-cloud-secrets.service"];
         environment = pgEnvironment;
         serviceConfig = lib.mkMerge [
-          (cfg.internal.loadSecrets ["cluster-token"])
+          (cfg.internal.loadSecrets ["cluster-token" "cloud-api-db-password"])
           {
             Type = "oneshot";
             RemainAfterExit = true;
             User = user;
             Group = user;
-            LoadCredential = pgCredentials;
+            ProtectSystem = "strict";
             ExecStart = pkgs.writeShellScript "unison-cloud-seed" ''
               ${exportPassword}
               ${psql} -X -q -v ON_ERROR_STOP=1 -1 \
@@ -323,18 +308,18 @@ in {
               "internal-auth-token"
               "consul-token"
               "oidc-client-secret"
+              "cloud-api-db-password"
             ]
             ++ lib.optional sentry "sentry-dsn"))
           # Signed-in users reach cloud-api directly, and it shares the host's loopback
-          # with hosted code, so it sees only the host paths it uses.
+          # with hosted code, so it sees only the host paths it uses and opens no unix
+          # socket.
           cfg.internal.hostIsolation
           {
             User = user;
             Group = user;
-            BindPaths = lib.optional (!pg.external) cfg.internal.postgresSocketDir;
-            RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
+            RestrictAddressFamilies = ["AF_INET" "AF_INET6"];
             SystemCallFilter = ["@system-service"];
-            LoadCredential = pgCredentials;
             ExecStart = start;
             Restart = "on-failure";
           }

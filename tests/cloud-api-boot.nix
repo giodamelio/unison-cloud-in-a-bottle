@@ -82,7 +82,7 @@ self: {
 
     def psql(query):
         return machine.succeed(
-            f"sudo -u unison-cloud-api psql -h /run/unison-cloud-postgresql -p ${cfg.internal.postgres.port} -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
+            f"sudo -u unison-cloud-postgres psql -h /run/unison-cloud-postgresql -p ${toString cfg.database.port} -d unison_cloud -XtA -v ON_ERROR_STOP=1 -c {shlex.quote(query)}"
         ).strip()
 
     def api(args):
@@ -150,7 +150,7 @@ self: {
         listeners = [l.rsplit(":", 1) for l in machine.succeed("ss -Hltn | awk '{print $4}'").split()]
         ports = [
             s3_port, 8500, secrets_port,
-            ${toString cfg.internal.postgresTcp.port}, ${toString cfg.internal.lokiPort}, ${toString cfg.internal.lokiGrpcPort},
+            ${toString cfg.database.port}, ${toString cfg.internal.lokiPort}, ${toString cfg.internal.lokiGrpcPort},
             ${toString cfg.internal.dexPort}, ${toString cfg.internal.outboundProxyPort},
         ]
         for port in ports:
