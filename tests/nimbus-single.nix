@@ -77,14 +77,23 @@
         machine.wait_for_unit(n["unit"], timeout=600)
     memory()
 
+    def consul(path, anonymous=False):
+        token = "" if anonymous else f"-H \"X-Consul-Token: $(cat {secrets}/consul-token)\""
+        return ns(f"curl -sf {token} 'http://127.0.0.1:8500{path}'")
+
     with subtest("cloud-api registers every node in Consul and its health checks pass"):
-        consul = "http://127.0.0.1:8500/v1/health/service"
-        machine.wait_until_succeeds(ns(
-            f"curl -sf '{consul}/byoc-nimbus-http?passing=true' | jq -e 'length == {len(nodes)}'"
-        ), timeout=120)
-        machine.wait_until_succeeds(ns(
-            f"curl -sf '{consul}/nimbus-client?passing=true' | jq -e 'length == {len(nodes)}'"
-        ), timeout=60)
+        machine.wait_until_succeeds(
+            consul("/v1/health/service/unison-cloud-nimbus-http?passing=true") + f" | jq -e 'length == {len(nodes)}'",
+            timeout=120,
+        )
+        machine.wait_until_succeeds(
+            consul("/v1/health/service/unison-cloud-nimbus-client?passing=true") + f" | jq -e 'length == {len(nodes)}'",
+            timeout=60,
+        )
+        machine.wait_until_succeeds(
+            consul("/v1/health/service/unison-cloud-cloud-api?passing=true") + " | jq -e 'length == 1'",
+            timeout=60,
+        )
 
     verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
@@ -126,6 +135,15 @@
         machine.wait_until_succeeds(f"journalctl -u {daemon_unit} | grep -q 'deploy-program daemon tick'", timeout=120)
         for unit in interactive_units:
             machine.fail(f"journalctl -u {unit} | grep -q 'deploy-program daemon tick'")
+
+    with subtest("cloud-api keeps its Consul keys and services under the prefix, out of anonymous reach"):
+        keys = json.loads(machine.succeed(consul("/v1/kv/?keys")))
+        assert keys and all(k.startswith("unison-cloud/daemons/") for k in keys), keys
+        services = json.loads(machine.succeed(consul("/v1/catalog/services")))
+        assert sorted(services) == ["unison-cloud-cloud-api", "unison-cloud-nimbus-client", "unison-cloud-nimbus-http"], services
+        machine.fail(consul("/v1/kv/unison-cloud/?keys", anonymous=True))
+        assert json.loads(machine.succeed(consul("/v1/catalog/services", anonymous=True))) == {}
+        assert json.loads(machine.succeed(consul("/v1/health/service/unison-cloud-nimbus-http", anonymous=True))) == []
 
     with subtest("hosted code's log lines reach cloud-api's log endpoint through Loki"):
         hurl("${./hurl/logs.hurl}", api="http://127.0.0.1:5424", host="cloud.localhost", token=token, line="deploy-program hello served")

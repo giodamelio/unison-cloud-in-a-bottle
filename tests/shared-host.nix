@@ -378,7 +378,8 @@ in {
 
     with subtest("a deploy stores its code in Garage, and nimbus serves it from there"):
         machine.wait_until_succeeds(ns(
-            "curl -sf 'http://127.0.0.1:8500/v1/health/service/byoc-nimbus-http?passing=true' | jq -e 'length == ${toString (builtins.length cfg.internal.nimbusNodes)}'"
+            f"curl -sf -H \"X-Consul-Token: $(cat {secrets}/consul-token)\""
+            " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true' | jq -e 'length == ${toString (builtins.length cfg.internal.nimbusNodes)}'"
         ), timeout=180)
         # The client talks to both public domains through the host's Caddy. The Unison
         # runtime only reads the system bundle, so Caddy's local CA joins it privately.

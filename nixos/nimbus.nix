@@ -301,18 +301,18 @@ in {
       users = [user];
     };
 
-    # cloud-api registers the nodes itself (`byoc-nimbus-http`) when they join; this is
-    # only for its TCP client path, which looks nodes up as `nimbus-client`.
+    # cloud-api registers the nodes itself (`<prefix>-nimbus-http`) when they join; this
+    # is only for its TCP client path, which looks nodes up as `<prefix>-nimbus-client`.
     services.unison-cloud.internal.consulServices =
       map (node: {
-        id = "nimbus-client-${node.name}";
-        name = "nimbus-client";
-        address = "127.0.0.1";
-        port = node.ports.client;
-        checks = [
+        ID = "${cfg.consul.prefix}-nimbus-client-${node.name}";
+        Name = "${cfg.consul.prefix}-nimbus-client";
+        Address = "127.0.0.1";
+        Port = node.ports.client;
+        Checks = [
           {
-            tcp = "127.0.0.1:${toString node.ports.client}";
-            interval = "10s";
+            TCP = "127.0.0.1:${toString node.ports.client}";
+            Interval = "10s";
           }
         ];
       })

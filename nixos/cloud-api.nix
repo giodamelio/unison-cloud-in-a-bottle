@@ -114,6 +114,7 @@
     export SHARE_EDDSA_KEY=$(< "$creds/share-eddsa-key")
     export CLOUD_HMAC_KEY=$(< "$creds/cloud-hmac-key")
     export CLOUD_INTERNAL_AUTH_TOKEN=$(< "$creds/internal-auth-token")
+    export CONSUL_HTTP_TOKEN=$(< "$creds/consul-token")
     export CLOUD_OIDC_CLIENT_SECRET=$(< "$creds/${cfg.internal.oidcSecretCredential}")
     CLOUD_POSTGRES="host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER"
     ${lib.optionalString pg.external ''
@@ -168,6 +169,22 @@ in {
     services.unison-cloud.internal = {
       egressUsers = lib.mkIf (cfg.sentry.dsnFile != null) [user];
       ingressSockets.cloud-api = cfg.internal.cloudApiPort;
+      # cloud-api finds its peers under this name, to forward invalidations to the nodes
+      # connected to them.
+      consulServices = [
+        {
+          ID = "${cfg.consul.prefix}-cloud-api";
+          Name = "${cfg.consul.prefix}-cloud-api";
+          Address = "127.0.0.1";
+          Port = cfg.internal.cloudApiPort;
+          Checks = [
+            {
+              TCP = "127.0.0.1:${toString cfg.internal.cloudApiPort}";
+              Interval = "10s";
+            }
+          ];
+        }
+      ];
       postgresRoles.${user} = {};
       # Untrusted extensions a database owner can't create; the migrations skip them once they exist.
       postgresDatabases.${database} = {
@@ -227,13 +244,11 @@ in {
         requires =
           [
             "unison-cloud-seed.service"
-            "unison-cloud-consul.service"
           ]
           ++ lib.optional (s3.unit != null) s3.unit;
         after =
           [
             "unison-cloud-seed.service"
-            "unison-cloud-consul.service"
           ]
           ++ lib.optional (s3.unit != null) s3.unit;
         environment =
@@ -255,7 +270,8 @@ in {
             NOMAD_ALLOC_PORT_cloud_tcp = "5425";
 
             CLOUD_POSTGRES_CONN_MAX = "10";
-            CONSUL_HOST = "http://127.0.0.1:${toString cfg.internal.consulPort}";
+            CONSUL_HOST = cfg.consul.address;
+            CLOUD_CONSUL_PREFIX = cfg.consul.prefix;
 
             CLOUD_ENVIRONMENTS_MOUNT = "environments";
             CLOUD_SECRETS_HOST = "127.0.0.1";
@@ -293,6 +309,7 @@ in {
             "share-eddsa-key"
             "cloud-hmac-key"
             "internal-auth-token"
+            "consul-token"
           ])
           # Signed-in users reach cloud-api directly, and it shares the namespace loopback
           # with hosted code, so it sees only the host paths it uses.

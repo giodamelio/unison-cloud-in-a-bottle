@@ -17,6 +17,7 @@
     "s3-secret-access-key"
     "nimbus-db-password"
     "dex-client-secret"
+    "consul-token"
   ];
 
   gen = name: command: lib.optionalString (!(credentials ? ${name})) "generate ${name} ${command}";
@@ -62,6 +63,12 @@
       ${gen "cluster-token" "openssl rand -hex 32"}
       ${gen "internal-auth-token" "openssl rand -hex 32"}
       ${lib.optionalString cfg.auth.dex.enable (gen "dex-client-secret" "openssl rand -hex 32")}
+      ${lib.optionalString cfg.consul.bundled ''
+        # The bundled Consul creates its tokens with these as their secret IDs, which must be UUIDs.
+        ${gen "consul-token" "cat /proc/sys/kernel/random/uuid"}
+        generate consul-management-token cat /proc/sys/kernel/random/uuid
+        generate consul-agent-token cat /proc/sys/kernel/random/uuid
+      ''}
       ${lib.optionalString (cfg.auth.dex.enable && cfg.auth.dex.adminUser.enable) ''
         generate dex-admin-password openssl rand -hex 16
         if [ ! -e dex-admin-password.bcrypt ] || [ dex-admin-password -nt dex-admin-password.bcrypt ]; then
@@ -85,7 +92,7 @@ in {
       Names: `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each), `cloud-hmac-key`,
       `cluster-token`, `internal-auth-token`, `s3-access-key-id`,
       `s3-secret-access-key`, `nimbus-db-password`, `dex-client-secret`,
-      `dex-admin-password`.
+      `dex-admin-password`, `consul-token`.
       Paths are strings so the secrets never enter the Nix store.
     '';
   };

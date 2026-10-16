@@ -105,7 +105,8 @@
         machine.wait_for_unit(unit, timeout=600)
     # A deploy before cloud-api sees every node joined can land on no node at all.
     machine.wait_until_succeeds(
-        "ip netns exec unison-cloud curl -sf 'http://127.0.0.1:8500/v1/health/service/byoc-nimbus-http?passing=true'"
+        "ip netns exec unison-cloud curl -sf -H \"X-Consul-Token: $(cat /var/lib/unison-cloud/secrets/consul-token)\""
+        " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true'"
         f" | jq -e 'length == {len(units)}'",
         timeout=300,
     )

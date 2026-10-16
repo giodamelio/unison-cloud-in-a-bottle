@@ -211,7 +211,8 @@
         for unit in external.succeed("systemctl list-units --plain --no-legend 'unison-cloud-nimbus-*-*.service' | cut -d' ' -f1").split():
             external.wait_for_unit(unit, timeout=600)
         external.wait_until_succeeds(
-            "ip netns exec unison-cloud curl -sf 'http://127.0.0.1:8500/v1/health/service/byoc-nimbus-http?passing=true' | grep -q nimbus",
+            "ip netns exec unison-cloud curl -sf -H \"X-Consul-Token: $(cat /var/lib/unison-cloud/secrets/consul-token)\""
+            " 'http://127.0.0.1:8500/v1/health/service/unison-cloud-nimbus-http?passing=true' | grep -q nimbus",
             timeout=180,
         )
         verifier = "hurl-test-verifier-0123456789abcdefghijklmnopqrstuvwxyz"

@@ -1,0 +1,343 @@
+--- a/app/Env.hs
++++ b/app/Env.hs
+@@ -25,7 +25,7 @@
+ import Cloud.Utils.Logging qualified as Logging
+ import Control.Lens ((.~))
+ import Data.ByteString.Char8 qualified as BS
+-import Data.Char (toUpper)
++import Data.Char (isAsciiLower, isDigit, toUpper)
+ import Data.Either.Combinators (maybeToRight)
+ import Data.HashMap.Strict qualified as HM
+ import Data.Set qualified as Set
+@@ -114,7 +114,9 @@
+   envSecretsHost <- fromEnv "CLOUD_SECRETS_HOST" readHostname
+   envSecretsPort <- fromEnv "CLOUD_SECRETS_PORT" (pure . maybeToEither "Invalid CLOUD_SECRETS_PORT" . readMaybe)
+   consulHost <- fromEnv "CONSUL_HOST" parseBaseUrl
+-  let consulClientEnv = mkClientEnv manager consulHost
++  consulToken <- lookupEnv "CONSUL_HTTP_TOKEN"
++  let consulClientEnv = withConsulToken consulToken (mkClientEnv manager consulHost)
++  envConsulPrefix <- maybe (pure "unison-cloud") (exitErrOnLeft . first ("'CLOUD_CONSUL_PREFIX': " <>) . parseConsulPrefix) =<< lookupEnv "CLOUD_CONSUL_PREFIX"
+   zendeskAPIUser <- fromEnv "CLOUD_ZENDESK_API_USER" (pure . Right . BS.pack)
+   zendeskAPIToken <- fromEnv "CLOUD_ZENDESK_API_TOKEN" (pure . Right . BS.pack)
+   let envZendeskAuth = ServantAuth.BasicAuthData zendeskAPIUser zendeskAPIToken
+@@ -211,9 +213,9 @@
+   envTimeCache <- FL.newTimeCache "%a, %d %b %Y %H:%M:%S %Z" -- RFC1123, e.g. Mon, 02 Jan 2006 15:04:05 MST
+   nimbusHostStr <- lookupEnv "CLOUD_NIMBUS_HOST"
+   let nimbusHost = (\host -> ConsulServiceInstance host (Just 17010) mempty []) <$> nimbusHostStr
+-  let nimbusClientServiceName = if Deployment.deployment == Deployment.Staging then "nimbus-client-staging" else "nimbus-client"
+-  let nimbusHttpServiceName = if Deployment.deployment == Deployment.Staging then "byoc-nimbus-http-staging" else "byoc-nimbus-http"
+-  let envNimbusConfig = NimbusConfig consulHost nimbusClientServiceName nimbusHttpServiceName nimbusHost
++  let nimbusClientServiceName = envConsulPrefix <> "-nimbus-client"
++  let nimbusHttpServiceName = envConsulPrefix <> "-nimbus-http"
++  let envNimbusConfig = NimbusConfig consulClientEnv nimbusClientServiceName nimbusHttpServiceName nimbusHost
+ 
+   let envSpConfig =
+         ServiceProviderConfig
+@@ -296,6 +298,22 @@
+     Left ("must be scheme://host[:port] only, got " <> str)
+   pure (secure, BS.pack (uriRegName auth), port)
+ 
++-- The prefix also forms service names, which must stay DNS-compatible.
++parseConsulPrefix :: String -> Either String Text
++parseConsulPrefix str
++  | not (null str) && all (\c -> isAsciiLower c || isDigit c || c == '-') str = Right (Text.pack str)
++  | otherwise = Left ("must be lowercase letters, digits and dashes, got " <> show str)
++
++-- Every Consul call goes through this env, including the long-poll copies that only change its timeout.
++withConsulToken :: Maybe String -> ClientEnv -> ClientEnv
++withConsulToken Nothing env = env
++withConsulToken (Just token) env =
++  env
++    { makeClientRequest = \url req ->
++        makeClientRequest env url req <&> \r ->
++          r {requestHeaders = ("X-Consul-Token", BS.pack token) : requestHeaders r}
++    }
++
+ parseS3AddressingStyle :: String -> Either String AWS.S3AddressingStyle
+ parseS3AddressingStyle = \case
+   "path" -> Right AWS.S3AddressingStylePath
+--- a/src/Cloud/Client/Nimbus.hs
++++ b/src/Cloud/Client/Nimbus.hs
+@@ -11,8 +11,6 @@
+ import Cloud.Utils.Logging ( MonadLogger )
+ import Control.Monad.Random.Strict
+ import Debug.Trace
+-import Network.HTTP.Client (newManager)
+-import Network.HTTP.Client.TLS (tlsManagerSettings)
+ import Network.Simple.TCP
+ import Servant
+ import Servant.Client
+@@ -25,15 +23,9 @@
+     cached = True
+     stale = True
+ 
+-consulContext :: NimbusConfig -> IO ClientEnv
+-consulContext config = do
+-  manager' <- newManager tlsManagerSettings
+-  return $ mkClientEnv manager' (consulBaseUrl config)
+-
+ nimbusNode :: (MonadIO m, MonadLogger m, MonadRandom m) => NimbusConfig -> m ConsulServiceInstance
+ nimbusNode config = do
+-  env <- liftIO $ consulContext config
+-  nodes <- liftIO $ runClientM (serviceHealthClient config) env
++  nodes <- liftIO $ runClientM (serviceHealthClient config) (consulEnv config)
+   case nodes of
+     Left e -> traceShow e $ UnliftIO.throwIO err500
+     Right [] -> respondErrorM $ AuthFailure "Temporary server error. Please try again later."
+--- a/src/Cloud/Client/Types.hs
++++ b/src/Cloud/Client/Types.hs
+@@ -13,7 +13,7 @@
+ import Data.Text (Text)
+ import Data.UUID
+ import Network.Socket
+-import Servant.Client (BaseUrl)
++import Servant.Client (ClientEnv)
+ import Cloud.Consul.API (ConsulServiceInstance)
+ 
+ data Client = Client
+@@ -22,7 +22,7 @@
+   }
+ 
+ data NimbusConfig = NimbusConfig
+-  { consulBaseUrl :: BaseUrl,
++  { consulEnv :: ClientEnv,
+     nimbusClientServiceName :: Text,
+     nimbusHttpServiceName :: Text,
+     envNimbusHost :: Maybe ConsulServiceInstance
+--- a/src/Cloud/Consul/Daemon.hs
++++ b/src/Cloud/Consul/Daemon.hs
+@@ -8,14 +8,13 @@
+   )
+  where
+ import Cloud.Daemon.Types
+-import Cloud.Deployment qualified as Deployment
+ import Cloud.Prelude
+ import Share.OAuth.Types (UserId)
+ import Cloud.Deployment.DeploymentHash (DeploymentHash)
+ import Cloud.Web.App (WebApp)
+ import qualified Servant.Client as S
+ import qualified Data.Text as Text
+-import Cloud.Byoc.Env (isDefaultCluster, ClusterId)
++import Cloud.Byoc.Env (ClusterId)
+ import Share.Utils.Show (tShow)
+ import Cloud.Errors
+ import Cloud.Web.Errors (CloudWebError (InternalError))
+@@ -34,22 +33,19 @@
+ import Cloud.Env (Env(..))
+ import Control.Monad.Reader (ask)
+ 
+-daemonIdKey :: ClusterId -> DaemonId -> Text
+-daemonIdKey cluster (DaemonId daemonId) =
+-  clusterDaemonPrefix cluster <> tShow daemonId
+-
+-clusterDaemonPrefix :: ClusterId -> Text
+-clusterDaemonPrefix cluster =
+-  env <> clusterSlug <> "/daemonId/"
+-  where
+-    env = tShow Deployment.deployment
+-    clusterSlug = if isDefaultCluster cluster then "" else "/" <> tShow cluster
++daemonIdKey :: Text -> ClusterId -> DaemonId -> Text
++daemonIdKey consulPrefix cluster (DaemonId daemonId) =
++  clusterDaemonPrefix consulPrefix cluster <> tShow daemonId
++
++clusterDaemonPrefix :: Text -> ClusterId -> Text
++clusterDaemonPrefix consulPrefix cluster =
++  consulPrefix <> "/daemons/" <> tShow cluster <> "/"
+ 
+ consulSetDaemonId :: ClusterId -> UserId -> DaemonId -> DeploymentHash -> WebApp ()
+ consulSetDaemonId cluster userId daemonId hash = do
+-  let key = daemonIdKey cluster daemonId
++  Env { consulClientEnv, envConsulPrefix } <- ask
++  let key = daemonIdKey envConsulPrefix cluster daemonId
+   let value = BSL.toStrict $ encode $ object ["owner" .= userId, "hash" .= hash]
+-  Env { consulClientEnv } <- ask
+   res <- liftIO $ S.runClientM (updateKey' key value Nothing Nothing Nothing Nothing) consulClientEnv
+   case res of
+     Left err -> do
+@@ -70,8 +66,8 @@
+ 
+ consulUnassignDaemonId :: ClusterId -> DaemonId -> WebApp ()
+ consulUnassignDaemonId cluster daemonId = do
+-  let key = daemonIdKey cluster daemonId
+-  Env { consulClientEnv } <- ask
++  Env { consulClientEnv, envConsulPrefix } <- ask
++  let key = daemonIdKey envConsulPrefix cluster daemonId
+   res <- liftIO $ S.runClientM (deleteKey' key Nothing Nothing) consulClientEnv
+   case res of
+     Left err -> do
+@@ -80,8 +76,8 @@
+ 
+ consulDeleteDaemon :: ClusterId -> DaemonId -> WebApp ()
+ consulDeleteDaemon cluster daemonId = do
+-  let key = daemonIdKey cluster daemonId
+-  Env { consulClientEnv } <- ask
++  Env { consulClientEnv, envConsulPrefix } <- ask
++  let key = daemonIdKey envConsulPrefix cluster daemonId
+   res <- liftIO $ S.runClientM (deleteKey' key Nothing Nothing) consulClientEnv
+   case res of
+     Left err -> do
+@@ -90,18 +86,18 @@
+ 
+ consulWatchClusterDaemons :: ClusterId -> ConduitT () [DaemonAssignmentSummary] WebApp ()
+ consulWatchClusterDaemons cluster = do
+-  Env { consulClientEnv } <- ask
+-  (watchKeys (runClient consulClientEnv) prefix True <&> absurd) .| mapMC (witherM decodeSummary)
++  Env { consulClientEnv, envConsulPrefix } <- ask
++  let prefix = clusterDaemonPrefix envConsulPrefix cluster
++  (watchKeys (runClient consulClientEnv) prefix True <&> absurd) .| mapMC (witherM (decodeSummary prefix))
+   where
+-    prefix = clusterDaemonPrefix cluster
+-    daemonIdFromKey :: Text -> Maybe DaemonId
+-    daemonIdFromKey key = DaemonId <$> UUID.fromText (stripPrefix prefix key)
+-    decodeSummary :: GetResponse -> WebApp (Maybe DaemonAssignmentSummary)
+-    decodeSummary res = case eitherDecodeStrict (encodeUtf8 res.responseValue) of
++    daemonIdFromKey :: Text -> Text -> Maybe DaemonId
++    daemonIdFromKey prefix key = DaemonId <$> UUID.fromText (stripPrefix prefix key)
++    decodeSummary :: Text -> GetResponse -> WebApp (Maybe DaemonAssignmentSummary)
++    decodeSummary prefix res = case eitherDecodeStrict (encodeUtf8 res.responseValue) of
+       Left err -> do
+         logErrorText $ "Error decoding Daemon summary: " <> tshow err
+         pure Nothing
+-      Right (r :: DaemonSummary) -> case daemonIdFromKey res.responseKey of
++      Right (r :: DaemonSummary) -> case daemonIdFromKey prefix res.responseKey of
+         Just daemonId -> pure $ Just $ DaemonAssignmentSummary { daemonId, ownerId = r.owner, deploymentHash = r.hash, modifyIndex = res.updateIndex }
+         Nothing -> do
+           logErrorText $ "Error decoding Daemon ID: " <> res.responseKey
+--- a/src/Cloud/Domain/Impl.hs
++++ b/src/Cloud/Domain/Impl.hs
+@@ -51,10 +51,10 @@
+ 
+ listDomainsEndpoint :: UserId -> WebApp [DomainDetails]
+ listDomainsEndpoint userId = do
+-  Env { consulClientEnv } <- ask
++  Env { consulClientEnv, envConsulPrefix } <- ask
+   User {handle} <- PGO.expectUserById userId
+   let (UserHandle handleTxt) = handle
+-  let key = "userdomains/" <> handleTxt
++  let key = envConsulPrefix <> "/userdomains/" <> handleTxt
+   res <- liftIO $ S.runClientM (listKeys key Nothing) consulClientEnv
+   case res of
+     Left err -> do
+@@ -109,7 +109,8 @@
+           update handleTxt domainTxt consulClientEnv Nothing
+   where
+     update handleTxt domainTxt consulEnv cas = do
+-      let key = "userdomains/" <> handleTxt <> "/" <> domainTxt
++      Env { envConsulPrefix } <- ask
++      let key = envConsulPrefix <> "/userdomains/" <> handleTxt <> "/" <> domainTxt
+       res <- liftIO $ S.runClientM (updateKey' key (Text.encodeUtf8 $ serviceNameToText serviceName) Nothing cas Nothing Nothing) consulEnv
+       case res of
+         Left err -> do
+@@ -125,10 +126,10 @@
+ 
+ getDomain :: UserHandle -> DomainName -> WebApp (Maybe (DomainDetails, ConsulIndex))
+ getDomain user domainName = do
+-  Env { consulClientEnv } <- ask
++  Env { consulClientEnv, envConsulPrefix } <- ask
+   let (DomainName domainTxt) = domainName
+   let (UserHandle handleTxt) = user
+-  res <- liftIO $ S.runClientM (readKey False ("userdomains/" <> handleTxt <> "/" <> domainTxt)) consulClientEnv
++  res <- liftIO $ S.runClientM (readKey False (envConsulPrefix <> "/userdomains/" <> handleTxt <> "/" <> domainTxt)) consulClientEnv
+   case res of
+     Left err -> do
+       if is404Error err
+@@ -149,8 +150,8 @@
+ 
+ checkDomainUniqueness :: DomainName -> WebApp ()
+ checkDomainUniqueness dn@(DomainName name) = do
+-  Env { consulClientEnv } <- ask
+-  res <- liftIO $ S.runClientM (listKeys "userdomains/" Nothing) consulClientEnv
++  Env { consulClientEnv, envConsulPrefix } <- ask
++  res <- liftIO $ S.runClientM (listKeys (envConsulPrefix <> "/userdomains/") Nothing) consulClientEnv
+   case res of
+     Left err -> do
+       liftIO $ print err
+@@ -175,11 +176,11 @@
+ 
+ deleteDomainEndpoint :: UserId -> DomainName -> WebApp NoContent
+ deleteDomainEndpoint userId domain = do
+-  Env { consulClientEnv } <- ask
++  Env { consulClientEnv, envConsulPrefix } <- ask
+   User {handle} <- PGO.expectUserById userId
+   let DomainName domainName = domain
+   let (UserHandle handleTxt) = handle
+-  res <- liftIO $ S.runClientM (deleteKey' ("userdomains/" <> handleTxt <> "/" <> domainName) Nothing Nothing) consulClientEnv
++  res <- liftIO $ S.runClientM (deleteKey' (envConsulPrefix <> "/userdomains/" <> handleTxt <> "/" <> domainName) Nothing Nothing) consulClientEnv
+   case res of
+     Left err -> do
+       respondError $ InternalError $ Text.pack $ "Consul error: " <> show err
+--- a/src/Cloud/Env.hs
++++ b/src/Cloud/Env.hs
+@@ -33,6 +33,9 @@
+     envEmailServiceToken :: Maybe Text,
+     envApiOrigin :: URI, -- E.g. "https://api.unison-lang.org"
+     consulClientEnv :: S.ClientEnv,
++    -- Every Consul key and service name cloud-api owns starts with this, so the ACL
++    -- policy on a shared cluster can grant it exactly those.
++    envConsulPrefix :: Text,
+     envLogger :: LogStr -> IO (),
+     envMinLogSeverity :: Logging.Severity,
+     envTimeCache :: IO FormattedTime,
+--- a/src/Cloud/Web/Cluster/Impl.hs
++++ b/src/Cloud/Web/Cluster/Impl.hs
+@@ -67,7 +67,6 @@
+ import Cloud.Consul.API qualified as Consul
+ import Cloud.Consul.Daemon (consulWatchClusterDaemons)
+ import Cloud.Consul.Filtering
+-import Cloud.Deployment qualified
+ 
+ import Cloud.Env (Env (..))
+ import Cloud.Errors (respondError)
+@@ -500,11 +499,6 @@
+               Nothing -> pure ()
+           go
+ 
+-eventPrefix :: Text
+-eventPrefix = case Cloud.Deployment.deployment of
+-  Cloud.Deployment.Staging -> "staging-"
+-  _ -> ""
+-
+ stmMapSnapshot :: STM.Map k v -> STM [(k, v)]
+ stmMapSnapshot = C.foldlM' (\l (k, v) -> pure ((k, v) : l)) [] . STM.unfoldlM
+ 
+@@ -554,14 +548,10 @@
+ invalidationTimeoutMicros :: Int
+ invalidationTimeoutMicros = 30_000_000
+ 
+--- | The Consul service name cloud-api registers itself under (via Nomad).
+--- Environment-prefixed: "cloud-api-http" in prod, "cloud-api-staging-http" in
+--- staging (overridable with CLOUD_API_CONSUL_SERVICE).
+-cloudApiServiceName :: Text
+-cloudApiServiceName = "cloud-api-" <> eventPrefix <> "http"
+-
+-resolveCloudApiServiceName :: IO Text
+-resolveCloudApiServiceName = maybe cloudApiServiceName Text.pack <$> lookupEnv "CLOUD_API_CONSUL_SERVICE"
++-- | The Consul service name cloud-api is registered under, "<prefix>-cloud-api"
++-- (overridable with CLOUD_API_CONSUL_SERVICE).
++resolveCloudApiServiceName :: Text -> IO Text
++resolveCloudApiServiceName consulPrefix = maybe (consulPrefix <> "-cloud-api") Text.pack <$> lookupEnv "CLOUD_API_CONSUL_SERVICE"
+ 
+ -- | Startup self-check: confirm this cloud-api deployment is discoverable in
+ -- Consul under the expected service name. A wrong name fails SILENTLY in
+@@ -570,8 +560,8 @@
+ -- briefly to ride out the registration race at boot, then logs loudly.
+ consulRegistrationSelfCheck :: CloudApp ()
+ consulRegistrationSelfCheck = do
+-  Env {consulClientEnv} <- ask
+-  svc <- liftIO resolveCloudApiServiceName
++  Env {consulClientEnv, envConsulPrefix} <- ask
++  svc <- liftIO $ resolveCloudApiServiceName envConsulPrefix
+   let go (n :: Int) = do
+         res <- liftIO $ S.runClientM (serviceHealth' svc (Just True) Nothing Nothing True True) consulClientEnv
+         case res of
+@@ -610,8 +600,8 @@
+ -- per environment from the Nomad port label).
+ discoverCloudApiPeers :: WebApp [S.BaseUrl]
+ discoverCloudApiPeers = do
+-  Env {consulClientEnv} <- ask
+-  svc <- liftIO resolveCloudApiServiceName
++  Env {consulClientEnv, envConsulPrefix} <- ask
++  svc <- liftIO $ resolveCloudApiServiceName envConsulPrefix
+   res <- liftIO $ S.runClientM (serviceHealth' svc (Just True) Nothing Nothing True True) consulClientEnv
+   case res of
+     Left err -> do

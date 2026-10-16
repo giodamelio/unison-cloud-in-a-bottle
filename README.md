@@ -156,6 +156,36 @@ Here's what each piece expects from the host:
 - **PostgreSQL.** The module creates `unison-cloud-api` and `unison-cloud-nimbus` roles, both `NOSUPERUSER`, `NOCREATEROLE` and `NOCREATEDB`, and their databases. cloud-api logs in over `/run/postgresql` with peer authentication. nimbus can't open a unix socket, so it logs in with a generated password, through a bridge to the host's `127.0.0.1`. The module never touches `pg_hba.conf`, so keep rules that let those system users log in as their own roles, and `unison-cloud-nimbus` with its password over TCP from `127.0.0.1`. NixOS's defaults, `local all all peer` and `host all all 127.0.0.1/32 md5`, do both.
 - **S3.** Create both buckets and a key that can read and write them. Requests through the bridge keep the `Host` header the clients sign, `<bucket>.<host>:7070`, so the store must accept a non-default port there. Garage does.
 
+## Use an existing Consul cluster
+
+Everything the stack keeps in Consul sits under one prefix, `consul.prefix` (`unison-cloud` by default): KV keys under `<prefix>/` and service names starting with `<prefix>-`. So it can share a cluster that runs with `default_policy = "deny"`. The module writes the ACL policy it needs to `config.services.unison-cloud.consul.aclPolicy`. Create the policy and a token from it on the cluster:
+
+```sh
+policy=$(nix build --no-link --print-out-paths .#nixosConfigurations.<host>.config.services.unison-cloud.consul.aclPolicy)
+consul acl policy create -name unison-cloud -rules @"$policy"
+consul acl token create -policy-name unison-cloud -description "Unison Cloud"
+```
+
+Then point the module at the host's local agent through a host bridge, and supply the token's secret ID as `consul-token`:
+
+```nix
+services.unison-cloud = {
+  consul = {
+    bundled = false;
+    address = "http://127.0.0.1:18500";
+  };
+  network.hostBridges.consul = {
+    target = "127.0.0.1:8500";
+    port = 18500;
+    users = ["unison-cloud-api"];
+  };
+  # Encrypted with --name=consul-token.
+  secrets.credentials.consul-token = "unison-cloud-consul-token";
+};
+```
+
+`unison-cloud-consul-services` registers the host's nimbus client ports and cloud-api with the local agent, as `<prefix>-nimbus-client` and `<prefix>-cloud-api`, while it runs, and deregisters them when it stops. It runs as `unison-cloud-api` too, so the bridge above covers it.
+
 ## Use the binary cache
 
 Building cloud-api and nimbus from scratch takes a long time, so I push the builds to a Cachix cache, [unison-cloud-in-a-bottle](https://unison-cloud-in-a-bottle.cachix.org). The flake already lists it in `nixConfig`, so when you `nix run` or `nix develop` here Nix asks whether to trust it. Say yes and it pulls the binaries instead of building them.
@@ -241,7 +271,7 @@ flowchart TB
 - **Dex** is the bundled login provider. cloud-api acts as an OIDC client of Dex (or any external OIDC provider you point it at), and as a tiny authorization server for `ucm auth.login`.
 - **PostgreSQL** holds cloud-api's data, environment secrets, login state and refresh tokens, and nimbus's transactional storage in place of DynamoDB. Each has its own role, and neither can read the other's tables.
 - **versitygw** stands in for S3, for deployed service code and blobs. You can point it at a real S3 instead, reached through a host bridge.
-- **Consul** is a single-node service registry that cloud-api uses to find the nimbus nodes.
+- **Consul** is a single-node service registry that cloud-api uses to find the nimbus nodes. It runs with ACLs on and denies anonymous requests. At boot it creates the `consul.aclPolicy` policy and cloud-api's token from it, so the stack uses the same token path as on a shared cluster.
 - **Loki and Vector** collect the logs. Vector ships nimbus's journal into Loki with the labels cloud-api expects when the UI asks for logs.
 - **Squid and Unbound** form the outbound proxy for hosted code. Your services can reach the internet, but never loopback or private addresses.
 - **nftables** locks down egress from the namespace so only the services that need the outside world can reach it. Host bridges (`network.hostBridges`) give named users a path to one host-side service each, such as an S3 store or a login provider, without any general egress.
@@ -264,6 +294,7 @@ cloud-api (`patches/cloud-api/`):
 - `0007-oidc-broker`: Makes cloud-api an OIDC client of Dex or any other provider, and the login server `ucm auth.login` talks to. It's the only way to log in.
 - `0008-remove-unauthenticated-routes`: Removes the routes that answer without a real login, so nothing on the host can reach cloud-api's port and become a user or change state. That covers the Share login (`/login`, `/oauth/redirect`, `/enroll`), the credential-free `/local/*` logins, the Stripe webhook (its secret is a public placeholder), and the `/internal` lookups nimbus replaced with `/v2/cluster`. `/internal/invalidate` now refuses every call when its token is unset.
 - `0009-redis-to-postgres`: Replaces Redis with a Postgres table for login state, authorization codes and refresh tokens, so there's one less service to run. Expired entries are skipped on read and deleted on write, without a timer. Codes and refresh tokens are now consumed in one statement, so two racing requests can't both redeem one.
+- `0010-consul-token-and-prefix`: Sends `CONSUL_HTTP_TOKEN` as `X-Consul-Token` on every Consul request, and puts every key and service name under `CLOUD_CONSUL_PREFIX` (`unison-cloud` by default), so cloud-api can live on a shared cluster with a narrow ACL policy. Daemon assignments move to `<prefix>/daemons/<cluster>/`, custom domains to `<prefix>/userdomains/`, and the services become `<prefix>-nimbus-http`, `<prefix>-nimbus-client` and `<prefix>-cloud-api`.
 
 unison-cloud-ui (`patches/cloud-ui/`):
 
