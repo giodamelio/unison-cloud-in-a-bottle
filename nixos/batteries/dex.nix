@@ -5,12 +5,14 @@
   ...
 }: let
   cfg = config.services.unison-cloud;
-  dex = cfg.auth.dex;
+  dex = cfg.batteries.dex;
   user = "unison-cloud-dex";
   dataDir = "${cfg.stateDir}/dex";
   secrets = "${cfg.stateDir}/secrets";
   runtimeDir = "/run/unison-cloud-dex";
-  issuer = cfg.internal.oidcIssuer;
+  issuer = "${cfg.internal.publicUrl.api}/dex";
+  loopback = "http://127.0.0.1:${toString dex.port}/dex";
+  api = lib.optional cfg.cloudApi.enable "unison-cloud-api.service";
 
   baseConfig = pkgs.writeText "unison-cloud-dex-base.json" (builtins.toJSON {
     inherit issuer;
@@ -18,7 +20,7 @@
       type = "sqlite3";
       config.file = "${dataDir}/dex.sqlite";
     };
-    web.http = "127.0.0.1:${toString cfg.internal.dexPort}";
+    web.http = "127.0.0.1:${toString dex.port}";
     enablePasswordDB = true;
     oauth2.skipApprovalScreen = true;
   });
@@ -68,55 +70,67 @@
     '';
   };
 in {
-  options.services.unison-cloud = {
-    auth.dex = {
-      enable = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Run the bundled Dex at `https://<domains.api>/dex` as the login provider.";
-      };
-
-      users = lib.mkOption {
-        type = lib.types.listOf (lib.types.submodule {
-          options = {
-            email = lib.mkOption {type = lib.types.str;};
-            username = lib.mkOption {
-              type = lib.types.str;
-              description = "Becomes the cloud-api handle on first login.";
-            };
-            passwordHashFile = lib.mkOption {
-              type = lib.types.str;
-              description = ''
-                File holding a bcrypt hash of the password, for example from `mkpasswd -m bcrypt`.
-                A string, so the hash never enters the Nix store.
-              '';
-            };
-          };
-        });
-        default = [];
-        description = "Users of the bundled Dex's password database.";
-      };
-
-      adminUser.enable = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          Create user `admin` (email `admin@<domains.api>`) with a password generated on
-          first start and written to `<stateDir>/secrets/dex-admin-password`.
-        '';
-      };
+  options.services.unison-cloud.batteries.dex = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run Dex at `https://<domains.api>/dex` as the login provider, and let every one of
+        its users log in unless `auth.oidc` sets an allowlist.
+      '';
     };
 
-    internal.dexPort = lib.mkOption {
+    port = lib.mkOption {
       type = lib.types.port;
-      internal = true;
-      readOnly = true;
       default = 24154;
       description = "Dex's plain HTTP port on loopback; TLS is the reverse proxy's job.";
+    };
+
+    users = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          email = lib.mkOption {type = lib.types.str;};
+          username = lib.mkOption {
+            type = lib.types.str;
+            description = "Becomes the cloud-api handle on first login.";
+          };
+          passwordHashFile = lib.mkOption {
+            type = lib.types.str;
+            description = ''
+              File holding a bcrypt hash of the password, for example from `mkpasswd -m bcrypt`.
+              A string, so the hash never enters the Nix store.
+            '';
+          };
+        };
+      });
+      default = [];
+      description = "Users of the bundled Dex's password database.";
+    };
+
+    adminUser.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Create user `admin` (email `admin@<domains.api>`) with a password generated on
+        first start and written to `<stateDir>/secrets/dex-admin-password`.
+      '';
     };
   };
 
   config = lib.mkIf (cfg.enable && dex.enable) {
+    # The browser follows the public authorization URL. cloud-api makes its own calls to
+    # Dex's loopback listener, since the public URL may not resolve from this host.
+    services.unison-cloud.auth.oidc = {
+      inherit issuer;
+      clientId = "cloud-api";
+      endpoints = {
+        authorization = "${issuer}/auth";
+        token = "${loopback}/token";
+        jwks = "${loopback}/keys";
+      };
+      allowedEmails = lib.mkDefault (map (u: u.email) users);
+    };
+
     users.users.${user} = {
       isSystemUser = true;
       group = user;
@@ -140,12 +154,16 @@ in {
         wantedBy = ["multi-user.target"];
         requires = ["unison-cloud-secrets.service"];
         after = ["unison-cloud-secrets.service"];
+        requiredBy = api;
+        before = api;
         restartTriggers = [baseConfig];
         serviceConfig = lib.mkMerge [
           (cfg.internal.loadSecrets ["oidc-client-secret"])
           {
             User = user;
             Group = user;
+            IPAddressDeny = "any";
+            IPAddressAllow = "localhost";
             RuntimeDirectory = baseNameOf runtimeDir;
             RuntimeDirectoryMode = "0700";
             ExecStartPre = "+${lib.getExe render}";

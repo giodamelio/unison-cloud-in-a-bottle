@@ -7,7 +7,7 @@
   # One combination of levers: the host's Postgres over loopback TCP, secrets supplied as
   # files, and no bundled Caddy, so the upstream ports are the whole interface.
   nodes.machine = {pkgs, ...}: {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     services.postgresql = {
       enable = true;
@@ -36,11 +36,11 @@
         apps = "apps.test";
         ui = "ui.test";
       };
-      database = {
-        bundled = false;
-        host = "127.0.0.1";
+      database.host = "127.0.0.1";
+      batteries = {
+        postgresql.enable = false;
+        caddy.enable = false;
       };
-      caddy.enable = false;
       secrets.files = {
         cluster-token = "/etc/unison-cloud-secrets/cluster-token";
         cloud-api-db-password = "/etc/unison-cloud-secrets/cloud-api-db";
@@ -58,7 +58,7 @@
   };
 
   # A Postgres prepared the way `database` asks, and an S3 store with
-  # virtual-host addressing, as `s3.external` needs.
+  # virtual-host addressing, as `s3` needs.
   nodes.db = {
     lib,
     pkgs,
@@ -108,7 +108,7 @@
     interactive = lib.findFirst (node: node.type == "interactive") (throw "no interactive node") config.services.unison-cloud.internal.nimbusNodes;
     dbAddress = nodes.db.networking.primaryIPAddress;
   in {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     networking.hosts = {
       "127.0.0.1" = ["cloud.localhost" "apps.localhost"];
@@ -129,14 +129,15 @@
         scheme = "http";
         port = interactive.ports.publicHttp;
       };
-      caddy.enable = false;
+      batteries = {
+        caddy.enable = false;
+        postgresql.enable = false;
+        s3.enable = false;
+      };
       s3 = {
-        bundled = false;
-        external = {
-          host = "s3.test";
-          port = 7070;
-          https = false;
-        };
+        host = "s3.test";
+        port = 7070;
+        https = false;
       };
       secrets.files = {
         s3-access-key-id = "/etc/unison-cloud-secrets/s3-access-key-id";
@@ -144,10 +145,7 @@
         cloud-api-db-password = "/etc/unison-cloud-secrets/cloud-api-db";
         nimbus-db-password = "/etc/unison-cloud-secrets/nimbus-db";
       };
-      database = {
-        bundled = false;
-        host = dbAddress;
-      };
+      database.host = dbAddress;
     };
 
     systemd.tmpfiles.rules = [
@@ -222,7 +220,7 @@
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         external.wait_for_unit("unison-cloud-dex.service")
         token = json.loads(external.succeed(
-            "hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.internal.dexPort} --variable api=http://127.0.0.1:${toString external.cloudApi.port}"
+            "hurl --connect-to ${external.domains.api}:${toString external.ingress.port}:127.0.0.1:${toString external.batteries.dex.port} --variable api=http://127.0.0.1:${toString external.cloudApi.port}"
             f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
             " --secret password=$(cat /var/lib/unison-cloud/secrets/dex-admin-password) ${./hurl/login-loopback.hurl}"
         ))["access_token"]

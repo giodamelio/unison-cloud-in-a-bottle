@@ -6,7 +6,7 @@
 
   # The module as a user would write it: only the three domains, every default kept.
   nodes.machine = {pkgs, ...}: {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     services.unison-cloud = {
       enable = true;

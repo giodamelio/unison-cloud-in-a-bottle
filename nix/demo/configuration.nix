@@ -53,7 +53,7 @@ self: {
     '';
   };
 in {
-  imports = [self.nixosModules.default];
+  imports = [self.nixosModules.core self.nixosModules.batteries];
 
   services.unison-cloud = {
     enable = true;
@@ -68,7 +68,7 @@ in {
       scheme = "http";
       port = 8080;
     };
-    auth.dex.users = [
+    batteries.dex.users = [
       {
         email = "demo@unison.localhost";
         username = "demo";

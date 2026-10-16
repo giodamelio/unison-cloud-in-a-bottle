@@ -37,7 +37,10 @@
         ucm = inputs.unison-nix.packages.${pkgs.stdenv.hostPlatform.system}.ucm-bin;
       };
   in {
-    nixosModules.default = import ./nixos inputs.self;
+    nixosModules = {
+      core = import ./nixos/core inputs.self;
+      batteries = import ./nixos/batteries inputs.self;
+    };
 
     nixosConfigurations = inputs.nixpkgs.lib.listToAttrs (map (system:
       inputs.nixpkgs.lib.nameValuePair (demoName system) (inputs.nixpkgs.lib.nixosSystem {
@@ -64,7 +67,7 @@
     });
 
     checks = forAllSystems (defaultPkgs: let
-      # The module always runs the bundled Consul, which nixpkgs marks unfree (BSL 1.1).
+      # Batteries runs Consul, which nixpkgs marks unfree (BSL 1.1).
       pkgs = import inputs.nixpkgs {
         inherit (defaultPkgs.stdenv.hostPlatform) system;
         config.allowUnfreePredicate = pkg: inputs.nixpkgs.lib.getName pkg == "consul";
@@ -86,6 +89,10 @@
       lint-eval-demo-aarch64 =
         pkgs.writeText "lint-eval-demo-aarch64"
         (builtins.unsafeDiscardStringContext inputs.self.nixosConfigurations.demo-aarch64-linux.config.system.build.vm.drvPath);
+      lint-eval-core-only = pkgs.writeText "lint-eval-core-only" (import ./tests/eval-core-only.nix {
+        inherit (inputs) self nixpkgs;
+        inherit (pkgs.stdenv.hostPlatform) system;
+      });
 
       cloud-api-boot = pkgs.testers.runNixOSTest (import ./tests/cloud-api-boot.nix inputs.self);
 

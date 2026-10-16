@@ -70,7 +70,7 @@ in {
       '';
     };
   in {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     networking.interfaces.eth1.ipv4.addresses = [
       {
@@ -96,10 +96,14 @@ in {
         apps = "apps.test";
         ui = "ui.test";
       };
-      caddy.enable = false;
+      batteries = {
+        caddy.enable = false;
+        dex.enable = false;
+        s3.enable = false;
+        postgresql.enable = false;
+      };
 
       auth = {
-        dex.enable = false;
         oidc = {
           issuer = "https://login.test";
           clientId = "unison-cloud";
@@ -113,14 +117,11 @@ in {
       };
 
       s3 = {
-        bundled = false;
         inherit buckets;
-        external = {
-          host = s3Host;
-          port = 3900;
-          https = false;
-          region = "garage";
-        };
+        host = s3Host;
+        port = 3900;
+        https = false;
+        region = "garage";
       };
       secrets.credentials = {
         oidc-client-secret = "unison-cloud-oidc-client-secret";
@@ -130,11 +131,7 @@ in {
         nimbus-db-password = "unison-cloud-nimbus-db-password";
       };
 
-      database = {
-        bundled = false;
-        host = "127.0.0.1";
-        package = config.services.postgresql.package;
-      };
+      database.host = "127.0.0.1";
     };
 
     services.caddy = {

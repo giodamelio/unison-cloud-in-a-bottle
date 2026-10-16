@@ -11,7 +11,7 @@
 in {
   imports = ["${modulesPath}/virtualisation/qemu-vm.nix"];
 
-  # The module always runs the bundled Consul, which nixpkgs marks unfree (BSL 1.1).
+  # Batteries runs Consul, which nixpkgs marks unfree (BSL 1.1).
   nixpkgs.config.allowUnfreePredicate = pkg: lib.getName pkg == "consul";
 
   networking.hostName = "unison-cloud-demo";

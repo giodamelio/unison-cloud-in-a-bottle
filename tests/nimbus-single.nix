@@ -13,7 +13,7 @@
     cfg = config.services.unison-cloud;
     interactive = lib.findFirst (node: node.type == "interactive") (throw "no interactive node") cfg.internal.nimbusNodes;
   in {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     services.unison-cloud = {
       enable = true;
@@ -29,12 +29,12 @@
         scheme = "http";
         port = interactive.ports.publicHttp;
       };
-      caddy.enable = false;
+      batteries.caddy.enable = false;
     };
 
     networking.hosts."127.0.0.1" = ["cloud.localhost" "apps.localhost"];
 
-    environment.systemPackages = [deployProgram pkgs.hurl pkgs.jq cfg.database.package];
+    environment.systemPackages = [deployProgram pkgs.hurl pkgs.jq cfg.batteries.postgresql.package];
 
     virtualisation.memorySize = 4096;
     virtualisation.cores = 4;
@@ -51,7 +51,7 @@
 
     secrets = "/var/lib/unison-cloud/secrets"
     api_port = ${toString cfg.cloudApi.port}
-    proxy = "http://127.0.0.1:${toString cfg.internal.outboundProxyPort}"
+    proxy = "http://127.0.0.1:${toString cfg.batteries.squid.port}"
     nodes = json.loads(${builtins.toJSON (builtins.toJSON cfg.internal.nimbusNodes)})
     daemon_unit = next(n["unit"] for n in nodes if n["type"] == "public-daemon")
     interactive_units = [n["unit"] for n in nodes if n["type"] == "interactive"]
@@ -97,7 +97,7 @@
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     machine.wait_for_unit("unison-cloud-dex.service")
     token = json.loads(machine.succeed(
-        f"hurl --connect-to ${cfg.domains.api}:${toString cfg.ingress.port}:127.0.0.1:${toString cfg.internal.dexPort} --variable api=http://127.0.0.1:{api_port}"
+        f"hurl --connect-to ${cfg.domains.api}:${toString cfg.ingress.port}:127.0.0.1:${toString cfg.batteries.dex.port} --variable api=http://127.0.0.1:{api_port}"
         f" --variable user=admin@cloud.localhost --variable verifier={verifier} --variable challenge={challenge}"
         f" --secret password=$(cat {secrets}/dex-admin-password) ${./hurl/login-loopback.hurl}"
     ))["access_token"]

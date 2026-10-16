@@ -21,7 +21,7 @@
     "consul-token"
     "sentry-dsn"
   ];
-  # Secrets nothing here generates, so each needs a supplier: you, or a bundled service.
+  # Secrets core doesn't generate, so each needs a supplier: you, or a battery.
   requiredNames =
     ["s3-access-key-id" "s3-secret-access-key" "consul-token"]
     ++ lib.optionals cfg.cloudApi.enable ["cloud-api-db-password" "oidc-client-secret"]
@@ -83,7 +83,7 @@ in {
       `cloud-hmac-key`, `cluster-token` and `internal-auth-token`. You supply
       `cloud-api-db-password`, `nimbus-db-password`, `s3-access-key-id`,
       `s3-secret-access-key`, `oidc-client-secret`, `consul-token` and, optionally,
-      `sentry-dsn`, unless a bundled service generates them.
+      `sentry-dsn`, unless a battery generates them.
       Paths are strings so the secrets never enter the Nix store.
     '';
   };
@@ -127,8 +127,8 @@ in {
     example.oidc-client-secret = "openssl rand -hex 32";
     description = ''
       Shell commands that generate secrets the module otherwise needs you to supply, by
-      name. Each runs once, in the secrets unit, unless the secret is supplied; a bundled
-      service uses it for the secrets it creates itself.
+      name. Each runs once, in the secrets unit, unless the secret is supplied; a battery
+      uses it for the secrets it creates itself.
     '';
   };
 

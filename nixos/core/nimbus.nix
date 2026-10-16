@@ -68,8 +68,8 @@
   groups);
 
   awsConfig = {
-    hostName = cfg.internal.s3.host;
-    inherit (cfg.internal.s3) port region https;
+    hostName = cfg.s3.host;
+    inherit (cfg.s3) port region https;
     service = "s3";
   };
 
@@ -159,12 +159,10 @@
         wantedBy = ["multi-user.target"];
         requires =
           ["unison-cloud-nimbus-storage.service"]
-          ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service"
-          ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
+          ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service";
         after =
           ["unison-cloud-nimbus-storage.service"]
-          ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service"
-          ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
+          ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service";
         environment = {
           HOME = "%t/unison-cloud-nimbus-${node.name}";
           NIMBUS_CONFIG_FILE = "%t/unison-cloud-nimbus-${node.name}/config.json";
@@ -345,7 +343,7 @@ in {
                 ExecStart = pkgs.writeShellScript "unison-cloud-nimbus-storage" ''
                   PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/nimbus-db-password")
                   export PGPASSWORD
-                  ${cfg.database.package}/bin/psql -X -q -v ON_ERROR_STOP=1 -f ${createTable}
+                  ${pkgs.postgresql}/bin/psql -X -q -v ON_ERROR_STOP=1 -f ${createTable}
                 '';
               }
             ];

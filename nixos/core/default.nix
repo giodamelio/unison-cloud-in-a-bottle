@@ -5,19 +5,19 @@ self: {
 }: let
   packages = self.packages.${pkgs.stdenv.hostPlatform.system};
 in {
+  # Batteries imports core too, so importing both loads core once.
+  key = "unison-cloud-nix/core";
+
   imports = [
     ./sandbox.nix
     ./secrets.nix
     ./ingress.nix
-    ./dex.nix
     ./auth.nix
-    ./caddy.nix
-    ./postgresql.nix
+    ./database.nix
     ./s3.nix
     ./consul.nix
     ./cloud-api.nix
-    ./outbound-proxy.nix
-    ./loki.nix
+    ./vector.nix
     ./nimbus.nix
   ];
 
@@ -30,7 +30,7 @@ in {
         example = "${name}.example.com";
         description =
           {
-            api = "Public hostname of cloud-api, which also serves login and the bundled Dex.";
+            api = "Public hostname of cloud-api, which also serves login.";
             apps = "Public hostname of nimbus: the deploy API and every deployed service.";
             ui = "Public hostname of the cloud web UI.";
           }.${
@@ -41,7 +41,7 @@ in {
     stateDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/unison-cloud";
-      description = "Directory holding generated secrets and the data of every bundled service.";
+      description = "Directory holding generated secrets, and the data of every battery.";
     };
 
     advertiseAddress = lib.mkOption {

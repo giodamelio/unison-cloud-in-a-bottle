@@ -6,8 +6,8 @@
 }: let
   cfg = config.services.unison-cloud;
   user = "unison-cloud-api";
-  psql = "${cfg.database.package}/bin/psql";
-  s3 = cfg.internal.s3;
+  psql = "${pkgs.postgresql}/bin/psql";
+  inherit (cfg) s3;
 
   # libpq's environment variables configure every client here: psql in the migrate and
   # seed units, and cloud-api's connection string, assembled at start.
@@ -30,7 +30,7 @@
 
   migrate = pkgs.writeShellApplication {
     name = "unison-cloud-migrate";
-    runtimeInputs = [cfg.database.package pkgs.coreutils pkgs.gnugrep];
+    runtimeInputs = [pkgs.postgresql pkgs.coreutils pkgs.gnugrep];
     text = ''
       ${exportPassword}
       sql_dir=${cfg.cloudApi.package.sql}
@@ -238,16 +238,8 @@ in {
       {
         description = "Unison Cloud API";
         wantedBy = ["multi-user.target"];
-        requires =
-          [
-            "unison-cloud-seed.service"
-          ]
-          ++ lib.optional (s3.unit != null) s3.unit;
-        after =
-          [
-            "unison-cloud-seed.service"
-          ]
-          ++ lib.optional (s3.unit != null) s3.unit;
+        requires = ["unison-cloud-seed.service"];
+        after = ["unison-cloud-seed.service"];
         environment =
           pgEnvironment
           // {
@@ -275,14 +267,11 @@ in {
             CLOUD_SECRETS_PORT = toString cfg.cloudApi.secretsPort;
 
             AWS_REGION = s3.region;
-            CLOUD_S3_ENDPOINT =
-              if cfg.s3.bundled
-              then "http://127.0.0.1:${toString cfg.internal.s3Port}"
-              else "${
-                if s3.https
-                then "https"
-                else "http"
-              }://${s3.host}:${toString s3.port}";
+            CLOUD_S3_ENDPOINT = "${
+              if s3.https
+              then "https"
+              else "http"
+            }://${s3.host}:${toString s3.port}";
             # Path style needs only the store's own name to resolve, and every S3 store
             # accepts it there; nimbus is the one that needs virtual hosts.
             CLOUD_S3_ADDRESSING = "path";

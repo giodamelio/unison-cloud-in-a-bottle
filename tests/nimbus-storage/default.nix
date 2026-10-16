@@ -9,7 +9,7 @@
     pkgs,
     ...
   }: {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     services.unison-cloud = {
       enable = true;
@@ -21,7 +21,7 @@
       };
     };
 
-    environment.systemPackages = [storageProbe pkgs.jq config.services.unison-cloud.database.package];
+    environment.systemPackages = [storageProbe pkgs.jq config.services.unison-cloud.batteries.postgresql.package];
 
     virtualisation.memorySize = 4096;
   };

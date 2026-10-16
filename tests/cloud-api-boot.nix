@@ -6,7 +6,7 @@ self: {
     pkgs,
     ...
   }: {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     services.unison-cloud = {
       enable = true;
@@ -19,7 +19,7 @@ self: {
       };
     };
 
-    environment.systemPackages = [pkgs.awscli2 pkgs.hurl config.services.unison-cloud.database.package];
+    environment.systemPackages = [pkgs.awscli2 pkgs.hurl config.services.unison-cloud.batteries.postgresql.package];
 
     # nimbus only speaks virtual-host bucket addressing, so the S3 checks use it too.
     environment.etc."aws-config".text = ''
@@ -41,7 +41,7 @@ self: {
     secrets = "/var/lib/unison-cloud/secrets"
     api_port = ${toString cfg.cloudApi.port}
     secrets_port = ${toString cfg.cloudApi.secretsPort}
-    s3_port = ${toString cfg.internal.s3Port}
+    s3_port = ${toString cfg.s3.port}
 
     def s3(args):
         return (
@@ -115,7 +115,7 @@ self: {
         machine.wait_until_succeeds(api(f"-o /dev/null -w '%{{http_code}}' http://127.0.0.1:{api_port}/v2/account | grep -q 401"), timeout=120)
 
     with subtest("the seed registers the cluster and the hash of nimbus's token"):
-        assert psql("SELECT hostname || ' ' || service_uri || ' ' || loki_uri FROM cloud_clusters WHERE id = 'd3ee426c-c252-4910-a861-08fccf85fb66'") == "cloud.test https://apps.test http://127.0.0.1:${toString cfg.internal.lokiPort}"
+        assert psql("SELECT hostname || ' ' || service_uri || ' ' || loki_uri FROM cloud_clusters WHERE id = 'd3ee426c-c252-4910-a861-08fccf85fb66'") == "cloud.test https://apps.test ${cfg.logs.lokiUrl}"
         token = machine.succeed(f"cat {secrets}/cluster-token").strip()
         expected = machine.succeed(f"printf %s {token} | sha512sum").split()[0]
         assert psql("SELECT token_hash FROM cloud_cluster_tokens") == expected
@@ -146,12 +146,12 @@ self: {
         )
         assert psql("SELECT count(*) FROM users WHERE handle = 'forged'") == "0"
 
-    with subtest("the bundled services and the secrets listener listen on loopback only"):
+    with subtest("the batteries and the secrets listener listen on loopback only"):
         listeners = [l.rsplit(":", 1) for l in machine.succeed("ss -Hltn | awk '{print $4}'").split()]
         ports = [
-            s3_port, 8500, secrets_port,
-            ${toString cfg.database.port}, ${toString cfg.internal.lokiPort}, ${toString cfg.internal.lokiGrpcPort},
-            ${toString cfg.internal.dexPort}, ${toString cfg.internal.outboundProxyPort},
+            s3_port, ${toString cfg.batteries.consul.port}, secrets_port,
+            ${toString cfg.database.port}, ${toString cfg.batteries.loki.port}, ${toString cfg.batteries.loki.grpcPort},
+            ${toString cfg.batteries.dex.port}, ${toString cfg.batteries.squid.port},
         ]
         for port in ports:
             addresses = [address for address, p in listeners if p == str(port)]

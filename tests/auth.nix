@@ -11,7 +11,7 @@ self: {
       printf %s ${password} | ${pkgs.mkpasswd}/bin/mkpasswd -m bcrypt -R 10 -s > $out
     ''}";
   in {
-    imports = [self.nixosModules.default];
+    imports = [self.nixosModules.core self.nixosModules.batteries];
 
     services.unison-cloud = {
       enable = true;
@@ -24,7 +24,7 @@ self: {
       };
       # A non-default port proves every redirect carries it.
       ingress.port = 8443;
-      auth.dex.users = [
+      batteries.dex.users = [
         {
           email = "alice@example.com";
           username = "alice";
@@ -44,7 +44,7 @@ self: {
 
     networking.hosts."127.0.0.1" = ["cloud.test" "ui.test" "apps.test"];
 
-    environment.systemPackages = [pkgs.hurl config.services.unison-cloud.database.package];
+    environment.systemPackages = [pkgs.hurl config.services.unison-cloud.batteries.postgresql.package];
 
     # Stands in for the listener ucm opens on a loopback port during `auth.login`.
     systemd.services.redirect-catcher = {

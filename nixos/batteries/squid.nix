@@ -5,13 +5,14 @@
   ...
 }: let
   cfg = config.services.unison-cloud;
+  battery = cfg.batteries.squid;
   proxyUser = "unison-cloud-outbound-proxy";
   nimbusUnits = lib.optionals cfg.nimbus.enable (map (node: node.unit) cfg.internal.nimbusNodes);
 
   # Adapted from upstream's cloud-api/outbound-proxy/squid.conf, without its allowlist of
   # internal hosts: nimbus's own traffic never goes through this proxy (nimbus patch 0002).
   squidConfig = pkgs.writeText "unison-cloud-squid.conf" ''
-    http_port 127.0.0.1:${toString cfg.internal.outboundProxyPort}
+    http_port 127.0.0.1:${toString battery.port}
 
     pid_filename none
     coredump_dir none
@@ -61,18 +62,27 @@
     http_upgrade_request_protocols WebSocket allow all
   '';
 in {
-  options.services.unison-cloud.internal.outboundProxyPort = lib.mkOption {
-    type = lib.types.port;
-    internal = true;
-    readOnly = true;
-    default = 24155;
-    description = "Port of the outbound proxy hosted code's requests go through, on loopback.";
+  options.services.unison-cloud.batteries.squid = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run Squid on loopback as nimbus's outbound proxy, so hosted code reaches the
+        internet but never loopback or private addresses.
+      '';
+    };
+
+    port = lib.mkOption {
+      type = lib.types.port;
+      default = 24155;
+      description = "Port of the outbound proxy, on loopback.";
+    };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf (cfg.enable && battery.enable) {
     services.unison-cloud.nimbus.outboundProxy = lib.mkDefault {
       host = "127.0.0.1";
-      port = cfg.internal.outboundProxyPort;
+      inherit (battery) port;
     };
 
     users.users.${proxyUser} = {
