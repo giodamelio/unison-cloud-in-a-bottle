@@ -321,7 +321,7 @@ in {
           after = ["unison-cloud-consul-acl.service"];
         };
 
-        unison-cloud-api = {
+        unison-cloud-api = lib.mkIf cfg.cloudApi.enable {
           requires = ["unison-cloud-consul-acl.service"];
           after = ["unison-cloud-consul-acl.service"];
         };

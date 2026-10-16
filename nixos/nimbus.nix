@@ -88,58 +88,59 @@
   };
 
   nodeConfig = node:
-    pkgs.writeText "unison-cloud-nimbus-${node.name}.json" (builtins.toJSON {
-      host = "127.0.0.1";
-      inherit (node) nodeId;
-      nodeType = node.type;
-      bindPorts = node.ports;
-      clusterMap = {};
-      tcpConfig.type = "everybody";
-      outboundProxy = {
-        host = "127.0.0.1";
-        port = cfg.internal.outboundProxyPort;
-      };
-      cors = {
-        origins.${cfg.internal.publicUrl.ui} = false;
-        allowHeaders = ["Authorization"];
-        exposeHeaders = ["Content-Encoding"];
-        varyOrigin = true;
-      };
-      shards = {
-        shardCount = 1;
-        logicalLocationCount = node.count;
-        allocationIndex = node.index;
-      };
-      blobFetcher = {
-        bucket = cfg.s3.buckets.services;
-        inherit awsConfig;
-      };
-      userBlobFetcher = {
-        bucket = cfg.s3.buckets.userBlobs;
-        inherit awsConfig;
-      };
-      dynamo =
-        {type = "postgres";}
-        // db;
-      vault = {
-        host = "127.0.0.1";
-        port = cfg.cloudApi.secretsPort;
-        scheme = "http";
-      };
-      cloudApiInstances = [{uri = "http://127.0.0.1:${toString cfg.cloudApi.port}";}];
-      # The client's `Cloud.logs` gets a token from cloud-api and then asks nimbus, which
-      # queries Loki itself; the labels are the ones the log shipper sets.
-      logs.provider = {
-        type = "loki";
-        uri = "http://127.0.0.1:${toString cfg.internal.lokiPort}";
-        labels = {
-          job = "nomad_allocs";
-          namespace = "user";
-          task_name = "nimbus";
+    pkgs.writeText "unison-cloud-nimbus-${node.name}.json" (builtins.toJSON ({
+        host = cfg.advertiseAddress;
+        inherit (node) nodeId;
+        nodeType = node.type;
+        bindPorts = node.ports;
+        clusterMap = {};
+        tcpConfig.type = "everybody";
+        cors = {
+          origins.${cfg.internal.publicUrl.ui} = false;
+          allowHeaders = ["Authorization"];
+          exposeHeaders = ["Content-Encoding"];
+          varyOrigin = true;
         };
-      };
-      blockedUsers = map (lib.replaceStrings ["-"] [""]) cfg.nimbus.blockedUsers;
-    });
+        shards = {
+          shardCount = 1;
+          logicalLocationCount = node.count;
+          allocationIndex = node.index;
+        };
+        blobFetcher = {
+          bucket = cfg.s3.buckets.services;
+          inherit awsConfig;
+        };
+        userBlobFetcher = {
+          bucket = cfg.s3.buckets.userBlobs;
+          inherit awsConfig;
+        };
+        dynamo =
+          {type = "postgres";}
+          // db;
+        vault = {
+          host = cfg.nimbus.cloudApiHost;
+          port = cfg.cloudApi.secretsPort;
+          scheme = "http";
+        };
+        cloudApiInstances = [{uri = "http://${cfg.nimbus.cloudApiHost}:${toString cfg.cloudApi.port}";}];
+        # The client's `Cloud.logs` gets a token from cloud-api and then asks nimbus, which
+        # queries Loki itself; the labels are the ones the log shipper sets.
+        logs.provider = {
+          type = "loki";
+          uri = cfg.logs.lokiUrl;
+          labels = {
+            job = "nomad_allocs";
+            namespace = "user";
+            task_name = "nimbus";
+          };
+        };
+        blockedUsers = map (lib.replaceStrings ["-"] [""]) cfg.nimbus.blockedUsers;
+      }
+      # nimbus reads the proxy as optional, so leaving the key out sends hosted code's
+      # requests straight out.
+      // lib.optionalAttrs (cfg.nimbus.outboundProxy != null) {
+        inherit (cfg.nimbus) outboundProxy;
+      }));
 
   # Secrets stay out of the store: the generated config is merged with them at start.
   renderConfig = node:
@@ -171,18 +172,12 @@
         description = "Unison Cloud nimbus node ${node.name}";
         wantedBy = ["multi-user.target"];
         requires =
-          [
-            "unison-cloud-nimbus-storage.service"
-            "unison-cloud-outbound-proxy.service"
-            "unison-cloud-api.service"
-          ]
+          ["unison-cloud-nimbus-storage.service"]
+          ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service"
           ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
         after =
-          [
-            "unison-cloud-nimbus-storage.service"
-            "unison-cloud-outbound-proxy.service"
-            "unison-cloud-api.service"
-          ]
+          ["unison-cloud-nimbus-storage.service"]
+          ++ lib.optional cfg.cloudApi.enable "unison-cloud-api.service"
           ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
         environment = {
           HOME = "%t/unison-cloud-nimbus-${node.name}";
@@ -261,6 +256,34 @@ in {
         description = "IDs of users nimbus refuses to run code for.";
       };
 
+      cloudApiHost = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1";
+        description = ''
+          Address the nodes reach cloud-api's HTTP port and secrets listener at. Set it to
+          the cloud-api host's address when this host runs `cloudApi.enable = false`.
+        '';
+      };
+
+      outboundProxy = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            host = lib.mkOption {type = lib.types.str;};
+            port = lib.mkOption {type = lib.types.port;};
+          };
+        });
+        default = null;
+        example = {
+          host = "127.0.0.1";
+          port = 3128;
+        };
+        description = ''
+          HTTP proxy hosted code's outbound requests go through. With `null`, hosted code
+          connects directly, to anything this host can reach. nimbus's own storage traffic
+          never uses the proxy (nimbus patch 0002).
+        '';
+      };
+
       basePort = lib.mkOption {
         type = lib.types.port;
         default = 24200;
@@ -281,6 +304,13 @@ in {
   };
 
   config = lib.mkIf (cfg.enable && cfg.nimbus.enable) {
+    assertions = [
+      {
+        assertion = cfg.cloudApi.enable || !(lib.hasPrefix "127." cfg.nimbus.cloudApiHost || cfg.nimbus.cloudApiHost == "localhost" || cfg.nimbus.cloudApiHost == "::1");
+        message = "services.unison-cloud: with cloudApi.enable = false, set nimbus.cloudApiHost to the address of the host that runs cloud-api.";
+      }
+    ];
+
     users.users.${user} = {
       isSystemUser = true;
       group = user;
@@ -316,7 +346,7 @@ in {
       map (node: {
         ID = "${cfg.consul.prefix}-nimbus-client-${node.name}";
         Name = "${cfg.consul.prefix}-nimbus-client";
-        Address = "127.0.0.1";
+        Address = cfg.advertiseAddress;
         Port = node.ports.client;
         Checks = [
           {

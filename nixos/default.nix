@@ -46,6 +46,26 @@ in {
       description = "Directory holding generated secrets and the data of every bundled service.";
     };
 
+    advertiseAddress = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1";
+      example = "10.0.0.5";
+      description = ''
+        Address other hosts reach this host's cloud-api and nimbus nodes at. nimbus
+        advertises it, cloud-api hands it to the cloud client for its TCP listener, and
+        the Consul registrations carry it.
+      '';
+    };
+
+    logs.lokiUrl = lib.mkOption {
+      type = lib.types.str;
+      example = "http://127.0.0.1:3100";
+      description = ''
+        Base URL of the Loki that Vector ships nimbus's logs to, and that cloud-api and
+        nimbus query for a user's logs.
+      '';
+    };
+
     network.namespace = lib.mkOption {
       type = lib.types.str;
       default = "unison-cloud";

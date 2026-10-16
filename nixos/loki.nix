@@ -75,7 +75,7 @@
     sinks.loki = {
       type = "loki";
       inputs = ["user_lines"];
-      endpoint = "http://127.0.0.1:${toString cfg.internal.lokiPort}";
+      endpoint = cfg.logs.lokiUrl;
       encoding.codec = "text";
       labels = {
         job = "nomad_allocs";
@@ -110,6 +110,8 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    services.unison-cloud.logs.lokiUrl = lib.mkDefault "http://127.0.0.1:${toString cfg.internal.lokiPort}";
+
     users.users.${lokiUser} = {
       isSystemUser = true;
       group = lokiUser;

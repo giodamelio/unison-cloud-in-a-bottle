@@ -91,7 +91,7 @@
     VALUES (
       '${clusterId}', 'default', '${cfg.domains.api}', 'local',
       '${cfg.internal.publicUrl.apps}', '${cfg.internal.publicUrl.apps}',
-      'http://127.0.0.1:${toString cfg.internal.lokiPort}', 'nimbus', '${systemUserId}', '${systemUserId}'
+      '${cfg.logs.lokiUrl}', 'nimbus', '${systemUserId}', '${systemUserId}'
     )
     ON CONFLICT (id) DO UPDATE SET
       hostname = EXCLUDED.hostname,
@@ -142,6 +142,15 @@ in {
   };
 
   options.services.unison-cloud.cloudApi = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run cloud-api on this host. With `false`, the host runs only nimbus nodes, which
+        reach the cloud-api at `nimbus.cloudApiHost`.
+      '';
+    };
+
     port = lib.mkOption {
       type = lib.types.port;
       default = 24100;
@@ -159,9 +168,18 @@ in {
       default = 24102;
       description = "Port of cloud-api's Vault-compatible secrets listener, which nimbus uses.";
     };
+
+    secretsListenAddress = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1";
+      description = ''
+        Address the secrets listener binds. It answers only requests carrying the cluster
+        token, but keep it on loopback unless nimbus nodes on other hosts need it.
+      '';
+    };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf (cfg.enable && cfg.cloudApi.enable) {
     users.users.${user} = {
       isSystemUser = true;
       group = user;
@@ -177,7 +195,7 @@ in {
         {
           ID = "${cfg.consul.prefix}-cloud-api";
           Name = "${cfg.consul.prefix}-cloud-api";
-          Address = "127.0.0.1";
+          Address = cfg.advertiseAddress;
           Port = cfg.cloudApi.port;
           Checks = [
             {
@@ -268,7 +286,7 @@ in {
             CLOUD_API_SUFFIX = cfg.domains.api;
 
             NOMAD_ALLOC_PORT_cloud_http = toString cfg.cloudApi.port;
-            NOMAD_HOST_IP_cloud_tcp = "127.0.0.1";
+            NOMAD_HOST_IP_cloud_tcp = cfg.advertiseAddress;
             NOMAD_ALLOC_PORT_cloud_tcp = toString cfg.cloudApi.clientPort;
 
             CLOUD_POSTGRES_CONN_MAX = "10";
@@ -276,7 +294,7 @@ in {
             CLOUD_CONSUL_PREFIX = cfg.consul.prefix;
 
             CLOUD_ENVIRONMENTS_MOUNT = "environments";
-            CLOUD_SECRETS_HOST = "127.0.0.1";
+            CLOUD_SECRETS_HOST = cfg.cloudApi.secretsListenAddress;
             CLOUD_SECRETS_PORT = toString cfg.cloudApi.secretsPort;
 
             AWS_REGION = s3.region;

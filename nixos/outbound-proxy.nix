@@ -9,6 +9,7 @@
   resolverUser = "unison-cloud-resolver";
   resolverDir = "${cfg.stateDir}/resolver";
   bundledResolver = cfg.egress.nameservers == [];
+  nimbusUnits = lib.optionals cfg.nimbus.enable (map (node: node.unit) cfg.internal.nimbusNodes);
 
   # Adapted from upstream's cloud-api/outbound-proxy/squid.conf, without its allowlist of
   # internal hosts: nimbus's own traffic never goes through this proxy (nimbus patch 0002).
@@ -106,6 +107,10 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    services.unison-cloud.nimbus.outboundProxy = lib.mkDefault {
+      host = "127.0.0.1";
+      port = cfg.internal.outboundProxyPort;
+    };
     # Only the proxy, and the resolver it asks, may send traffic out of the namespace.
     services.unison-cloud.internal.egressUsers = [proxyUser] ++ lib.optional bundledResolver resolverUser;
 
@@ -139,6 +144,8 @@ in {
       {
         description = "Unison Cloud outbound proxy for hosted code (Squid)";
         wantedBy = ["multi-user.target"];
+        requiredBy = nimbusUnits;
+        before = nimbusUnits;
         requires = lib.optional bundledResolver "unison-cloud-resolver.service";
         after = lib.optional bundledResolver "unison-cloud-resolver.service";
         serviceConfig = {

@@ -165,7 +165,7 @@ in {
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf (cfg.enable && cfg.cloudApi.enable) {
     assertions = [
       {
         assertion = dex.enable || (oidc.issuer != null && oidc.clientId != null);
