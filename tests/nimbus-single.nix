@@ -105,11 +105,9 @@
         hello = deploy("hello")
         hurl("${./hurl/service.hurl}", url=hello["url"], expected="hello from deploy-program")
 
-    with subtest("transactional storage goes through ExtendDB"):
+    with subtest("transactional storage goes through nimbus's PostgreSQL table"):
         deploy("storage")
-        tables = psql("unison-cloud-extenddb", "extenddb", "SELECT tablename FROM pg_tables WHERE tablename LIKE '\\_ddb\\_%'").split()
-        assert len(tables) == 1, tables
-        rows = psql("unison-cloud-extenddb", "extenddb", f"SELECT count(*) FROM \"{tables[0]}\" WHERE sk_s LIKE '%:deploy-program'")
+        rows = psql("unison-cloud-postgres", "unison_cloud_nimbus", "SELECT count(*) FROM nimbus_kv WHERE ns LIKE '%:deploy-program'")
         assert int(rows) >= 1, rows
 
     with subtest("environment variables go through cloud-api's secrets listener"):
@@ -141,8 +139,8 @@
         assert through_proxy("http://10.0.2.2/") == "403"
         assert through_proxy("http://169.254.169.254/latest/meta-data/") == "403"
         # The namespace's /etc/hosts names don't resolve through the proxy at all.
-        assert through_proxy("http://extenddb.unison-cloud.internal:18443/") in ("403", "503"), "extenddb"
-        machine.fail(ns("curl -sf -x http://127.0.0.1:3128 -p https://127.0.0.1:18443/"))
+        assert through_proxy("http://localhost:5432/") in ("403", "503"), "localhost"
+        machine.fail(ns("curl -sf -x http://127.0.0.1:3128 -p https://127.0.0.1:5432/"))
 
     with subtest("the nimbus user can't reach Consul even without the proxy"):
         machine.fail(ns("sudo -u unison-cloud-nimbus curl -sf -m 5 http://127.0.0.1:8500/v1/status/leader"))

@@ -80,7 +80,8 @@
         CREATE EXTENSION "uuid-ossp";
         CREATE EXTENSION citext;
         CREATE EXTENSION moddatetime;
-        CREATE ROLE extenddb LOGIN CREATEDB PASSWORD 'extenddb-password';
+        CREATE ROLE unison_cloud_nimbus LOGIN PASSWORD 'nimbus-password';
+        CREATE DATABASE unison_cloud_nimbus OWNER unison_cloud_nimbus;
       '';
     };
   };
@@ -133,7 +134,7 @@
         external = {
           host = nodes.db.networking.primaryIPAddress;
           cloudApi.passwordFile = "/etc/unison-cloud-secrets/cloud-api-db";
-          extenddb.passwordFile = "/etc/unison-cloud-secrets/extenddb-db";
+          nimbus.passwordFile = "/etc/unison-cloud-secrets/nimbus-db";
         };
       };
       # The test network is a private range, which egress otherwise refuses.
@@ -148,7 +149,7 @@
     systemd.tmpfiles.rules = [
       "d /etc/unison-cloud-secrets 0700 root root"
       "f+ /etc/unison-cloud-secrets/cloud-api-db 0600 root root - cloud-api-password"
-      "f+ /etc/unison-cloud-secrets/extenddb-db 0600 root root - extenddb-password"
+      "f+ /etc/unison-cloud-secrets/nimbus-db 0600 root root - nimbus-password"
       "f+ /etc/unison-cloud-secrets/s3-access-key-id 0600 root root - AKIAEXTERNALS3TEST00"
       "f+ /etc/unison-cloud-secrets/s3-secret-access-key 0600 root root - external-s3-secret"
     ];
@@ -182,12 +183,9 @@
     machine.wait_until_succeeds(f"curl -s {sock} -o /dev/null -w '%{{http_code}}' http://x/v2/account | grep -q 401", timeout=120)
 
     with subtest("the module's databases live in the host's Postgres"):
-        assert machine.succeed("sudo -u postgres psql -XtA -c \"SELECT count(*) FROM pg_database WHERE datname IN ('unison_cloud', 'extenddb', 'extenddb_catalog')\"").strip() == "3"
+        assert machine.succeed("sudo -u postgres psql -XtA -c \"SELECT string_agg(datname, ',') FROM pg_database WHERE datname LIKE 'unison_cloud%'\"").strip() == "unison_cloud"
         assert int(psql("SELECT count(*) FROM selfhost.applied_migrations")) > 0
         machine.fail("systemctl is-active unison-cloud-postgresql.service")
-
-    with subtest("ExtendDB initialised in the host's Postgres and created nimbus's table"):
-        machine.wait_for_unit("unison-cloud-extenddb-setup.service")
 
     with subtest("supplied secrets are used verbatim"):
         expected = machine.succeed("printf %s supplied-cluster-token | sha512sum").split()[0]
@@ -206,9 +204,9 @@
         db.wait_for_open_port(5432)
         external.wait_for_unit("unison-cloud-api.service")
         external.wait_until_succeeds("curl -s --unix-socket /run/unison-cloud/cloud-api.sock -H 'Host: cloud.localhost' -o /dev/null -w '%{http_code}' http://x/v2/account | grep -q 401", timeout=180)
-        external.wait_for_unit("unison-cloud-extenddb-setup.service")
+        external.wait_for_unit("unison-cloud-nimbus-storage.service")
         assert int(db.succeed("sudo -u postgres psql -d unison_cloud -XtA -c 'SELECT count(*) FROM selfhost.applied_migrations'").strip()) > 0
-        assert db.succeed("sudo -u postgres psql -XtA -c \"SELECT count(*) FROM pg_database WHERE datname LIKE 'extenddb%'\"").strip() == "2"
+        assert db.succeed("sudo -u postgres psql -d unison_cloud_nimbus -XtA -c \"SELECT tableowner FROM pg_tables WHERE tablename = 'nimbus_kv'\"").strip() == "unison_cloud_nimbus"
         external.fail("systemctl is-active unison-cloud-postgresql.service")
 
     with subtest("a deploy stores its code in the external S3, reached through the bridge"):

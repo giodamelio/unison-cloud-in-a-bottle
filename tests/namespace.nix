@@ -92,7 +92,8 @@ in {
 
     environment.systemPackages = [pkgs.curl pkgs.python3];
 
-    virtualisation.memorySize = 3072;
+    # The whole stack boots here, and three nimbus nodes alone take about 2.5 GiB.
+    virtualisation.memorySize = 4096;
   };
 
   testScript = {nodes, ...}: ''

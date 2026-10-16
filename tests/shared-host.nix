@@ -6,6 +6,7 @@
   # Commands run inside a unit's sandbox, where /run/current-system is hidden.
   bin = {
     cat = "${pkgs.coreutils}/bin/cat";
+    env = "${pkgs.coreutils}/bin/env";
     test = "${pkgs.coreutils}/bin/test";
     getent = "${pkgs.getent}/bin/getent";
     socat = "${pkgs.socat}/bin/socat";
@@ -123,7 +124,6 @@ in {
         mode = "host";
         package = config.services.postgresql.package;
       };
-      extenddb.database = "unison_cloud_extenddb";
     };
 
     services.caddy = {
@@ -348,7 +348,7 @@ in {
 
     with subtest("only cloud-api may use the login provider's bridge"):
         machine.succeed(as_user("unison-cloud-api", "curl -sf -m 5 -o /dev/null http://127.0.0.1:5427/keys"))
-        for user in ["unison-cloud-nimbus", "unison-cloud-extenddb", "root"]:
+        for user in ["unison-cloud-nimbus", "unison-cloud-outbound-proxy", "root"]:
             machine.fail(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:5427/keys"))
         # The public issuer itself is unreachable from the namespace, and cloud-api has no egress.
         machine.fail(as_user("unison-cloud-api", f"curl -s -m 5 --cacert {ca} -o /dev/null https://login.test/"))
@@ -357,8 +357,13 @@ in {
     with subtest("only cloud-api and nimbus may use the S3 bridge"):
         for user in ["unison-cloud-api", "unison-cloud-nimbus"]:
             machine.succeed(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:7070/"))
-        for user in ["unison-cloud-extenddb", "unison-cloud-outbound-proxy", "root"]:
+        for user in ["unison-cloud-outbound-proxy", "root"]:
             machine.fail(as_user(user, "curl -s -m 5 -o /dev/null http://127.0.0.1:7070/"))
+
+    with subtest("only nimbus may use the PostgreSQL bridge"):
+        machine.succeed(as_user("unison-cloud-nimbus", "bash -c ': </dev/tcp/127.0.0.1/5432'"))
+        for user in ["unison-cloud-api", "unison-cloud-outbound-proxy", "root"]:
+            machine.fail(as_user(user, "timeout 5 bash -c ': </dev/tcp/127.0.0.1/5432'"))
 
     with subtest("the bridges expose nothing on the host"):
         machine.fail("ss -Hltn | grep -E ':(5427|7070) '")
@@ -417,15 +422,25 @@ in {
         assert psql("postgres", "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'unrelated'") == "unrelated"
         assert psql("postgres", "SELECT rolsuper OR rolcreaterole OR rolcreatedb FROM pg_roles WHERE rolname = 'unrelated'") == "f"
         roles = psql("postgres", "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname LIKE 'unison-cloud-%' ORDER BY rolname")
-        assert roles == "unison-cloud-api|f|f|f\nunison-cloud-extenddb|f|f|t", roles
+        assert roles == "unison-cloud-api|f|f|f\nunison-cloud-nimbus|f|f|f", roles
         dbs = psql("postgres", "SELECT datname FROM pg_database WHERE datname LIKE 'unison_cloud%' ORDER BY datname")
-        assert dbs == "unison_cloud\nunison_cloud_extenddb\nunison_cloud_extenddb_catalog", dbs
+        assert dbs == "unison_cloud\nunison_cloud_nimbus", dbs
+        owner = psql("unison_cloud_nimbus", "SELECT tableowner FROM pg_tables WHERE tablename = 'nimbus_kv'")
+        assert owner == "unison-cloud-nimbus", owner
         extensions = psql("unison_cloud", "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname")
         assert extensions == "citext\nmoddatetime\nuuid-ossp", extensions
         assert machine.succeed("grep -c unison \"$(sudo -u postgres psql -XtA -c 'SHOW hba_file')\" || true").strip() == "0"
 
-    with subtest("nimbus can't connect to the host's PostgreSQL"):
+    with subtest("nimbus reaches the host's PostgreSQL only through the bridge, as its own role"):
         machine.fail(in_sandbox(interactive, "${bin.psql} -h /run/postgresql -d postgres -c 'SELECT 1'"))
+        machine.fail(in_sandbox(interactive, "${bin.psql} -h 127.0.0.1 -d unison_cloud_nimbus -U unison-cloud-nimbus -w -c 'SELECT 1'"))
+        password = machine.succeed(f"cat {secrets}/nimbus-db-password").strip()
+        connect = f"${bin.env} PGPASSWORD={password} ${bin.psql} -h 127.0.0.1 -U unison-cloud-nimbus -XtA -v ON_ERROR_STOP=1"
+        machine.succeed(in_sandbox(interactive, f"{connect} -d unison_cloud_nimbus -c 'SELECT count(*) FROM nimbus_kv'"))
+        machine.fail(in_sandbox(interactive, f"{connect} -d unison_cloud -c 'SELECT count(*) FROM selfhost.environment_secrets'"))
+
+    with subtest("cloud-api's role can't read nimbus's table"):
+        machine.fail("sudo -u unison-cloud-api psql -h /run/postgresql -d unison_cloud_nimbus -XtA -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM nimbus_kv'")
 
     with subtest("with the bundled Dex off, none of it runs or exists"):
         machine.fail("systemctl cat unison-cloud-dex.service")

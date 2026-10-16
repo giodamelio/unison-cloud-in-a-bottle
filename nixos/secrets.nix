@@ -16,9 +16,7 @@
     "redis-password"
     "s3-access-key-id"
     "s3-secret-access-key"
-    "extenddb-access-key-id"
-    "extenddb-secret-access-key"
-    "extenddb-admin-password"
+    "nimbus-db-password"
     "dex-client-secret"
   ];
 
@@ -48,18 +46,16 @@
         fi
       }
 
-      # AWS-shaped, so SDKs and ExtendDB's import validation accept it.
+      # AWS-shaped, so SDKs accept it.
       access_key_id() {
         printf AKIA
         openssl rand -hex 8 | tr a-f A-F
       }
 
-      ${gen "extenddb-admin-password" "openssl rand -hex 24"}
-      ${gen "extenddb-access-key-id" "access_key_id"}
-      ${gen "extenddb-secret-access-key" "openssl rand -hex 20"}
       ${gen "s3-access-key-id" "access_key_id"}
       ${gen "s3-secret-access-key" "openssl rand -hex 20"}
       ${gen "redis-password" "openssl rand -hex 24"}
+      ${lib.optionalString (!cfg.internal.postgres.external) (gen "nimbus-db-password" "openssl rand -hex 24")}
       # cloud-api reads its Ed25519 keys as the raw bytes of an environment variable and
       # needs exactly 32 of them, so they must be printable: 24 random bytes in base64.
       ${gen "cloud-eddsa-key" "openssl rand -base64 24"}
@@ -75,29 +71,6 @@
           mv dex-admin-password.bcrypt.tmp dex-admin-password.bcrypt
         fi
       ''}
-
-      if [ ! -e ca.crt ]; then
-        openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-          -keyout ca.key -out ca.crt.tmp -days 36500 -subj "/CN=Unison Cloud internal CA" \
-          -addext "basicConstraints=critical,CA:TRUE" \
-          -addext "keyUsage=critical,keyCertSign,cRLSign"
-        mv ca.crt.tmp ca.crt
-      fi
-
-      if [ ! -e extenddb.crt ]; then
-        openssl req -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-          -keyout extenddb.key -out extenddb.csr -subj "/CN=extenddb"
-        openssl x509 -req -in extenddb.csr -CA ca.crt -CAkey ca.key -out extenddb.crt.tmp -days 36500 \
-          -extfile <(printf '%s\n' \
-            "basicConstraints=critical,CA:FALSE" \
-            "keyUsage=critical,digitalSignature" \
-            "extendedKeyUsage=serverAuth" \
-            "subjectKeyIdentifier=hash" \
-            "authorityKeyIdentifier=keyid" \
-            "subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:${cfg.internal.extenddbHost}")
-        rm extenddb.csr
-        mv extenddb.crt.tmp extenddb.crt
-      fi
     '';
   };
 in {
@@ -113,8 +86,8 @@ in {
       start copies each file over the generated one; the rest are generated once and kept.
       Names: `cloud-eddsa-key`, `share-eddsa-key` (32 printable bytes each), `cloud-hmac-key`,
       `cluster-token`, `internal-auth-token`, `redis-password`, `s3-access-key-id`,
-      `s3-secret-access-key`, `extenddb-access-key-id`, `extenddb-secret-access-key`,
-      `extenddb-admin-password`, `dex-client-secret`, `dex-admin-password`.
+      `s3-secret-access-key`, `nimbus-db-password`, `dex-client-secret`,
+      `dex-admin-password`.
       Paths are strings so the secrets never enter the Nix store.
     '';
   };

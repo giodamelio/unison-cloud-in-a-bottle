@@ -19,9 +19,6 @@
     cloud-api.flake = false;
 
     stacklock2nix.url = "github:cdepillabout/stacklock2nix/v5.2.3";
-
-    extenddb.url = "github:ExtendDB/extenddb/v0.1.13";
-    extenddb.flake = false;
   };
 
   outputs = inputs: let
@@ -90,8 +87,6 @@
         pkgs.writeText "lint-eval-demo-aarch64"
         (builtins.unsafeDiscardStringContext inputs.self.nixosConfigurations.demo-aarch64-linux.config.system.build.vm.drvPath);
 
-      extenddb = pkgs.testers.runNixOSTest (import ./tests/extenddb.nix inputs.self);
-
       cloud-api-boot = pkgs.testers.runNixOSTest (import ./tests/cloud-api-boot.nix inputs.self);
 
       auth = pkgs.testers.runNixOSTest (import ./tests/auth.nix inputs.self);
@@ -105,9 +100,9 @@
 
       namespace = pkgs.testers.runNixOSTest (import ./tests/namespace.nix inputs.self);
 
-      nimbus-dynamo = pkgs.testers.runNixOSTest (import ./tests/nimbus-dynamo {
+      nimbus-storage = pkgs.testers.runNixOSTest (import ./tests/nimbus-storage {
         inherit (inputs) self;
-        dynamoProbe = pkgs.callPackage ./tests/nimbus-dynamo/probe.nix {
+        storageProbe = pkgs.callPackage ./tests/nimbus-storage/probe.nix {
           inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
           inherit (inputs.self.packages.${pkgs.stdenv.hostPlatform.system}) nimbus;
         };
@@ -167,15 +162,6 @@
       cloud-api = pkgs.callPackage ./nix/cloud-api {
         src = inputs.cloud-api;
         stacklock2nix = pkgs.callPackage "${inputs.stacklock2nix}/nix/build-support/stacklock2nix" {};
-      };
-
-      extenddb = pkgs.callPackage ./nix/extenddb {
-        src = inputs.extenddb;
-        gitRev = inputs.extenddb.shortRev;
-        buildTime = let
-          d = inputs.extenddb.lastModifiedDate;
-          s = builtins.substring;
-        in "${s 0 4 d}-${s 4 2 d}-${s 6 2 d}T${s 8 2 d}:${s 10 2 d}:${s 12 2 d}Z";
       };
 
       nimbus = pkgs.callPackage ./nix/nimbus {

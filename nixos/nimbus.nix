@@ -6,9 +6,39 @@
 }: let
   cfg = config.services.unison-cloud;
   user = "unison-cloud-nimbus";
-  secrets = "${cfg.stateDir}/secrets";
-  caBundleDir = "/run/unison-cloud-nimbus";
   curl = lib.getExe pkgs.curl;
+
+  pg = cfg.internal.postgres;
+  ext = cfg.database.external.nimbus;
+  # nimbus's sandbox forbids unix sockets, so it logs in over TCP with a password even
+  # where every other service uses peer authentication.
+  db = {
+    inherit (cfg.internal.postgresTcp) host port;
+    user =
+      if pg.external
+      then ext.user
+      else user;
+    database =
+      if pg.external
+      then ext.database
+      else "unison_cloud_nimbus";
+    table = "nimbus_kv";
+  };
+  dbPassword =
+    if pg.external
+    then {LoadCredential = ["nimbus-db-password:${ext.passwordFile}"];}
+    else cfg.internal.loadSecrets ["nimbus-db-password"];
+
+  createTable = pkgs.writeText "unison-cloud-nimbus-storage.sql" ''
+    CREATE TABLE IF NOT EXISTS ${db.table} (
+      k  bytea  NOT NULL,
+      ns text   NOT NULL,
+      v  bytea  NOT NULL,
+      t  bigint NOT NULL,
+      fk bytea,
+      PRIMARY KEY (k, ns)
+    );
+  '';
 
   # Fixed so a node keeps its identity across restarts; nimbus picks a random one otherwise.
   nodeId = name: let
@@ -88,12 +118,9 @@
         bucket = cfg.s3.buckets.userBlobs;
         inherit awsConfig;
       };
-      dynamo = {
-        type = "local-https";
-        host = cfg.internal.extenddbHost;
-        port = cfg.extenddb.port;
-        table = cfg.extenddb.tableName;
-      };
+      dynamo =
+        {type = "postgres";}
+        // db;
       vault = {
         host = "127.0.0.1";
         port = cfg.internal.secretsPort;
@@ -121,14 +148,14 @@
       creds=$CREDENTIALS_DIRECTORY
       ${lib.getExe pkgs.jq} \
         --rawfile s3Id "$creds/s3-access-key-id" --rawfile s3Secret "$creds/s3-secret-access-key" \
-        --rawfile dynamoId "$creds/extenddb-access-key-id" --rawfile dynamoSecret "$creds/extenddb-secret-access-key" \
+        --rawfile dbPassword "$creds/nimbus-db-password" \
         --rawfile token "$creds/cluster-token" \
         'def trim: rtrimstr("\n");
          def s3: {awsConfig: {credentials: {accessKey: ($s3Id | trim), secretKey: ($s3Secret | trim)}}};
          . * {
            blobFetcher: s3,
            userBlobFetcher: s3,
-           dynamo: {credentials: {accessKey: ($dynamoId | trim), secretKey: ($dynamoSecret | trim)}},
+           dynamo: {password: ($dbPassword | trim)},
            vault: {token: ($token | trim)},
            cloudApiToken: ($token | trim)
          }' ${nodeConfig node} > "$RUNTIME_DIRECTORY/config.json.tmp"
@@ -145,16 +172,14 @@
         wantedBy = ["multi-user.target"];
         requires =
           [
-            "unison-cloud-nimbus-ca.service"
-            "unison-cloud-extenddb-setup.service"
+            "unison-cloud-nimbus-storage.service"
             "unison-cloud-outbound-proxy.service"
             "unison-cloud-api.service"
           ]
           ++ lib.optional (cfg.internal.s3.unit != null) cfg.internal.s3.unit;
         after =
           [
-            "unison-cloud-nimbus-ca.service"
-            "unison-cloud-extenddb-setup.service"
+            "unison-cloud-nimbus-storage.service"
             "unison-cloud-outbound-proxy.service"
             "unison-cloud-api.service"
           ]
@@ -173,10 +198,9 @@
           (cfg.internal.loadSecrets [
             "s3-access-key-id"
             "s3-secret-access-key"
-            "extenddb-access-key-id"
-            "extenddb-secret-access-key"
             "cluster-token"
           ])
+          dbPassword
           {
             User = user;
             Group = user;
@@ -186,9 +210,6 @@
             SystemCallFilter = ["@system-service"];
             RemoveIPC = true;
             KeyringMode = "private";
-            # The Unison runtime only reads the system bundle, and ExtendDB's certificate is
-            # issued by the module's own CA.
-            BindReadOnlyPaths = ["${caBundleDir}/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt"];
             ExecStartPre = renderConfig node;
             ExecStart = lib.getExe cfg.nimbus.package;
             # /ready answers 204 once the node has joined cloud-api.
@@ -266,10 +287,19 @@ in {
         cfg.internal.cloudApiPort
         cfg.internal.secretsPort
         cfg.internal.lokiPort
-        cfg.extenddb.port
         cfg.internal.s3Port
       ]
+      ++ lib.optional (!pg.external) db.port
       ++ lib.concatMap (node: lib.attrValues node.ports) nodes;
+
+    services.unison-cloud.internal.postgresRoles.${user}.passwordCredential = "nimbus-db-password";
+    services.unison-cloud.internal.postgresDatabases.${db.database}.owner = user;
+
+    services.unison-cloud.network.hostBridges.postgres = lib.mkIf (cfg.database.mode == "host") {
+      target = "127.0.0.1:${toString config.services.postgresql.settings.port}";
+      inherit (db) port;
+      users = [user];
+    };
 
     # cloud-api registers the nodes itself (`byoc-nimbus-http`) when they join; this is
     # only for its TCP client path, which looks nodes up as `nimbus-client`.
@@ -292,26 +322,42 @@ in {
       lib.listToAttrs (map (node: lib.nameValuePair "nimbus-${node.name}" node.ports.publicHttp)
         (lib.filter (node: node.type == "interactive") nodes));
 
-    # A bind mount's source must exist before the unit starts, so the bundle is built by
-    # its own unit rather than in each node's ExecStartPre.
     systemd.services =
       {
-        unison-cloud-nimbus-ca = {
-          description = "Build the CA bundle the Unison Cloud nimbus nodes trust";
-          requires = ["unison-cloud-secrets.service"];
-          after = ["unison-cloud-secrets.service"];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            RuntimeDirectory = baseNameOf caBundleDir;
-            RuntimeDirectoryMode = "0755";
-            ExecStart = pkgs.writeShellScript "unison-cloud-nimbus-ca" ''
-              cat /etc/ssl/certs/ca-certificates.crt ${secrets}/ca.crt > ${caBundleDir}/ca-bundle.crt.tmp
-              chmod 0644 ${caBundleDir}/ca-bundle.crt.tmp
-              mv ${caBundleDir}/ca-bundle.crt.tmp ${caBundleDir}/ca-bundle.crt
-            '';
-          };
-        };
+        # Creates the table as nimbus's own role, over the same path nimbus uses, so the
+        # role owns it in every database mode and a broken path fails here, not in a node.
+        unison-cloud-nimbus-storage = lib.mkMerge [
+          cfg.internal.inNamespace
+          {
+            description = "Create the Unison Cloud nimbus storage table";
+            requires =
+              ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"]
+              ++ lib.optional (cfg.database.mode == "host") "unison-cloud-bridge-postgres.socket";
+            after =
+              ["unison-cloud-postgresql-setup.service" "unison-cloud-secrets.service"]
+              ++ lib.optional (cfg.database.mode == "host") "unison-cloud-bridge-postgres.socket";
+            environment = {
+              PGHOST = db.host;
+              PGPORT = toString db.port;
+              PGDATABASE = db.database;
+              PGUSER = db.user;
+            };
+            serviceConfig = lib.mkMerge [
+              dbPassword
+              {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                User = user;
+                Group = user;
+                ExecStart = pkgs.writeShellScript "unison-cloud-nimbus-storage" ''
+                  PGPASSWORD=$(< "$CREDENTIALS_DIRECTORY/nimbus-db-password")
+                  export PGPASSWORD
+                  ${cfg.database.package}/bin/psql -X -q -v ON_ERROR_STOP=1 -f ${createTable}
+                '';
+              }
+            ];
+          }
+        ];
       }
       // lib.listToAttrs (map (node: lib.nameValuePair "unison-cloud-nimbus-${node.name}" (nodeService node)) nodes);
   };

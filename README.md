@@ -135,7 +135,6 @@ in {
       mode = "host";
       package = config.services.postgresql.package;
     };
-    extenddb.database = "unison_cloud_extenddb";
   };
 
   services.caddy.virtualHosts = {
@@ -154,7 +153,7 @@ Here's what each piece expects from the host:
 
 - **Caddy.** It must run as group `caddy`, or set `ingressGroup` to its group. The sockets under `/run/unison-cloud/` reach cloud-api's `/internal/*` routes, which Caddy keeps private, so keep that group to Caddy. They grant no login: cloud-api only logs you in through OIDC. Point a monitor at `https://cloud.example.com/.well-known/openid-configuration`. It needs no login, and a 200 means Caddy and cloud-api are up.
 - **The login provider.** Give it a confidential client with the redirect URI `https://cloud.example.com/selfhost/oidc/callback`. cloud-api still checks every ID token's `iss` against the public issuer.
-- **PostgreSQL.** The module creates `unison-cloud-api` and `unison-cloud-extenddb` roles, both `NOSUPERUSER` and `NOCREATEROLE`, and their databases, then logs in over `/run/postgresql` with peer authentication. It never touches `pg_hba.conf`, so keep a rule that lets those system users log in as their own roles. NixOS's default `local all all peer` does.
+- **PostgreSQL.** The module creates `unison-cloud-api` and `unison-cloud-nimbus` roles, both `NOSUPERUSER`, `NOCREATEROLE` and `NOCREATEDB`, and their databases. cloud-api logs in over `/run/postgresql` with peer authentication. nimbus can't open a unix socket, so it logs in with a generated password, through a bridge to the host's `127.0.0.1`. The module never touches `pg_hba.conf`, so keep rules that let those system users log in as their own roles, and `unison-cloud-nimbus` with its password over TCP from `127.0.0.1`. NixOS's defaults, `local all all peer` and `host all all 127.0.0.1/32 md5`, do both.
 - **S3.** Create both buckets and a key that can read and write them. Requests through the bridge keep the `Host` header the clients sign, `<bucket>.<host>:7070`, so the store must accept a non-default port there. Garage does.
 
 ## Use the binary cache
@@ -170,7 +169,7 @@ nix.settings = {
 };
 ```
 
-The cache has cloud-api, nimbus, ExtendDB, and the whole demo VM for `x86_64-linux` and `aarch64-linux`. The web UI gets rebuilt for your own domains when you use the module, so that one bit always builds locally.
+The cache has cloud-api, nimbus, and the whole demo VM for `x86_64-linux` and `aarch64-linux`. The web UI gets rebuilt for your own domains when you use the module, so that one bit always builds locally.
 
 ## See how it fits together
 
@@ -205,7 +204,6 @@ flowchart TB
             subgraph storage["Storage"]
                 direction LR
                 postgres[("PostgreSQL")]
-                extenddb[("ExtendDB")]
                 s3[("versitygw")]
                 redis[("Redis")]
             end
@@ -242,8 +240,7 @@ flowchart TB
 - **cloud-api** is the control plane. It handles login, users, environments, secrets, and service names, and hands deploys to nimbus.
 - **nimbus** is the worker that actually runs your Unison code. There's one daemon node plus a configurable number of interactive nodes (two by default).
 - **Dex** is the bundled login provider. cloud-api acts as an OIDC client of Dex (or any external OIDC provider you point it at), and as a tiny authorization server for `ucm auth.login`.
-- **PostgreSQL** holds cloud-api's data and environment secrets, and backs ExtendDB.
-- **ExtendDB** stands in for DynamoDB, which is where nimbus keeps its transactional storage.
+- **PostgreSQL** holds cloud-api's data and environment secrets, and nimbus's transactional storage in place of DynamoDB. Each has its own role, and neither can read the other's tables.
 - **versitygw** stands in for S3, for deployed service code and blobs. You can point it at a real S3 instead, reached through a host bridge.
 - **Redis** holds login state and refresh tokens.
 - **Consul** is a single-node service registry that cloud-api uses to find the nimbus nodes.
@@ -252,7 +249,7 @@ flowchart TB
 - **nftables** locks down egress from the namespace so only the services that need the outside world can reach it. Host bridges (`network.hostBridges`) give named users a path to one host-side service each, such as an S3 store or a login provider, without any general egress.
 - **systemd sandboxing** covers what the namespace can't: unix sockets and files. nimbus and cloud-api run with `/run` and `/var` emptied, and nimbus can't open a unix socket at all.
 
-All secrets (keys, passwords, an internal CA) are generated on first boot under the state directory. You can override any of them with your own files (`secrets.files`), and most of them with systemd encrypted credentials (`secrets.credentials`).
+All secrets (keys and passwords) are generated on first boot under the state directory. You can override any of them with your own files (`secrets.files`), and most of them with systemd encrypted credentials (`secrets.credentials`).
 
 ## See what I patched
 
@@ -278,8 +275,8 @@ unison-cloud-ui (`patches/cloud-ui/`):
 
 nimbus (`patches/nimbus/`):
 
-- `0001-dynamo-https.u`: Adds a DynamoDB config that talks HTTPS to a local endpoint, so nimbus can use ExtendDB.
 - `0002-unproxied-internal-traffic.u`: Keeps nimbus's own storage traffic off the outbound proxy, so the proxy can block every private address.
+- `0003-postgres-config.u` and `0004-postgres-storage.u`: Store nimbus's transactional data in a PostgreSQL table instead of DynamoDB, through [@runarorama/postgres](https://share.unison-lang.org/@runarorama/postgres), so there's no DynamoDB stand-in to run. Concurrent transactions conflict and retry the way they do on DynamoDB, and a small pool of long-lived sessions avoids logging in on every query.
 
 ## Thanks
 
@@ -288,6 +285,6 @@ This only exists because of a bunch of other people's work on a bunch of project
 - [Unison](https://www.unison-lang.org/), for open sourcing [cloud-api](https://github.com/unisonweb/cloud-api), [nimbus](https://share.unison-lang.org/@unison/nimbus), and [unison-cloud-ui](https://github.com/unisonweb/unison-cloud-ui), and for the language itself.
 - [unison-nix](https://github.com/ceedubs/unison-nix), for packaging `ucm`.
 - [stacklock2nix](https://github.com/cdepillabout/stacklock2nix), for making the cloud-api Haskell build painless.
-- [ExtendDB](https://github.com/ExtendDB/extenddb), for a DynamoDB I can run myself.
+- [@runarorama/postgres](https://share.unison-lang.org/@runarorama/postgres), for a PostgreSQL client nimbus can use.
 - [versitygw](https://github.com/versity/versitygw), [Dex](https://dexidp.io/), [Caddy](https://caddyserver.com/), [PostgreSQL](https://www.postgresql.org/), [Redis](https://redis.io/), [Consul](https://www.consul.io/), [Grafana Loki](https://grafana.com/oss/loki/), [Vector](https://vector.dev/), [Squid](https://www.squid-cache.org/), and [Unbound](https://nlnetlabs.nl/projects/unbound/).
 - [NixOS](https://nixos.org/) and nixpkgs, for making it possible to wire all of this together in one place.

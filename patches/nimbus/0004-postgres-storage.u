@@ -1,0 +1,485 @@
+-- Stores nimbus's transactional data in a PostgreSQL table when the storage config's type
+-- is `postgres` (see 0003-postgres-config.u), so nimbus doesn't need DynamoDB. Every other
+-- config still goes to DynamoDB. The table is
+--
+--   CREATE TABLE nimbus_kv (
+--     k  bytea  NOT NULL, -- the key's hash, as DynamoDB's K
+--     ns text   NOT NULL, -- "databaseId:tableName", as DynamoDB's NS
+--     v  bytea  NOT NULL, -- the serialized value
+--     t  bigint NOT NULL, -- the version, from 1
+--     fk bytea,           -- the full key, written on insert only
+--     PRIMARY KEY (k, ns)
+--   );
+--
+-- `write` is an optimistic commit, as with DynamoDB's TransactWriteItems. It takes a
+-- transaction-scoped advisory lock on every key it reads or writes, in sorted order so
+-- concurrent writers can't deadlock, then compares versions and applies the changes. A
+-- row lock wouldn't do, because it can't lock a key that doesn't exist yet. A missing row
+-- is version 0. A version mismatch, a serialization failure or a deadlock returns false,
+-- so nimbus retries the transaction instead of failing the request.
+--
+-- The library logs in on every connection, and its SCRAM runs in Unison, which is slow
+-- (about 200 ms). So `freshState` starts eight worker threads that each keep one session
+-- open and run queries from a shared queue. A worker drops its session after any error and
+-- opens a new one for its next query.
+--
+-- `freshState` is 0002-unproxied-internal-traffic.u's, with the storage runner built on
+-- that pool.
+
+stateful.Postgres.bytea : postgres.Codec Bytes
+stateful.Postgres.bytea =
+  decode t =
+    if Text.startsWith "\\x" t then Bytes.fromHex.impl (Text.drop 2 t)
+    else Left "bytea not in hex output format"
+  postgres.Codec.simple Type.types.bytea (b -> "\\x" Text.++ Bytes.toHex b) decode
+
+-- The library rejects a `text[]` parameter as an unknown type, so a list of keys goes
+-- over as one comma-separated text parameter.
+stateful.Postgres.hexList : postgres.Codec [Bytes]
+stateful.Postgres.hexList =
+  encode bs = Text.join "," (List.map Bytes.toHex bs)
+  postgres.Codec.simple Type.types.text encode (_ -> Left "hexList only encodes")
+
+stateful.Postgres.rowVersion : postgres.Codec Nat
+stateful.Postgres.rowVersion =
+  postgres.Codec.imap Int.truncate0 Nat.toInt postgres.Codec.bigint
+
+stateful.Postgres.sqlState : IO.Failure -> Optional Text
+stateful.Postgres.sqlState = cases
+  IO.Failure.Failure typ msg payload
+    | (typ === typeLink errors.PostgresError)
+        && (msg === "Error response from postgres") ->
+      sqlAndInfo : (Text, Map Char Text)
+      sqlAndInfo = unsafeExtract payload
+      Map.get ?C (at2 sqlAndInfo)
+  _ -> None
+
+-- The library's own `singleIO` leaves the socket open when the body throws.
+stateful.Postgres.withSession :
+  PostgresClientConfig
+  -> '{IO, Exception, postgres.Postgres} a
+  ->{IO, Exception} a
+stateful.Postgres.withSession cfg p =
+  conn =
+    TcpConnect.runIO do
+      TcpConnect.connect
+        (PostgresClientConfig.host cfg) (PostgresClientConfig.port cfg)
+  result = catch do withConnection cfg conn p
+  Connection.close conn
+  Either.toException result
+
+-- The library only closes a statement in `PreparedQuery.single` and `optional`, and a
+-- pooled session would otherwise keep every statement it ever prepared.
+stateful.Postgres.queryRows :
+  postgres.Query r a b -> [Optional Text] ->{postgres.Postgres} [b]
+stateful.Postgres.queryRows q args =
+  portal = PreparedQuery.bind (Query.prepare q) args
+  (rows, _) = postgres.Postgres.executeQueryPortal portal 0
+  QueryPortal.close portal
+  rows
+
+stateful.Postgres.runCommand :
+  Command r a -> [Optional Text] ->{postgres.Postgres} ()
+stateful.Postgres.runCommand c args =
+  prepared = prepareCommand c
+  portal = bindAndExecute prepared args
+  postgres.Postgres.closePortal (CommandPortal.id portal)
+  PreparedCommand.close prepared
+
+type stateful.Postgres.PoolJob
+  = PoolJob
+      PostgresClientConfig
+      ('{IO, Exception, postgres.Postgres} ())
+      (IO.Failure ->{IO} ())
+
+type stateful.Postgres.Pool = Pool (MVar PoolJob)
+
+stateful.Postgres.Pool.start : Nat ->{IO} Pool
+stateful.Postgres.Pool.start size =
+  queue = MVar.newEmpty()
+  List.foreach (_ -> concurrent.fork_ (Pool.worker queue)) (List.range 0 size)
+  Pool queue
+
+-- A worker connects on its first query and keeps the session while the queries it takes
+-- use the same config, so a config reload moves it to the new server.
+stateful.Postgres.Pool.worker : MVar PoolJob -> '{IO} ()
+stateful.Postgres.Pool.worker queue =
+  next : '{IO} PoolJob
+  next = do
+    match MVar.take.impl queue with
+      Right job -> job
+      Left err -> bug ("stateful.Postgres.Pool.worker: the queue failed", err)
+  serve :
+    PostgresClientConfig
+    -> mutable.Ref {IO} (IO.Failure ->{IO} ())
+    ->{IO, Exception, postgres.Postgres} PoolJob
+  serve cfg current =
+    job = next()
+    match job with
+      PoolJob jobCfg run fail
+        | jobCfg === cfg ->
+          mutable.Ref.write current fail
+          run()
+          serve cfg current
+      _ -> job
+  go : PoolJob ->{IO} ()
+  go = cases
+    PoolJob cfg run fail ->
+      current = IO.ref fail
+      outcome =
+        catch do
+          withSession cfg do
+            run()
+            serve cfg current
+      match outcome with
+        Right leftover -> go leftover
+        Left err ->
+          failCurrent = mutable.Ref.read current
+          failCurrent err
+          go (next())
+  do go (next())
+
+stateful.Postgres.Pool.run :
+  Pool
+  -> PostgresClientConfig
+  -> '{IO, Exception, postgres.Postgres} a
+  ->{IO, Exception} a
+stateful.Postgres.Pool.run pool cfg p =
+  (Pool queue) = pool
+  result = MVar.newEmpty()
+  deliver r = Function.ignore (MVar.tryPut.impl result r)
+  MVar.put
+    queue (PoolJob cfg (do deliver (Right p())) (err -> deliver (Left err)))
+  Either.toException (MVar.take result)
+
+stateful.Postgres.postgresKvs :
+  Pool -> stateful.Clock -> '{IO, Threads} Dynamo.Config -> KVS
+stateful.Postgres.postgresKvs pool clock config =
+  use Text ++
+  use stateful.Key Key
+  hashOf = cases Key h _ _ -> h
+  unpack = cases
+    Config.Postgres client tbl -> (client, tbl)
+    _ -> bug "stateful.Postgres.postgresKvs needs a postgres config"
+  -- Connection failures, shutdowns and running out of connections are retried; anything
+  -- else the server rejects would fail the same way again.
+  transient err = match sqlState err with
+    None -> true
+    Some code -> List.contains (Text.take 2 code) ["08", "53", "57"]
+  retry : '{g, Exception} a ->{g, Exception, Backoff} a
+  retry p = match catch p with
+    Right a -> a
+    Left err ->
+      if transient err then
+        nextSleep()
+        retry p
+      else Exception.raise err
+  withRetries : '{g, Exception} a ->{g, IO, Exception, Random, Threads} a
+  withRetries p = backoff clock do retry p
+  readOne = cases
+    Key h ns _ ->
+      found =
+        withRetries do
+          (client, tbl) = unpack config()
+          q =
+            sql ("SELECT v, t FROM " ++ tbl ++ " WHERE k = ")
+              %% var bytea
+              %% sql " AND ns = "
+              %% var postgres.Codec.text
+              |> typedQuery (bytea ~ rowVersion)
+          Pool.run pool client do
+            PreparedQuery.optional (Query.prepare q) (Query.encodeArgs q h ns)
+      Optional.map (cases (bytes, t) -> (Any (Blob.read bytes), t)) found
+  readChunk keys =
+    withRetries do
+      (client, tbl) = unpack config()
+      q =
+        sql
+          ("SELECT k, v, t FROM "
+            ++ tbl
+            ++ " WHERE k IN (SELECT decode(x, 'hex') FROM unnest(string_to_array(")
+          %% var hexList
+          %% sql ", ',')) AS x)"
+          |> typedQuery (bytea ~ (bytea ~ rowVersion))
+      Pool.run pool client do
+        Postgres.queryRows q (Query.encodeArgs q (List.map hashOf keys))
+  readMany keys =
+    found =
+      List.chunk 100 keys
+        |> List.flatMap readChunk
+        |> List.foldLeft
+             (m -> cases (k, (bytes, t)) -> Map.put k (Any (Blob.read bytes), t) m)
+             Map.empty
+    List.map (k -> (k, Map.get (hashOf k) found)) keys
+  writeTx seen changed =
+    use Map toList
+    (client, tbl) = unpack config()
+    hashes =
+      (Map.keys seen List.++ Map.keys changed)
+        |> List.map hashOf
+        |> Set.fromList
+        |> Set.toList
+    lockQ =
+      sql "SELECT count(*)::int4 FROM unnest(string_to_array("
+        %% var hexList
+        %% sql
+             (", ',')) AS h"
+               ++ " WHERE pg_advisory_xact_lock(('x' || substr(h, 1, 16))::bit(64)::bigint) IS NOT NULL")
+        |> typedQuery postgres.Codec.int4
+    versionsQ =
+      sql
+        ("SELECT k, t FROM "
+          ++ tbl
+          ++ " WHERE k IN (SELECT decode(x, 'hex') FROM unnest(string_to_array(")
+        %% var hexList
+        %% sql ", ',')) AS x)"
+        |> typedQuery (bytea ~ rowVersion)
+    upsertC =
+      sql ("INSERT INTO " ++ tbl ++ " (k, ns, v, t, fk) VALUES (")
+        %% var bytea
+        %% sql ", "
+        %% var postgres.Codec.text
+        %% sql ", "
+        %% var bytea
+        %% sql ", 1, "
+        %% var bytea
+        %% sql
+             (") ON CONFLICT (k, ns) DO UPDATE SET v = EXCLUDED.v, t = "
+               ++ tbl
+               ++ ".t + 1")
+        |> buildCommand
+    deleteC =
+      sql ("DELETE FROM " ++ tbl ++ " WHERE k = ")
+        %% var bytea
+        %% sql " AND ns = "
+        %% var postgres.Codec.text
+        |> buildCommand
+    attempt : '{IO, Exception, postgres.Postgres} Boolean
+    attempt =
+      do
+        transaction do
+          Function.ignore
+            (PreparedQuery.single
+              (Query.prepare lockQ) (Query.encodeArgs lockQ hashes))
+          current =
+            Postgres.queryRows versionsQ (Query.encodeArgs versionsQ hashes)
+              |> Map.fromList
+          unchanged = cases
+            (key, expected) ->
+              Map.getOrElse 0 (hashOf key) current Nat.== expected
+          if Boolean.not (List.all unchanged (toList seen)) then
+            Function.ignore Transaction.rollback
+            false
+          else
+            List.foreach
+              (cases
+                (Key h ns fullKey, Some value) ->
+                  fk = Blob.write (unsafeExtract fullKey)
+                  v = Blob.write (unsafeExtract value)
+                  Postgres.runCommand
+                    upsertC (Command.encodeArgs upsertC h ns v fk)
+                (Key h ns _, None) ->
+                  Postgres.runCommand
+                    deleteC (Command.encodeArgs deleteC h ns))
+              (toList changed)
+            true
+    conflict = cases
+      Some "40001" -> true
+      Some "40P01" -> true
+      _ -> false
+    if List.isEmpty hashes then true
+    else
+      withRetries do
+        match catch do Pool.run pool client attempt with
+          Right ok -> ok
+          Left err ->
+            if conflict (sqlState err) then false else Exception.raise err
+  KVS.empty
+    |> read.set readOne
+    |> batchRead.set readMany
+    |> write.set writeTx
+
+stateful.runPooledStorage :
+  Pool
+  -> stateful.Logger
+  -> Client
+  -> '{IO} Dynamo.Config
+  -> time.Duration
+  -> [Database]
+  -> '{g, unison_cloud_27_2_1.Storage} a
+  ->{g, IO, Random, Threads} a
+stateful.runPooledStorage pool logger httpClient config timeout dbs p =
+  clock = real
+  kvs = match config() with
+    Config.Postgres _ _ -> postgresKvs pool clock config
+    _ -> Dynamo.kvs logger clock httpClient config
+  logic kvs logger clock timeout dbs p
+
+ServerState.freshState :
+  FilePath ->{IO, Exception, Threads} ServerState
+ServerState.freshState configPath =
+  use Client start
+  use IO ref
+  use Nat ==
+  use getEnv impl
+  (config, initialDynamicConfig) =
+    Random.run do
+      readFile configPath
+        |> fromUtf8
+        |> json_1_2_1.Decoder.run config.read
+  logger = LogBuffer.new 10000
+  dynConf =
+    systemfw_concurrent_9_0_0.Signal.new
+      (StateIndex 0, initialDynamicConfig)
+  metrics =
+    setupMetrics =
+      do
+        use Metrics createHistogram
+        usTiming = Config.log 10 3000 24
+        msTiming = Config.log 10000 3000000 24
+        createHistogram
+          usTiming "check_native_service_cache_micros"
+        createHistogram
+          usTiming "decode_native_service_micros"
+        createHistogram
+          msTiming "deployment_request_h2_micros"
+        createHistogram msTiming "deployment_request_micros"
+        createHistogram
+          (Config.log 100 100000 24) "detach_local_micros"
+        createHistogram msTiming "detach_remote_micros"
+        createHistogram
+          (Config.hdr 1 48 2)
+          "detach_remote_num_term_requests"
+        createHistogram
+          (Config.log 500 300000 24)
+          "fetch_environment_micros"
+        createHistogram msTiming "fetch_from_s3_micros"
+        createHistogram msTiming "fetch_native_service_micros"
+        createHistogram
+          msTiming "handle_service_http_request_micros"
+        createHistogram
+          (Config.log 30 30000 24)
+          "lookup_storage_pool_micros"
+        createHistogram
+          (Config.log 100 5000 24) "node_candidates_micros"
+        createHistogram usTiming "record_local_thread_micros"
+        createHistogram usTiming "ref_write_local_micros"
+        createHistogram msTiming "ref_write_remote_micros"
+        createHistogram
+          msTiming "resolve_by_user_and_name_micros"
+        createHistogram msTiming "resolve_name_micros"
+        createHistogram msTiming "service_request_micros"
+        createHistogram usTiming "service_call_micros"
+        createHistogram msTiming "state_transaction_micros"
+        createHistogram
+          msTiming "state_batch_transaction_micros"
+        createHistogram usTiming "try_cancel_local_micros"
+        createHistogram msTiming "try_cancel_remote_micros"
+        createHistogram
+          usTiming "user_code_validate_sandbox_micros"
+    cfg = MetricsConfig.default
+    m = buffer.new cfg
+    runMetrics m setupMetrics ()
+    m
+  firstByte : Bytes -> Nat
+  firstByte bs = match Bytes.at 0 bs with
+    Some n -> n
+    None   -> 0
+  firstUIDByte : UID -> Nat
+  firstUIDByte = cases UID bs -> firstByte bs
+  firstPromiseByte = cases Promise.Id.Id id -> firstUIDByte id
+  firstThreadByte = cases Thread.Id.Id id -> firstUIDByte id
+  webSocketByte = cases WebSocket.Id.Id id -> firstByte id
+  (proxiedHttpClient, unproxiedHttpClient) =
+    maxPerKey =
+      match impl "NIMBUS_MAX_CONNECTIONS_PER_HOST" with
+        Right t -> fromTextOrFail t
+        Left _  -> 10
+    Function.ignore
+      "https://github.com/minio/minio/issues/21633#issuecomment-3388024508"
+    reuseConnection defaultPolicy =
+      match impl "NIMBUS_MINIO_412_WORKAROUND" with
+        Right t ->
+          if List.contains (Text.toLowercase t) ["true", "1"] then
+            defaultTimeout httpResponse ->
+              (if
+                Status.code (HttpResponse.status httpResponse)
+                  == 412 then None
+              else defaultPolicy defaultTimeout httpResponse)
+          else defaultPolicy
+        Left _ -> defaultPolicy
+    unproxiedConf =
+      Client.Config.default
+        |> Client.Config.idleTimeout.set
+             (time.Duration.seconds +2)
+        |> statsBufferSize.set 1000000
+        |> maxPerKey.set maxPerKey
+        |> reuseConnection.modify reuseConnection
+    client = start unproxiedConf
+    (client, client)
+  storageRunner =
+    dynamoConfig : '{IO} Dynamo.Config
+    dynamoConfig =
+      do
+        DynamicConfig.dynamo
+          (systemfw_concurrent_9_0_0.Signal.readNow dynConf
+            |> at2)
+    timeout = time.Duration.minutes +10
+    convertLogLevel : Level -> LogLevel
+    convertLogLevel = cases
+      Level.Debug -> LogLevel.Debug
+      Level.Info  -> LogLevel.Info
+      Level.Warn  -> LogLevel.Warn
+      Level.Error -> LogLevel.Error
+      Custom _    -> LogLevel.Error
+    storageLogger ctx =
+      log lvl fields =
+        logEvent
+          logger
+          (convertLogLevel lvl)
+          (StatefulLog ctx fields)
+      stateful.Logger.Logger log
+    postgresPool = Postgres.Pool.start 8
+    StorageRunner
+      (ctx dbs ->
+        stateful.runPooledStorage
+          postgresPool
+          (storageLogger ctx)
+          proxiedHttpClient
+          dynamoConfig
+          timeout
+          dbs)
+  pool =
+    ConnectionPool.new (ServerState.poolConfig config logger)
+  peers =
+    Peers
+      SemispaceCache.new()
+      (ref PeerMap.empty)
+      (ref PendingReads.empty)
+      pool
+  ServerState
+    config
+    dynConf
+    (StripedMap.empty firstPromiseByte 256)
+    (StripedMap.empty firstThreadByte 256)
+    (StripedMap.empty firstUIDByte 256)
+    logger
+    SemispaceCache.new()
+    SemispaceCache.new()
+    SemispaceCache.new()
+    (StripedMap.empty webSocketByte 256)
+    SemispaceCache.new()
+    SemispaceCache.new()
+    storageRunner
+    metrics
+    SemispaceCache.new()
+    SemispaceCache.new()
+    SemispaceCache.new()
+    (ref EmptyJwkCache)
+    proxiedHttpClient
+    unproxiedHttpClient
+    Promise.new()
+    SemispaceCache.new()
+    ConcurrentMap.empty()
+    ConcurrentMap.empty()
+    peers

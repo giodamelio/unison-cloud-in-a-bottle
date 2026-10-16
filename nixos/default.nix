@@ -15,7 +15,6 @@ in {
     ./auth.nix
     ./caddy.nix
     ./postgresql.nix
-    ./extenddb.nix
     ./s3.nix
     ./redis.nix
     ./consul.nix
@@ -84,38 +83,6 @@ in {
       default = packages.nimbus;
       defaultText = lib.literalExpression "self.packages.\${system}.nimbus";
       description = "Patched nimbus package, run once per node.";
-    };
-
-    extenddb = {
-      package = lib.mkOption {
-        type = lib.types.package;
-        default = packages.extenddb;
-        defaultText = lib.literalExpression "self.packages.\${system}.extenddb";
-        description = "ExtendDB package, the DynamoDB-compatible store nimbus uses.";
-      };
-
-      port = lib.mkOption {
-        type = lib.types.port;
-        default = 18443;
-        description = "HTTPS port ExtendDB listens on, on the namespace loopback.";
-      };
-
-      database = lib.mkOption {
-        type = lib.types.str;
-        default = "extenddb";
-        example = "unison_cloud_extenddb";
-        description = ''
-          Postgres database ExtendDB creates and keeps its data in. It also creates a second
-          one for its catalog, named after this with a `_catalog` suffix. Both are created
-          on ExtendDB's first start only; changing this later has no effect.
-        '';
-      };
-
-      tableName = lib.mkOption {
-        type = lib.types.str;
-        default = "unison-cloud";
-        description = "Name of the DynamoDB table nimbus stores transactional data in.";
-      };
     };
   };
 }

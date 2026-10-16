@@ -27,13 +27,19 @@
   # Patches are scratch files in ../../patches/nimbus, copied into the transcript's working
   # directory through `src`. `update` typechecks each one against the pinned causal, so a
   # causal bump that conflicts with a patch fails here as a type error.
+  #
+  # The PostgreSQL storage patches need @runarorama/postgres, which installs from Share
+  # without a token. A release is immutable, so this pins it as firmly as the causal.
   patchesDir = ../../patches/nimbus;
   prepare = ''
     scratch/main> pull @unison/nimbus/main
     scratch/main> reset #${causalHash}
-    scratch/main> load 0001-dynamo-https.u
-    scratch/main> update
     scratch/main> load 0002-unproxied-internal-traffic.u
+    scratch/main> update
+    scratch/main> lib.install @runarorama/postgres/releases/2.5.1
+    scratch/main> load 0003-postgres-config.u
+    scratch/main> update
+    scratch/main> load 0004-postgres-storage.u
     scratch/main> update
   '';
 in
@@ -49,7 +55,7 @@ in
       ```
     '';
 
-    compiledHash = "sha256-uaWWQTMjIrvwf6t0zaPE/F5IkyGGbpdoE4m790NMQn8=";
+    compiledHash = "sha256-KimSfdBQ40bKsba8hq8Pje8YKwteQ8nRA8prDSzFNDQ=";
 
     meta = {
       description = "Unison Cloud worker node";

@@ -1,39 +1,51 @@
--- Adds a `local-https` DynamoDB config so nimbus can reach ExtendDB, which only serves
--- TLS. Like `local` it signs with an empty region; unlike `local` it reads the table
--- name from the config instead of hardcoding "test".
+-- Adds a `postgres` storage config, which 0004-postgres-storage.u serves from a PostgreSQL
+-- table instead of DynamoDB. It lives in `Dynamo.Config` because that's what the dynamic
+-- config and `stateful.runStorage` already pass around.
+--
+-- ucm can't load this type change and the code that uses it in a single update, so the
+-- storage code is a separate patch.
+--
+-- The session always asks for `bytea_output = hex`, which the storage code's `bytea`
+-- codec reads, whatever the server's default.
 
 type stateful.Dynamo.Config
   = Cloud Region Credentials Text
   | Local Credentials HostName Port Text
-  | LocalHttps Credentials HostName Port Text
+  | Postgres PostgresClientConfig Text
 
 stateful.Dynamo.table : Dynamo.Config -> Text
 stateful.Dynamo.table = cases
-  Cloud _ _ name               -> name
-  Config.Local _ _ _ name      -> name
-  Config.LocalHttps _ _ _ name -> name
+  Cloud _ _ name          -> name
+  Config.Local _ _ _ name -> name
+  Config.Postgres _ name  -> name
 
-ServerState.config.read.dynamoConfig : '{Decoder} Dynamo.Config
+ServerState.config.read.dynamoConfig : '{json_1_2_1.Decoder} Dynamo.Config
 ServerState.config.read.dynamoConfig =
   do
-    match object.at! "type" Decoder.text with
+    use object at!
+    match at! "type" Decoder.text with
       "local" ->
         Config.Local
-          (object.at! "credentials" aws.credentials)
-          (object.at! "host" json.hostName)
-          (object.at! "port" json.port)
+          (at! "credentials" aws.credentials)
+          (at! "host" json.hostName)
+          (at! "port" json.port)
           "test"
-      "local-https" ->
-        Config.LocalHttps
-          (object.at! "credentials" aws.credentials)
-          (object.at! "host" json.hostName)
-          (object.at! "port" json.port)
-          (object.at! "table" Decoder.text)
       "cloud" ->
         Cloud
-          (object.at! "region" aws.region)
-          (object.at! "credentials" aws.credentials)
-          (object.at! "table" Decoder.text)
+          (at! "region" aws.region)
+          (at! "credentials" aws.credentials)
+          (at! "table" Decoder.text)
+      "postgres" ->
+        Config.Postgres
+          (PostgresClientConfig.PostgresClientConfig
+            (at! "host" json.hostName)
+            (at! "port" json.port)
+            (UserName.UserName (at! "user" Decoder.text))
+            (DatabaseName.DatabaseName (at! "database" Decoder.text))
+            (optionalAt! "password" Decoder.text |> Optional.map Password.Password)
+            (Map.put "bytea_output" "hex" defaultConnectionParameters)
+            BuiltinsOnly)
+          (at! "table" Decoder.text)
       other ->
         Decoder.fail ("Unknown DynamoDB config type: " Text.++ other)
 
@@ -41,7 +53,7 @@ stateful.Dynamo.call :
   Dynamo.Config
   -> Text
   -> Json
-  -> '{g, Exception, Decoder} a
+  -> '{g, Exception, json_1_2_1.Decoder} a
   ->{g, IO, Exception, Http} a
 stateful.Dynamo.call config opName op decoder =
   use HttpRequest setHeader
@@ -51,8 +63,8 @@ stateful.Dynamo.call config opName op decoder =
     match config with
       Config.Local credentials host port _ ->
         (Region "", credentials, Scheme.http, HostName.toText host, Some port)
-      Config.LocalHttps credentials host port _ ->
-        (Region "", credentials, Scheme.https, HostName.toText host, Some port)
+      Config.Postgres _ _ ->
+        bug "stateful.Dynamo.call: a postgres config has no DynamoDB endpoint"
       Cloud region credentials _ ->
         ( region
         , credentials
@@ -67,7 +79,7 @@ stateful.Dynamo.call config opName op decoder =
       Path.root
       RawQuery.empty
       Fragment.empty
-  instant = realtime()
+  instant = Instant.now()
   date = Instant.toBasicISO8601 (truncateToSeconds instant)
   payload = op |> unison_json_1_3_5.core.Json.toText |> Text.toUtf8
   size = Nat.toText (Bytes.size payload)

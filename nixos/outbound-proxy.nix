@@ -23,7 +23,7 @@
     access_log syslog:daemon.info squid
     shutdown_lifetime 1 seconds
 
-    # Names on the namespace's /etc/hosts, such as the S3 and ExtendDB hostnames, must
+    # Names on the namespace's /etc/hosts, such as the S3 hostnames, must
     # not resolve for hosted code.
     hosts_file none
     dns_nameservers ${

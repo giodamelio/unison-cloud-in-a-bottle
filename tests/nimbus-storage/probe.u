@@ -1,0 +1,106 @@
+-- Decodes a nimbus `dynamo` config from $STORAGE_CONFIG with nimbus's own decoder, then
+-- drives nimbus's own PostgreSQL storage through it and prints what it saw, one
+-- `name=value` line per check.
+storageProbe.counter : Table Text Nat
+storageProbe.counter = Storage.Table.Table "probe"
+
+storageProbe.withKvs : '{IO, Exception, Random, Threads} a ->{IO, Exception} a
+storageProbe.withKvs p = Threads.run do splitmix randomNat() p
+
+storageProbe.caught : '{IO, Exception} a ->{IO} Either IO.Failure a
+storageProbe.caught p = catch p
+
+storageProbe.concurrently : ['{IO, Exception} a] ->{IO, Exception} [Either IO.Failure a]
+storageProbe.concurrently ps =
+  started = List.map (p -> (MVar.newEmpty(), MVar.newEmpty(), p)) ps
+  List.foreach
+    (cases
+      (go, done, p) ->
+        concurrent.fork_ do
+          Function.ignore (MVar.take.impl go)
+          Function.ignore (MVar.put.impl done (storageProbe.caught p)))
+    started
+  List.foreach (cases (go, _, _) -> MVar.put go ()) started
+  List.map (cases (_, done, _) -> MVar.take done) started
+
+storageProbe : '{IO, Exception} ()
+storageProbe = do
+  use Text ++
+  config =
+    unison_json_1_3_5.Decoder.run
+      ServerState.config.read.dynamoConfig (getEnv "STORAGE_CONFIG")
+  pool = Postgres.Pool.start 8
+  kvs = postgresKvs pool real (do config)
+  say name value = printLine (name ++ "=" ++ value)
+  showNat = Optional.fold (do "none") Nat.toText
+  withKvs = storageProbe.withKvs
+  transaction t =
+    Threads.run do
+      httpClient = Client.start Client.Config.default
+      splitmix randomNat() do
+        stateful.runPooledStorage
+          pool
+          stdErrLogger
+          httpClient
+          (do config)
+          (time.Duration.minutes +10)
+          [exampleDb]
+          do transact exampleDb t
+  keyOf = Key.create exampleDb storageProbe.counter
+
+  transaction do Transaction.write.tx storageProbe.counter "foo" 42
+  say "read" (showNat (transaction do Transaction.tryRead.tx storageProbe.counter "foo"))
+  transaction do Transaction.write.tx storageProbe.counter "foo" 43
+  say "overwritten" (showNat (transaction do Transaction.tryRead.tx storageProbe.counter "foo"))
+  transaction do Transaction.delete.tx storageProbe.counter "foo"
+  say "deleted" (showNat (transaction do Transaction.tryRead.tx storageProbe.counter "foo"))
+
+  transaction do
+    Transaction.write.tx storageProbe.counter "a" 1
+    Transaction.write.tx storageProbe.counter "b" 2
+  rows = withKvs do KVS.batchRead kvs [keyOf "a", keyOf "missing", keyOf "b"]
+  showRow = cases
+    (_, Some (v, t)) -> Nat.toText (unsafeExtract v) ++ "@" ++ Nat.toText t
+    (_, None) -> "none"
+  say "batch" (Text.join "," (List.map showRow rows))
+
+  isWin = cases
+    Right true -> true
+    _ -> false
+  isConflict = cases
+    Right false -> true
+    _ -> false
+  isError = cases
+    Left _ -> true
+    _ -> false
+  race r =
+    key = keyOf ("race" ++ Nat.toText r)
+    seen =
+      if Nat.isEven r then 0
+      else
+        Function.ignore
+          (withKvs do KVS.write kvs (Map.singleton key 0) (Map.singleton key (Some (Any 0))))
+        1
+    writer n =
+      do withKvs do KVS.write kvs (Map.singleton key seen) (Map.singleton key (Some (Any n)))
+    results = storageProbe.concurrently [writer 1, writer 2]
+    final = withKvs do KVS.read kvs key
+    say
+      "race"
+      (Text.join
+        " "
+        [ "from=" ++ Nat.toText seen
+        , "won=" ++ Nat.toText (List.count isWin results)
+        , "conflicted=" ++ Nat.toText (List.count isConflict results)
+        , "errored=" ++ Nat.toText (List.count isError results)
+        , "version=" ++ Nat.toText (Optional.fold (do 0) at2 final)
+        ])
+  List.foreach race (List.range 0 10)
+
+  increment = do
+    v = Transaction.tryRead.tx storageProbe.counter "c" |> Optional.getOrElse 0
+    Transaction.write.tx storageProbe.counter "c" (v Nat.+ 1)
+  worker = do List.foreach (_ -> transaction increment) (List.range 0 10)
+  workers = storageProbe.concurrently [worker, worker, worker, worker]
+  say "failedWorkers" (Nat.toText (List.count isError workers))
+  say "counter" (showNat (transaction do Transaction.tryRead.tx storageProbe.counter "c"))

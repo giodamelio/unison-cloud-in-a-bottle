@@ -99,23 +99,6 @@
         "type": "github"
       }
     },
-    "extenddb": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1790740053,
-        "narHash": "sha256-rNJZH7gYDGaB1MkmAmfteqCKuaRtnO9Z3BfnAS9rSK0=",
-        "owner": "ExtendDB",
-        "repo": "extenddb",
-        "rev": "29b6b7fa183d99d2109e87faa2e394772906f312",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ExtendDB",
-        "ref": "v0.1.13",
-        "repo": "extenddb",
-        "type": "github"
-      }
-    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -716,7 +699,6 @@
     "root": {
       "inputs": {
         "cloud-api": "cloud-api",
-        "extenddb": "extenddb",
         "nixpkgs": "nixpkgs",
         "stacklock2nix": "stacklock2nix",
         "unison-cloud-ui": "unison-cloud-ui",

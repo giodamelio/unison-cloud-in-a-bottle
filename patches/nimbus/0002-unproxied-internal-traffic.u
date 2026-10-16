@@ -1,6 +1,6 @@
 -- Keeps nimbus's own S3, DynamoDB and user-blob traffic off the outbound proxy, so the
 -- proxy only ever carries hosted code's requests and can refuse every loopback and
--- private address without exceptions for ExtendDB and S3.
+-- private address without an exception for S3.
 --
 -- Hosted code reaches the network through `http.run`, `tcpConnect.connect.local` and
 -- `websocketclients.run`, which read `outboundProxy` or `proxiedHttpConf` themselves and
