@@ -23,7 +23,7 @@
       ```
     '';
 
-    compiledHash = "";
+    compiledHash = "sha256-xjHnTteRgrNztR53Oq0P1MEwCcQr4JNnMKIClbKVET0=";
   };
 in
   runCommand "s3-headers" {} ''

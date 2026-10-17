@@ -21,5 +21,5 @@ buildFromTranscript {
     ```
   '';
 
-  compiledHash = "sha256-idE1gdOIzt0npEZ0Eutuj8ta6hBynYyaUpQyCxE8CSU=";
+  compiledHash = "sha256-ivXqvCBv+HSM+ve4li+aqc0ybO1Ql8/oIkKPbMwmxjA=";
 }
