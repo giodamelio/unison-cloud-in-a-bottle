@@ -52,6 +52,20 @@
     def hurl(file, *args):
         return machine.succeed(f"hurl --cacert {ca} --variable api=https://cloud.test " + " ".join(args) + f" {file}")
 
+    # The client's `Cloud.logs` fails on the first entry without id, time and userMsg, and
+    # the UI drops every such entry without a word, so a single one is a failure.
+    def user_messages(response):
+        messages = []
+        for raw in response["logs"]:
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise AssertionError(f"log entry {raw!r} is not JSON: {e}")
+            if not (isinstance(entry.get("id"), str) and isinstance(entry.get("time"), str) and isinstance(entry.get("userMsg"), dict)):
+                raise AssertionError(f"log entry {raw!r} is not a user message with id, time and userMsg")
+            messages.append(entry["userMsg"].get("message"))
+        return messages
+
     machine.wait_for_unit("multi-user.target")
     for node in nodes:
         machine.wait_for_unit(node["unit"])
@@ -102,11 +116,12 @@
         daemon_unit = next(n["unit"] for n in nodes if n["type"] == "public-daemon")
         machine.wait_until_succeeds(f"journalctl -u {daemon_unit} | grep -q 'deploy-program daemon tick'", timeout=120)
 
-    with subtest("cloud-api's log search finds the service's log line through Loki"):
-        machine.succeed(
-            f"hurl --test --cacert {ca} --variable api=https://cloud.test --variable host=cloud.test"
-            f" --variable token={token} --variable 'line=deploy-program hello served' ${./hurl/logs.hurl}"
-        )
+    with subtest("cloud-api's log search finds the service's log line through Loki, among only user messages"):
+        response = json.loads(hurl(
+            "${./hurl/logs.hurl}", "--variable host=cloud.test", f"--variable token={token}",
+            "--variable 'line=deploy-program hello served'",
+        ))
+        assert "deploy-program hello served" in user_messages(response), response
 
     with subtest("the UI's deployment page gets the service's log line in a shape it can parse"):
         jar = "/tmp/ui-cookies"
@@ -118,17 +133,7 @@
             "${./hurl/logs-ui.hurl}", f"--cookie {jar}", "--variable ui=https://ui.test", f"--variable hash={hello['hash']}",
             f"--variable start={start}", f"--variable end={end}", "--variable 'line=deploy-program hello served'",
         ))
-        # The UI drops, without a word, every entry JSON.parse rejects or that lacks id, time
-        # and an object userMsg; nimbus's other user lines, such as UserServiceCall, lack them.
-        messages = []
-        for raw in response["logs"]:
-            try:
-                entry = json.loads(raw)
-            except json.JSONDecodeError as e:
-                raise AssertionError(f"the UI cannot parse log entry {raw!r}: {e}")
-            if isinstance(entry.get("id"), str) and isinstance(entry.get("time"), str) and isinstance(entry.get("userMsg"), dict):
-                messages.append(entry["userMsg"].get("message"))
-        assert "deploy-program hello served" in messages, response
+        assert "deploy-program hello served" in user_messages(response), response
 
     with subtest("the UI is served and built for this API"):
         index = machine.succeed(f"curl -sf --cacert {ca} https://ui.test/")
