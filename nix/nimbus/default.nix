@@ -64,7 +64,7 @@ in
       ```
     '';
 
-    compiledHash = "sha256-KimSfdBQ40bKsba8hq8Pje8YKwteQ8nRA8prDSzFNDQ=";
+    compiledHash = "sha256-jYwdyf6h+Ak7OQGN1ReKfrIzDI2tBKeO/F3XwmkJqAM=";
 
     meta = {
       description = "Unison Cloud worker node";

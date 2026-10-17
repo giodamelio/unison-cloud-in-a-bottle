@@ -1,0 +1,63 @@
+-- S3 stores whatever Content-Type an upload sends, and Garage stores none when the
+-- upload sends none, so every read that requires the header fails on objects nimbus
+-- wrote itself. Hosted code's blobs are uploaded here with an explicit type, which
+-- unison_aws's headObject requires, and nimbus's own reads accept an object without one,
+-- as S3 does, so blobs written before this patch still read.
+--
+-- Applied after nimbus is upgraded to unison_aws 5.2.1, so the signature names its Config.
+
+up.aws.s3.putObject.impl :
+  BucketName
+  -> types.Key
+  -> Boolean
+  -> Bytes
+  -> unison_aws_5_2_1.Config
+  -> Instant
+  ->{Exception, Http} Either HttpResponse types.ETag
+up.aws.s3.putObject.impl bucket key ifNoneMatch bytes config instant =
+  use unison_aws_5_2_1.Config Config
+  (Config host port _ service _ _ _) = config
+  (BucketName bucketName) = bucket
+  (Config host port region service isHttps _ mkUri) = config
+  (BucketName bucketName) = bucket
+  uri =
+    mkUri isHttps host port region service
+      |> path.set (toPath key)
+      |> addSubdomain bucketName
+  contentType = Headers.singleton "Content-Type" "application/octet-stream"
+  headers =
+    if ifNoneMatch then
+      Headers.union contentType (Headers.singleton "If-None-Match" "*")
+    else contentType
+  req =
+    HttpRequest.put uri (Body bytes)
+      |> HttpRequest.headers.modify (Headers.union headers)
+      |> addAwsHeaders config instant
+  response = Http.request req
+  if HttpResponse.isSuccess response then
+    response
+      |> HttpResponse.headers
+      |> getValues "ETag"
+      |> List.head
+      |> Optional.toException
+           "No ETag header in putObject response!" (typeLink S3Error)
+      |> types.ETag.ETag
+      |> Right
+  else Left response
+
+up.aws.s3.types.HeadObjectResponse.fromHeaders :
+  Headers ->{Exception} HeadObjectResponse
+up.aws.s3.types.HeadObjectResponse.fromHeaders hs =
+  HeadObjectResponse
+    (types.ETag.ETag (requireHeader "ETag" hs))
+    (base.abilities.Abort.toException
+      (typeLink Unit)
+      "Invalid Last-Modified header"
+      do offsetDateTime (requireHeader "Last-Modified" hs) |> toInstant)
+    (requireHeader "Content-Length" hs
+      |> Nat.fromText
+      |> Optional.toException "Invalid Content-Length header" (typeLink Unit))
+    (getValues "Content-Type" hs
+      |> List.head
+      |> Optional.getOrElse "application/octet-stream")
+    (Headers.toMap hs)
