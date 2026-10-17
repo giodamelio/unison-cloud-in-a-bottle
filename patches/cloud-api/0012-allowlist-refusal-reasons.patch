@@ -1,0 +1,98 @@
+--- a/src/Cloud/SelfHost/Oidc.hs
++++ b/src/Cloud/SelfHost/Oidc.hs
+@@ -29,6 +29,7 @@
+ import Cloud.User.Types (User (..))
+ import Cloud.Utils.Logging qualified as Logging
+ import Cloud.Web.App (WebApp)
++import Control.Applicative ((<|>))
+ import Control.Monad (unless)
+ import Control.Monad.Random (randomIO)
+ import Control.Monad.Reader (asks)
+@@ -63,18 +64,35 @@
+   | MismatchedState
+   | MissingCallbackParam Text
+   | UpstreamFailed UpstreamError
+-  | NotAllowed Text
++  | NotAllowed Text Refusal
+   | ProvisionFailed ProvisionError
+   | UnknownClient OAuthClientId
+   | InvalidRedirectURI URIParam
+   | UnsupportedChallengeMethod
+   | OpenIdScopeRequired
+ 
++-- | Why the allowlist refused a login. Each names only what the provider sent about the
++-- user, never the allowlist, which a refused user has no business reading.
++data Refusal
++  = NoEmail
++  | UnverifiedEmail Text
++  | EmailNotListed Text
++  | NoGroups
++  | GroupsNotListed (Set.Set Text)
++
++refusalMessage :: Refusal -> Text
++refusalMessage = \case
++  NoEmail -> "The identity provider sent no email address for your account, and this server only lets in listed addresses."
++  UnverifiedEmail email -> "The identity provider hasn't verified your email address, " <> email <> ", and this server only lets in verified addresses."
++  EmailNotListed email -> "Your email address, " <> email <> ", isn't one this server lets in."
++  NoGroups -> "The identity provider sent no groups for your account, and this server only lets in members of certain groups."
++  GroupsNotListed groups -> "None of your groups (" <> Text.intercalate ", " (Set.toList groups) <> ") may log in to this server."
++
+ instance Logging.Loggable BrokerError where
+   toLog = \case
+     UpstreamFailed err -> Logging.withSeverity Logging.Error . Logging.textLog $ "oidc login failed upstream: " <> tshow err
+     ProvisionFailed err -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc login failed: " <> tshow err
+-    NotAllowed who -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc login refused by the allowlist: " <> who
++    NotAllowed who refusal -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc login refused by the allowlist: " <> who <> ": " <> refusalMessage refusal
+     ProviderRefused err desc -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oidc provider refused the login: " <> err <> maybe "" (": " <>) desc
+     UnknownClient clientId -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oauth authorize from unknown client " <> tshow clientId
+     InvalidRedirectURI uri -> Logging.withSeverity Logging.UserFault . Logging.textLog $ "oauth authorize with non-loopback redirect_uri " <> tshow uri
+@@ -92,7 +110,7 @@
+     MismatchedState -> (ErrorID "selfhost:oidc-mismatched-state", err400 {errBody = "Mismatched state parameter."})
+     MissingCallbackParam param -> (ErrorID "selfhost:oidc-missing-param", err400 {errBody = "Missing " <> encode param <> " parameter."})
+     UpstreamFailed _ -> (ErrorID "selfhost:oidc-upstream-failed", err502 {errBody = "Logging in through the identity provider failed; the server log has details."})
+-    NotAllowed _ -> (ErrorID "selfhost:oidc-not-allowed", err403 {errBody = "Your account isn't allowed to log in here."})
++    NotAllowed _ refusal -> (ErrorID "selfhost:oidc-not-allowed", err403 {errBody = encode (refusalMessage refusal <> " Ask this server's administrator for access.")})
+     ProvisionFailed err -> toServerError err
+     UnknownClient _ -> (ErrorID "selfhost:oauth-unknown-client", err400 {errBody = "Unknown client_id; only ucm may use this server."})
+     InvalidRedirectURI _ -> (ErrorID "selfhost:oauth-invalid-redirect-uri", err400 {errBody = "redirect_uri must be an http URL on a loopback address."})
+@@ -235,26 +253,29 @@
+ allowedIdentity config VerifiedClaims {subject, claims} = do
+   let Allowlist {emails, emailDomains, groups} = config.allowlist
+       email = textClaim config.emailClaim
+-      -- An unverified address could be anyone's, so it never matches an email allowlist.
+-      verifiedEmail = case KeyMap.lookup "email_verified" claims of
+-        Just (Aeson.Bool False) -> Nothing
+-        _ -> Text.toLower <$> email
+-      emailAllowed =
+-        (Set.null emails && Set.null emailDomains) || case verifiedEmail of
+-          Just e -> Set.member e emails || Set.member (Text.takeWhileEnd (/= '@') e) emailDomains
+-          Nothing -> False
++      emailRefusal
++        | Set.null emails && Set.null emailDomains = Nothing
++        | otherwise = case email of
++            Nothing -> Just NoEmail
++            Just e
++              -- An unverified address could be anyone's, so it never matches an email allowlist.
++              | KeyMap.lookup "email_verified" claims == Just (Aeson.Bool False) -> Just (UnverifiedEmail e)
++              | Set.member (Text.toLower e) emails || Set.member (Text.toLower (Text.takeWhileEnd (/= '@') e)) emailDomains -> Nothing
++              | otherwise -> Just (EmailNotListed e)
+       userGroups = case KeyMap.lookup (Key.fromText config.groupsClaim) claims of
+         Just (Aeson.Array gs) -> Set.fromList [g | Aeson.String g <- toList gs]
+         Just (Aeson.String g) -> Set.singleton g
+         _ -> Set.empty
+-      groupsAllowed = Set.null groups || not (Set.disjoint groups userGroups)
+-  unless' (emailAllowed && groupsAllowed) $ NotAllowed (subject <> maybe "" (" " <>) email)
++      groupsRefusal
++        | Set.null groups || not (Set.disjoint groups userGroups) = Nothing
++        | Set.null userGroups = Just NoGroups
++        | otherwise = Just (GroupsNotListed userGroups)
++  maybe (Right ()) (Left . NotAllowed (subject <> maybe "" (" " <>) email)) (emailRefusal <|> groupsRefusal)
+   pure Identity {issuer = config.issuer, subject, preferredUsername = textClaim config.handleClaim, email}
+   where
+     textClaim name = case KeyMap.lookup (Key.fromText name) claims of
+       Just (Aeson.String t) | not (Text.null t) -> Just t
+       _ -> Nothing
+-    unless' ok err = if ok then Right () else Left err
+ 
+ -- | Issues a one-time code for ucm and sends the browser back to ucm's loopback listener.
+ codeRedirect :: UserId -> AuthenticationRequest -> WebApp URI

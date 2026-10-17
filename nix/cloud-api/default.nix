@@ -19,6 +19,7 @@
     ../../patches/cloud-api/0009-redis-to-postgres.patch
     ../../patches/cloud-api/0010-consul-token-and-prefix.patch
     ../../patches/cloud-api/0011-pkce-verifier-length.patch
+    ../../patches/cloud-api/0012-allowlist-refusal-reasons.patch
   ];
 
   stacklock = stacklock2nix {

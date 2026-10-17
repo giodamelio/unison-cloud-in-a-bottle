@@ -1,4 +1,5 @@
-# A provider user outside the allowlist authenticates but is refused, and gets no session.
+# A provider user outside the email allowlist authenticates but is refused, is told why,
+# and gets no session.
 # Variables: api, user; secret: password.
 
 GET {{api}}/login
@@ -18,3 +19,4 @@ password: {{password}}
 HTTP 403
 [Asserts]
 cookie "cloud-session" not exists
+body contains "Your email address, {{user}}, isn't one this server lets in."
