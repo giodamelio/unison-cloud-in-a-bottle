@@ -30,6 +30,11 @@
   #
   # The PostgreSQL storage patches need @runarorama/postgres, which installs from Share
   # without a token. A release is immutable, so this pins it as firmly as the causal.
+  #
+  # unison_aws 5.2.0 reads S3 response headers through unison_http 3.6.0, which matches
+  # `ETag` only as written or all lowercase, so it misses the `Etag` that Go servers such
+  # as Caddy send over HTTP/1.1. 5.2.1 reads them through unison_http 15.2.0, which
+  # ignores case, and `upgrade` moves every nimbus definition over to it.
   patchesDir = ../../patches/nimbus;
   prepare = ''
     scratch/main> pull @unison/nimbus/main
@@ -40,6 +45,10 @@
     scratch/main> load 0003-postgres-config.u
     scratch/main> update
     scratch/main> load 0004-postgres-storage.u
+    scratch/main> update
+    scratch/main> lib.install @unison/aws/releases/5.2.1
+    scratch/main> upgrade unison_aws_5_2_0 unison_aws_5_2_1
+    scratch/main> load 0005-s3-content-type.u
     scratch/main> update
   '';
 in
