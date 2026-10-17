@@ -113,6 +113,11 @@
         };
       });
 
+      s3-headers = pkgs.callPackage ./tests/s3-headers {
+        inherit (inputs.unison-nix.packagesLib.${pkgs.stdenv.hostPlatform.system}) buildFromTranscript;
+        inherit (inputs.self.packages.${pkgs.stdenv.hostPlatform.system}) nimbus;
+      };
+
       nimbus-single = pkgs.testers.runNixOSTest (import ./tests/nimbus-single.nix {
         inherit (inputs) self;
         deployProgram = pkgs.callPackage ./tests/deploy-program {

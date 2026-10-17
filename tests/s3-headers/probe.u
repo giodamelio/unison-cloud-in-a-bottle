@@ -1,0 +1,67 @@
+-- Answers nimbus's own S3 calls with the responses Caddy sends for Garage over HTTP/1.1,
+-- where Go spells the header `Etag`, for an object stored without a Content-Type. Prints
+-- one `name=value` line per check.
+
+s3HeadersProbe.response : Nat -> Text -> HttpResponse
+s3HeadersProbe.response code headers =
+  parsed = match lib.unison_http_15_2_0.Headers.parseHeaders headers with
+    Right hs -> hs
+    Left e   -> bug e
+  lib.unison_http_15_2_0.HttpResponse.HttpResponse
+    (lib.unison_http_15_2_0.HttpResponse.Status.Status code "")
+    lib.unison_http_15_2_0.Version.http11
+    parsed
+    lib.unison_http_15_2_0.Body.empty
+
+s3HeadersProbe.put : HttpResponse
+s3HeadersProbe.put =
+  s3HeadersProbe.response
+    200 "Content-Length: 0\r\nEtag: \"ab9616d85327c4b9bb465db1917fe162\"\r\nVia: 1.1 Caddy"
+
+s3HeadersProbe.head : HttpResponse
+s3HeadersProbe.head =
+  s3HeadersProbe.response
+    200
+    "Accept-Ranges: bytes\r\nContent-Length: 23101\r\nEtag: \"ab9616d85327c4b9bb465db1917fe162\"\r\nLast-Modified: Sat, 17 Oct 2026 03:17:22 GMT\r\nVia: 1.1 Caddy"
+
+-- S3 stores the Content-Type an upload sends, so a blob upload without one gets a 400 here.
+s3HeadersProbe.blobStore : HttpRequest -> HttpResponse
+s3HeadersProbe.blobStore req =
+  contentType =
+    lib.unison_http_15_2_0.HttpRequest.headers req
+      |> lib.unison_http_15_2_0.Headers.getValues "Content-Type"
+  if contentType === ["application/octet-stream"] then s3HeadersProbe.put
+  else s3HeadersProbe.response 400 "Content-Length: 0"
+
+s3HeadersProbe.stub : (HttpRequest -> HttpResponse) -> '{g, Http} a ->{g} a
+s3HeadersProbe.stub respond p =
+  go = cases
+    { a }                        -> a
+    { Http.tryRequest req -> k } -> handle k (Right (respond req)) with go
+  handle p() with go
+
+s3HeadersProbe : '{IO, Exception} ()
+s3HeadersProbe = do
+  use Text ++
+  config =
+    lib.unison_aws_5_2_1.s3.defaultConfig
+      (lib.unison_aws_5_2_1.Credentials.Credentials "key" "secret" None)
+  bucket = BucketName.BucketName "services"
+  key = types.Key.Key "probe"
+  now = Instant.now()
+  say name value = printLine (name ++ "=" ++ value)
+  attempt : '{Exception} Text ->{IO} Text
+  attempt p = match catch p with
+    Right v -> v
+    Left (IO.Failure.Failure _ msg _) -> "error: " ++ msg
+  say "servicePut" (attempt do
+    s3HeadersProbe.stub (_ -> s3HeadersProbe.put) do
+      lib.unison_aws_5_2_1.s3.putObject bucket key 0xs00 config now |> types.ETag.toText)
+  say "blobPut" (attempt do
+    s3HeadersProbe.stub s3HeadersProbe.blobStore do
+      match up.aws.s3.putObject.impl bucket key false 0xs00 config now with
+        Right etag -> types.ETag.toText etag
+        Left resp  -> "status " ++ Nat.toText (lib.unison_http_15_2_0.HttpResponse.Status.code (lib.unison_http_15_2_0.HttpResponse.status resp)))
+  say "blobRead" (attempt do
+    meta = up.aws.s3.types.HeadObjectResponse.fromHeaders (lib.unison_http_15_2_0.HttpResponse.headers s3HeadersProbe.head)
+    types.ETag.toText (HeadObjectResponse.etag meta) ++ " " ++ HeadObjectResponse.contentType meta)
