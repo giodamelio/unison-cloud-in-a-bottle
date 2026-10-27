@@ -1,0 +1,120 @@
+-- @runarorama/postgres 2.5.1's PostgresMessaging.runIO reads backend messages in a fiber
+-- whose handler puts its `catch` and `match` inside the handled block, so every message it
+-- resumes on nests another catch frame around a continuation that already holds the
+-- previous ones. Those frames are freed only when the connection closes, and
+-- 0004-postgres-storage.u's pool keeps each session open for the life of the process, so
+-- nimbus grows until it runs out of memory.
+--
+-- These are copies of the library's runIO and withConnection that differ only in that
+-- the backend handler runs the computation directly. The outer `catch` around it still
+-- prints a backend error, as before. withSession is 0004's, calling the copy.
+--
+-- The copies exist only until @runarorama/postgres ships a fix. Then this patch goes, and
+-- 0004's withSession calls the library's withConnection again.
+
+stateful.Postgres.runIO :
+  net.Connection {IO, Exception}
+  -> Map Text Text
+  -> '{h, IO, Exception, PostgresMessaging} a
+  ->{h, IO, Exception} a
+stateful.Postgres.runIO conn parameters p =
+  use IO.Failure Failure
+  use STM atomically
+  use Text ++
+  txnStatus = IO.ref None
+  msgQueue : TQueue BackendMessage
+  msgQueue = atomically do TQueue.empty()
+  concurrent.fork_ do
+    goBackend :
+      '{IO, Exception, PostgresBackend} ()
+      ->{IO, Exception} ()
+    goBackend c =
+      handle c()
+      with cases
+        { offerBackendMessage msg -> k } ->
+          atomically do
+            TQueue.boundedEnqueue 4096 msg msgQueue
+          goBackend do k()
+        { offerTransactionStatus b -> k } ->
+          mutable.Ref.write txnStatus (Some b)
+          goBackend do k()
+        { offerParameterStatus _ -> k } -> goBackend do k()
+        { offerBackendKeyData _ -> k } -> goBackend do k()
+        { offerNotification _ -> k } -> goBackend do k()
+        { _ } ->
+          Exception.raise
+            (Failure
+              (typeLink postgres.errors.ProtocolError)
+              "Postgres abandoned connection"
+              (Any ()))
+    match catch do goBackend do backend conn parameters with
+      Left e ->
+        Function.ignore
+          (hush do
+            printLine
+              ("Error in backend driver: " ++ toDebugText e))
+      Right _ -> ()
+  go :
+    '{h, IO, Exception, PostgresMessaging} a
+    ->{h, IO, Exception} a
+  go p =
+    handle p()
+    with cases
+      { trySendFrontendMessage msg -> k } ->
+        bytes = do FrontendMessage.encode msg
+        v =
+          catch do Connection.send conn (encode.toBytes bytes)
+        go do k v
+      { tryGetTransactionStatus -> k } ->
+        match mutable.Ref.read txnStatus with
+          None ->
+            go do
+              k
+                (Left
+                  (Failure
+                    (typeLink postgres.errors.ProtocolError)
+                    "Session not started"
+                    (Any ())))
+          Some bs -> go do k (Right bs)
+      { tryAwaitBackendMessage -> k } ->
+        msg = atomically do TQueue.dequeue msgQueue
+        go do k (Right msg)
+      { a } -> a
+  go p
+
+stateful.Postgres.withConnection :
+  PostgresClientConfig
+  -> net.Connection {IO, Exception}
+  -> '{g, IO, Exception, postgres.Postgres} a
+  ->{g, IO, Exception} a
+stateful.Postgres.withConnection cfg conn p =
+  typer =
+    match typerStrategy cfg with
+      BuiltinsOnly -> Typer.static
+      x ->
+        bug
+          "Support for this typer strategy is not implemented. Use BuiltinsOnly."
+          x
+  stateful.Postgres.runIO conn (parameters cfg) do
+    Random.run do
+      withInitialValue 1 do
+        runMessaging typer do
+          startup
+            (user cfg)
+            (PostgresClientConfig.database cfg)
+            (password cfg)
+            (parameters cfg)
+          p()
+
+stateful.Postgres.withSession :
+  PostgresClientConfig
+  -> '{IO, Exception, postgres.Postgres} a
+  ->{IO, Exception} a
+stateful.Postgres.withSession cfg p =
+  conn =
+    TcpConnect.runIO do
+      TcpConnect.connect
+        (PostgresClientConfig.host cfg) (PostgresClientConfig.port cfg)
+  result = catch do stateful.Postgres.withConnection cfg conn p
+  Connection.close conn
+  Either.toException result

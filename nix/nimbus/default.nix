@@ -50,6 +50,8 @@
     scratch/main> upgrade unison_aws_5_2_0 unison_aws_5_2_1
     scratch/main> load 0005-s3-content-type.u
     scratch/main> update
+    scratch/main> load 0006-postgres-session-leak.u
+    scratch/main> update
   '';
 in
   (buildFromTranscript {
@@ -64,7 +66,7 @@ in
       ```
     '';
 
-    compiledHash = "sha256-jYwdyf6h+Ak7OQGN1ReKfrIzDI2tBKeO/F3XwmkJqAM=";
+    compiledHash = "sha256-D2WMBvopGnUjxftoRGFWiVXcfGWCW14uxJBDTHxVrpg=";
 
     meta = {
       description = "Unison Cloud worker node";
